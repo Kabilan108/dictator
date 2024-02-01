@@ -1,0 +1,25 @@
+{
+  "name": "ispy",
+  "version": "0.1.0",
+  "description": "A local transcription service for your desktop.",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/Kabilan108/distil.git"
+  },
+  "keywords": [
+    "whisper",
+    "transcription",
+    "voice",
+    "recorder"
+  ],
+  "author": "Kabilan108",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Kabilan108/distil/issues"
+  },
+  "homepage": "https://github.com/Kabilan108/distil#readme"
+}
