@@ -9,7 +9,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/Kabilan108/distil.git"
+    "url": "git+ssh://git@github.com/Kabilan108/dictator.git"
   },
   "keywords": [
     "whisper",
@@ -20,9 +20,9 @@
   "author": "Kabilan108",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/Kabilan108/distil/issues"
+    "url": "https://github.com/Kabilan108/dictator/issues"
   },
-  "homepage": "https://github.com/Kabilan108/distil#readme",
+  "homepage": "https://github.com/Kabilan108/dictator#readme",
   "devDependencies": {
     "electron": "^28.2.1"
   },
