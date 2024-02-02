@@ -25,5 +25,8 @@
   "homepage": "https://github.com/Kabilan108/distil#readme",
   "devDependencies": {
     "electron": "^28.2.1"
+  },
+  "dependencies": {
+    "uuid": "^9.0.1"
   }
 }
