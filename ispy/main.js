@@ -1,6 +1,6 @@
 // main.js
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, Tray, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -25,7 +25,8 @@ function createTempAudioFile(audioBuffer, callback) {
 const worker = spawn('./worker.py', [], { shell: true });
 let isWorkerReady = false;
 
-let win;
+let win = null
+let tray = null
 
 function createWindow() {
     win = new BrowserWindow({
@@ -38,6 +39,23 @@ function createWindow() {
 
     win.loadFile('index.html');
     // win.webContents.openDevTools();
+
+    tray = new Tray(path.join(__dirname, 'assets', 'icon.png'));
+    // tray = new Tray()
+
+    tray.on('click', () => {
+        if (window.isVisible()) {
+            window.hide()
+        } else {
+            window.show()
+        }
+    })
+
+    window.on('blur', () => {
+        if (!window.webContents.isDevToolsOpened()) {
+            window.hide()
+        }
+    })
 }
 
 
