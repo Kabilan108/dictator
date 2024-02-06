@@ -1,32 +1,32 @@
 {
-  "name": "ispy",
+  "name": "dictator",
+  "private": true,
   "version": "0.1.0",
-  "description": "A local transcription service for your desktop.",
-  "main": "main.js",
+  "type": "module",
   "scripts": {
-    "start": "electron .",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+ssh://git@github.com/Kabilan108/dictator.git"
-  },
-  "keywords": [
-    "whisper",
-    "transcription",
-    "voice",
-    "recorder"
-  ],
-  "author": "Kabilan108",
-  "license": "ISC",
-  "bugs": {
-    "url": "https://github.com/Kabilan108/dictator/issues"
-  },
-  "homepage": "https://github.com/Kabilan108/dictator#readme",
-  "devDependencies": {
-    "electron": "^28.2.1"
+    "start": "concurrently \"bun dev\" \"bun electron\"",
+    "dev": "vite",
+    "build": "vite build",
+    "lint": "eslint . --ext js,jsx --report-unused-disable-directives --max-warnings 0",
+    "preview": "vite preview",
+    "electron": "electron ./electron/main.js",
+    "electron-build": "electron-builder"
   },
   "dependencies": {
-    "uuid": "^9.0.1"
+    "concurrently": "^8.2.2",
+    "electron": "^28.2.1",
+    "electron-builder": "^24.9.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.43",
+    "@types/react-dom": "^18.2.17",
+    "@vitejs/plugin-react": "^4.2.1",
+    "eslint": "^8.55.0",
+    "eslint-plugin-react": "^7.33.2",
+    "eslint-plugin-react-hooks": "^4.6.0",
+    "eslint-plugin-react-refresh": "^0.4.5",
+    "vite": "^5.0.8"
   }
 }

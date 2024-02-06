@@ -1,5 +1,4 @@
-#!/home/muaddib/.cache/pypoetry/virtualenvs/distil-1_vY1VFM-py3.10/bin/python
-#
+#!//mnt/arrakis/sietch/projects/dictator/electron/whisper/.venv/bin/python
 # worker.py
 #
 # A program that reads from STDIN and executes commands.
@@ -101,9 +100,13 @@ if __name__ == "__main__":
                 cmd, audiofile = line.split()
 
                 if Path(audiofile).exists():
+                    logger.info(f"Transcribing {audiofile}")
+                    tic = time.time()
+
                     transcript, duration = transcribe(pipe, audiofile)
                     print_transcript(transcript, duration)
-                    sys.stdout.flush()
+
+                    logger.info(f"Transcribed {audiofile} in {time.time() - tic:.2f}s")
                 else:
                     print_("[error] File does not exist.")
 
