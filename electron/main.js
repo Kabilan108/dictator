@@ -13,11 +13,12 @@ let saveRecording = false;
 
 function createWindow() {
   window = new BrowserWindow({
-    width: 400,
-    height: 200,
+    width: 300,
+    height: 150,
     webPreferences: {
-      preload: path.join(utils.getDirname(), "preload.js"),
+      preload: path.join(utils.getDirname(), "preload.cjs"),
       nodeIntegration: true,
+      contextIsolation: true,
     },
   });
   tray = new Tray(path.join(utils.getDirname(), "assets", "icon.png"));
@@ -30,12 +31,6 @@ function createWindow() {
   window.loadURL(startURL);
 
   window.on("closed", () => (window = null));
-
-  // window.on('blur', () => {
-  //   if (!window.webContents.isDevToolsOpened()) {
-  //     window.hide()
-  //   }
-  // })
 
   // TODO: implement tray behavior
 }
