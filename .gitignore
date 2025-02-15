@@ -38,3 +38,5 @@ venv/
 .env.development
 .env.test
 .env.production
+
+build/bin
