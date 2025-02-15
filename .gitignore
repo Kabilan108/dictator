@@ -40,3 +40,4 @@ venv/
 .env.production
 
 build/bin
+lib/
