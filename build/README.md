@@ -4,9 +4,9 @@ The build directory is used to house all the build files and assets for your app
 
 The structure is:
 
-- bin - Output directory
-- darwin - macOS specific files
-- windows - Windows specific files
+* bin - Output directory
+* darwin - macOS specific files
+* windows - Windows specific files
 
 ## Mac
 
