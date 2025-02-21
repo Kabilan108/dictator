@@ -40,4 +40,6 @@ venv/
 .env.production
 
 build/bin
-lib/
+bin/
+models/
+data/

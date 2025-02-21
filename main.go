@@ -2,7 +2,6 @@ package main
 
 import (
 	"embed"
-	"log"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/logger"
@@ -26,11 +25,11 @@ func main() {
 	err := wails.Run(&options.App{
 		Title:             "dictator",
 		Width:             500,
-		Height:            200,
 		MinWidth:          500,
-		MinHeight:         200,
-		MaxWidth:          1280,
-		MaxHeight:         800,
+		MaxWidth:          500,
+		Height:            150,
+		MinHeight:         150,
+		MaxHeight:         600,
 		DisableResize:     false,
 		Fullscreen:        false,
 		Frameless:         false,
@@ -81,6 +80,6 @@ func main() {
 		},
 	})
 	if err != nil {
-		log.Fatal(err)
+		Log.E("Failed to start wails app: %v", err)
 	}
 }
