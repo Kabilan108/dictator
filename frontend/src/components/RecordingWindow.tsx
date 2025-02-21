@@ -18,9 +18,6 @@ export function RecordingWindow() {
   const recordingModeRef = useRef<"tap" | "hold" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const version = navigator.userAgent;
-  Log.i(`Version: ${version}`);
-
   // Start recording using Wails backend
   const startRecording = useCallback(async () => {
     try {

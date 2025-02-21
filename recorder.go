@@ -99,6 +99,37 @@ func (a *AudioRecorder) Terminate() error {
 	return nil
 }
 
+type AudioDevice struct {
+	name      string
+	isDefault bool
+}
+
+func (a *AudioRecorder) ListDevices() ([]AudioDevice, error) {
+	a.mu.Lock()
+	if !a.isInitialized {
+		a.mu.Unlock()
+		return make([]AudioDevice, 0), fmt.Errorf("audio recorder not initialized")
+	}
+	a.mu.Unlock()
+
+	did, err := portaudio.DefaultInputDevice()
+	if err != nil {
+		return make([]AudioDevice, 0), fmt.Errorf("failed to get default input device: %w", err)
+	}
+
+	paDevices, err := portaudio.Devices()
+	if err != nil {
+		return make([]AudioDevice, 0), fmt.Errorf("failed to get devices: %w", err)
+	}
+
+	ads := make([]AudioDevice, 0)
+	for _, dev := range paDevices {
+		ads = append(ads, AudioDevice{dev.Name, dev == did})
+	}
+
+	return ads, nil
+}
+
 func (a *AudioRecorder) StartRecording() error {
 	a.mu.Lock()
 	if !a.isInitialized {
@@ -238,6 +269,18 @@ func TestAudioRecorder() {
 	}
 	defer recorder.Terminate()
 
+	// list available devices
+	devices, err := recorder.ListDevices()
+	if err != nil {
+		Log.E("Failed to list input devices: %v", err)
+		os.Exit(1)
+	}
+
+	Log.I("Available input devices:")
+	for _, d := range devices {
+		Log.I("  %s (default=%v)", d.name, d.isDefault)
+	}
+
 	// Start recording
 	err = recorder.StartRecording()
 	if err != nil {
@@ -261,11 +304,16 @@ func TestAudioRecorder() {
 	}
 
 	// Write the WAV file
-	outputPath := "recording.wav"
-	if err := writeWavFile(outputPath, audioData); err != nil {
+	fp, err := newRecordingFile()
+	if err != nil {
+		Log.E("Failed to create recording file: %v", err)
+		os.Exit(1)
+	}
+
+	if err := writeWavFile(fp, audioData); err != nil {
 		Log.E("Failed to write WAV file: %v", err)
 		os.Exit(1)
 	}
 
-	Log.I("Successfully recorded audio to %s", outputPath)
+	Log.I("Successfully recorded audio to %s", fp)
 }

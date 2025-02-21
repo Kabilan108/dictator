@@ -7,10 +7,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
-
-	"github.com/google/uuid"
 )
 
 // App struct
@@ -52,34 +48,40 @@ func (a *App) shutdown(ctx context.Context) {
 	a.ar.Terminate()
 }
 
-// start a recording
-func (a *App) StartRecording() bool {
-	if err := a.ar.StartRecording(); err != nil {
-		Log.E("Failed to start recording:", err)
-		return false
-	}
-	Log.D("Started recording")
-	return true
+type Result struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
 }
 
-// // Validate file path
-// dir := filepath.Dir(filePath)
-// if _, err := os.Stat(dir); os.IsNotExist(err) {
-// 	return fmt.Errorf("directory does not exist: %s", dir)
-// }
+// start a recording
+func (a *App) StartRecording() Result {
+	if err := a.ar.StartRecording(); err != nil {
+		Log.E("Failed to start recording:", err)
+		return Result{Success: false, Error: "Failed to start recording"}
+	}
+	Log.D("Started recording")
+	return Result{Success: true}
+}
 
 // stop a recording
-func (a *App) StopRecording() bool {
+func (a *App) StopRecording() Result {
 	data, err := a.ar.StopRecording()
-	fp := filepath.Join(DATA_DIR, "recordings", fmt.Sprintf("%v.wav", uuid.New()))
 	if err != nil {
 		Log.E("Failed to stop recording:", err)
-		return false
+		return Result{Success: false, Error: "Failed to stop recording"}
 	}
+
+	fp, err := newRecordingFile()
+	if err != nil {
+		Log.E("Failed to create wav file:", err)
+		return Result{Success: false, Error: "Failed to create wav file"}
+	}
+
 	Log.D("Stopped recording. Transcribing...")
 	if err := writeWavFile(fp, data); err != nil {
 		Log.E("Failed to write WAV file:", err)
-		return false
+		return Result{Success: false, Error: "Failed to write wav file"}
 	}
-	return true
+
+	return Result{Success: true}
 }
