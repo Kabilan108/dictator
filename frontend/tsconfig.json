@@ -24,9 +24,10 @@
     "rootDir": "src",
     "baseUrl": "./",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@wailsjs/*": ["./wailsjs/*"]
     }
   },
-  "include": ["src"],
+  "include": ["src", "wailsjs/**/*"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }
