@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"bytes"
@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gordonklaus/portaudio"
+
+  "dictator/util"
 )
 
 // wavHeader defines the structure of a WAV file header.
@@ -178,7 +180,7 @@ func (a *AudioRecorder) StartRecording() error {
 			}
 
 			if err := a.stream.Read(); err != nil {
-				Log.W("Error reading audio stream: %v", err)
+				util.Log.W("Error reading audio stream: %v", err)
 				a.mu.Lock()
 				active = a.isRecording
 				a.mu.Unlock()
@@ -232,7 +234,7 @@ func (a *AudioRecorder) StopRecording() ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-func writeWavFile(filePath string, audioData []byte) error {
+func WriteWavFile(filePath string, audioData []byte) error {
 	// Validate file path
 	dir := filepath.Dir(filePath)
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -264,7 +266,7 @@ func TestAudioRecorder() {
 	// Create a new audio recorder
 	recorder, err := NewAudioRecorder()
 	if err != nil {
-		Log.E("Failed to create audio recorder: %v", err)
+		util.Log.E("Failed to create audio recorder: %v", err)
 		os.Exit(1)
 	}
 	defer recorder.Terminate()
@@ -272,48 +274,48 @@ func TestAudioRecorder() {
 	// list available devices
 	devices, err := recorder.ListDevices()
 	if err != nil {
-		Log.E("Failed to list input devices: %v", err)
+		util.Log.E("Failed to list input devices: %v", err)
 		os.Exit(1)
 	}
 
-	Log.I("Available input devices:")
+	util.Log.I("Available input devices:")
 	for _, d := range devices {
-		Log.I("  %s (default=%v)", d.name, d.isDefault)
+		util.Log.I("  %s (default=%v)", d.name, d.isDefault)
 	}
 
 	// Start recording
 	err = recorder.StartRecording()
 	if err != nil {
-		Log.E("Failed to start recording: %v", err)
+		util.Log.E("Failed to start recording: %v", err)
 		os.Exit(1)
 	}
 
-	Log.I("Recording for 5 seconds...")
+	util.Log.I("Recording for 5 seconds...")
 	time.Sleep(5 * time.Second)
 
 	// Stop recording and get the audio data
 	audioData, err := recorder.StopRecording()
 	if err != nil {
-		Log.E("Failed to stop recording: %v", err)
+		util.Log.E("Failed to stop recording: %v", err)
 		os.Exit(1)
 	}
 
 	if len(audioData) == 0 {
-		Log.E("No audio data was recorded")
+		util.Log.E("No audio data was recorded")
 		os.Exit(1)
 	}
 
 	// Write the WAV file
-	fp, err := newRecordingFile()
+	fp, err := util.NewRecordingFile(DATA_DIR)
 	if err != nil {
-		Log.E("Failed to create recording file: %v", err)
+		util.Log.E("Failed to create recording file: %v", err)
 		os.Exit(1)
 	}
 
-	if err := writeWavFile(fp, audioData); err != nil {
-		Log.E("Failed to write WAV file: %v", err)
+	if err := WriteWavFile(fp, audioData); err != nil {
+		util.Log.E("Failed to write WAV file: %v", err)
 		os.Exit(1)
 	}
 
-	Log.I("Successfully recorded audio to %s", fp)
+	util.Log.I("Successfully recorded audio to %s", fp)
 }

@@ -1,5 +1,7 @@
 # README
 
+whisper.cpp version: https://github.com/ggerganov/whisper.cpp/archive/refs/tags/v1.7.4.zip
+
 ## About
 
 This template comes with Vite, React, TypeScript, TailwindCSS and shadcn/ui.

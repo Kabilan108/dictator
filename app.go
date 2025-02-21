@@ -7,12 +7,14 @@ package main
 import (
 	"context"
 	"fmt"
+
+  "dictator/app"
 )
 
 // App struct
 type App struct {
 	ctx context.Context
-	ar  *AudioRecorder
+	ar  *app.AudioRecorder
 }
 
 // NewApp creates a new App application struct
@@ -22,7 +24,7 @@ func NewApp() *App {
 
 // startup is called at application startup
 func (a *App) startup(ctx context.Context) {
-	ar, err := NewAudioRecorder()
+	ar, err := app.NewAudioRecorder()
 	if err != nil {
 		panic(fmt.Sprintf("failed to start audio recorder: %v", err))
 	}
@@ -56,10 +58,10 @@ type Result struct {
 // start a recording
 func (a *App) StartRecording() Result {
 	if err := a.ar.StartRecording(); err != nil {
-		Log.E("Failed to start recording:", err)
+		app.Log.E("Failed to start recording:", err)
 		return Result{Success: false, Error: "Failed to start recording"}
 	}
-	Log.D("Started recording")
+	app.Log.D("Started recording")
 	return Result{Success: true}
 }
 
@@ -67,19 +69,19 @@ func (a *App) StartRecording() Result {
 func (a *App) StopRecording() Result {
 	data, err := a.ar.StopRecording()
 	if err != nil {
-		Log.E("Failed to stop recording:", err)
+		app.Log.E("Failed to stop recording:", err)
 		return Result{Success: false, Error: "Failed to stop recording"}
 	}
 
-	fp, err := newRecordingFile()
+	fp, err := app.NewRecordingFile()
 	if err != nil {
-		Log.E("Failed to create wav file:", err)
+		app.Log.E("Failed to create wav file:", err)
 		return Result{Success: false, Error: "Failed to create wav file"}
 	}
 
-	Log.D("Stopped recording. Transcribing...")
-	if err := writeWavFile(fp, data); err != nil {
-		Log.E("Failed to write WAV file:", err)
+	app.Log.D("Stopped recording. Transcribing...")
+	if err := app.WriteWavFile(fp, data); err != nil {
+		app.Log.E("Failed to write WAV file:", err)
 		return Result{Success: false, Error: "Failed to write wav file"}
 	}
 

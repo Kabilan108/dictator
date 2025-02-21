@@ -9,6 +9,8 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
+
+  "dictator/util"
 )
 
 //go:embed all:frontend/dist
@@ -18,8 +20,8 @@ var assets embed.FS
 var icon []byte
 
 func main() {
-	// Create an instance of the app structure
-	app := NewApp()
+	// Create an instance of the dictator structure
+	dictator := NewApp()
 
 	// Create application with options
 	err := wails.Run(&options.App{
@@ -42,13 +44,13 @@ func main() {
 		Menu:             nil,
 		Logger:           nil,
 		LogLevel:         logger.DEBUG,
-		OnStartup:        app.startup,
-		OnDomReady:       app.domReady,
-		OnBeforeClose:    app.beforeClose,
-		OnShutdown:       app.shutdown,
+		OnStartup:        dictator.startup,
+		OnDomReady:       dictator.domReady,
+		OnBeforeClose:    dictator.beforeClose,
+		OnShutdown:       dictator.shutdown,
 		WindowStartState: options.Normal,
 		Bind: []interface{}{
-			app,
+			dictator,
 		},
 		// Windows platform specific options
 		Windows: &windows.Options{
@@ -80,6 +82,6 @@ func main() {
 		},
 	})
 	if err != nil {
-		Log.E("Failed to start wails app: %v", err)
+		util.Log.E("Failed to start wails app: %v", err)
 	}
 }
