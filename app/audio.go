@@ -36,12 +36,12 @@ func createWavHeader(dataSize uint32) wavHeader {
 		Format:        [4]byte{'W', 'A', 'V', 'E'},
 		Subchunk1ID:   [4]byte{'f', 'm', 't', ' '},
 		Subchunk1Size: 16,
-		AudioFormat:   3,                    // IEEE Float
+		AudioFormat:   1,                    // PCM format
 		NumChannels:   1,                    // Mono
-		SampleRate:    44100,                // 44.1kHz
-		BitsPerSample: 32,                   // 32-bit float
-		ByteRate:      44100 * 1 * (32 / 8), // SampleRate * NumChannels * (BitsPerSample / 8)
-		BlockAlign:    1 * (32 / 8),         // NumChannels * (BitsPerSample / 8)
+		SampleRate:    16000,                // 16kHz
+		BitsPerSample: 16,                   // 16-bit
+		ByteRate:      16000 * 1 * (16 / 8), // SampleRate * NumChannels * (BitsPerSample / 8)
+		BlockAlign:    1 * (16 / 8),         // NumChannels * (BitsPerSample / 8)
 		Subchunk2ID:   [4]byte{'d', 'a', 't', 'a'},
 		Subchunk2Size: dataSize,
 	}
@@ -63,7 +63,7 @@ func NewAudioRecorder() (*AudioRecorder, error) {
 		buffer:         make([]float32, 0),
 		isRecording:    false,
 		isInitialized:  false,
-		sampleRate:     44100,
+		sampleRate:     16000, // whisper needs 16KHz PCM WAV
 		framesPerBlock: 1024,
 	}
 	if err := recorder.Initialize(); err != nil {
@@ -224,7 +224,9 @@ func (a *AudioRecorder) StopRecording() ([]byte, error) {
 
 	var buf bytes.Buffer
 	for _, sample := range bufferCopy {
-		err := binary.Write(&buf, binary.LittleEndian, sample)
+		// convert float32 (-1.0 to 1.0) to int16 (-32768 to 32767)
+		intSample := int16(sample * 32767)
+		err := binary.Write(&buf, binary.LittleEndian, intSample)
 		if err != nil {
 			return nil, err
 		}
