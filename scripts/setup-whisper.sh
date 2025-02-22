@@ -24,7 +24,7 @@ unzip v1.7.4.zip && cd whisper.cpp-1.7.4
 cmake -B build $BUILD_FLAGS
 cmake --build build -j $(($(nproc) - 2)) --config Release
 
-# mv build/bin/whisper-server ..
-mv build/bin/whisper-* ..
-cd .. && rm -r v1.7.4.zip whisper.cpp-1.7.4
-
+# # mv build/bin/whisper-server ..
+# mv build/bin/whisper-* ..
+# cd .. && rm -r v1.7.4.zip whisper.cpp-1.7.4
+#

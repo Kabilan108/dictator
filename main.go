@@ -10,7 +10,7 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 
-  "dictator/util"
+	"dictator/app"
 )
 
 //go:embed all:frontend/dist
@@ -82,6 +82,6 @@ func main() {
 		},
 	})
 	if err != nil {
-		util.Log.E("Failed to start wails app: %v", err)
+		app.Log.E("Failed to start wails app: %v", err)
 	}
 }

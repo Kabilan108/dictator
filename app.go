@@ -8,13 +8,18 @@ import (
 	"context"
 	"fmt"
 
-  "dictator/app"
+	"dictator/app"
 )
 
 // App struct
 type App struct {
 	ctx context.Context
 	ar  *app.AudioRecorder
+}
+
+type Result struct {
+	Success bool   `json:"success"`
+	Error   string `json:"error,omitempty"`
 }
 
 // NewApp creates a new App application struct
@@ -48,11 +53,6 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 // shutdown is called at application termination
 func (a *App) shutdown(ctx context.Context) {
 	a.ar.Terminate()
-}
-
-type Result struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
 }
 
 // start a recording

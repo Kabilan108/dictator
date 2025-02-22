@@ -91,7 +91,6 @@ func (l *Logger) E(msg string, args ...interface{}) {
 	l.log(ERROR, msg, args...)
 }
 
-
 var Log = NewLogger(DEBUG)
 
 func TestLogger() {
