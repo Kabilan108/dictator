@@ -50,3 +50,20 @@ func NewRecordingFile() (string, error) {
 	fp := filepath.Join(d, fmt.Sprintf("%v.wav", now))
 	return fp, nil
 }
+
+func NewLogFile(prefix string) (*os.File, error) {
+	d, err := CreateAppDir(Config)("logs")
+	if err != nil {
+		return nil, err
+	}
+
+	now := time.Now().Format("01022006-150405")
+	fp := filepath.Join(d, fmt.Sprintf("%v-%v.log", prefix, now))
+
+	f, err := os.OpenFile(fp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	return f, nil
+}

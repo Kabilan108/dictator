@@ -15,11 +15,13 @@ import (
 type App struct {
 	ctx context.Context
 	ar  *app.AudioRecorder
+	ws  *app.WhisperServer
 }
 
 type Result struct {
-	Success bool   `json:"success"`
-	Error   string `json:"error,omitempty"`
+	Success    bool   `json:"success"`
+	Transcript string `json:"transcript,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // NewApp creates a new App application struct
@@ -34,8 +36,19 @@ func (a *App) startup(ctx context.Context) {
 		panic(fmt.Sprintf("failed to start audio recorder: %v", err))
 	}
 
+	ws, err := app.NewWhisperServer()
+	if err != nil {
+		panic(fmt.Sprintf("failed to start whisper server: %v", err))
+	}
+
+	err = ws.Start()
+	if err != nil {
+		panic(fmt.Sprintf("failed to start whisper server: %v", err))
+	}
+
 	a.ctx = ctx
 	a.ar = ar
+	a.ws = ws
 }
 
 // domReady is called after front-end resources have been loaded
@@ -52,7 +65,13 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 
 // shutdown is called at application termination
 func (a *App) shutdown(ctx context.Context) {
-	a.ar.Terminate()
+	if err := a.ar.Terminate(); err != nil {
+		app.Log.E("Failed to terminate audio recorder:", err)
+	}
+	if err := a.ws.Stop(); err != nil {
+		app.Log.E("Failed to stop whisper server:", err)
+	}
+	app.Log.I("Successfully cleaned up resources.")
 }
 
 // start a recording
@@ -79,11 +98,19 @@ func (a *App) StopRecording() Result {
 		return Result{Success: false, Error: "Failed to create wav file"}
 	}
 
-	app.Log.D("Stopped recording. Transcribing...")
+	app.Log.D("Stopped recording. Saving WAV file.")
 	if err := app.WriteWavFile(fp, data); err != nil {
 		app.Log.E("Failed to write WAV file:", err)
 		return Result{Success: false, Error: "Failed to write wav file"}
 	}
 
-	return Result{Success: true}
+	app.Log.D("Transcribing audio...")
+	transcript, err := a.ws.Transcribe(fp)
+	if err != nil {
+		app.Log.E("Failed to transcribe audio:", err)
+		return Result{Success: false, Error: "Failed to transcribe audio"}
+	}
+
+	app.Log.D("Transcription complete: %s", transcript)
+	return Result{Success: true, Transcript: transcript}
 }
