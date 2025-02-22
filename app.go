@@ -4,6 +4,8 @@ package main
 //       when the recording > THRESHOLD sec long -> split and start
 //       transcribing each part
 
+// TODO: run a job on start up that will remove old recordings
+
 import (
 	"context"
 	"fmt"

@@ -3,7 +3,7 @@ import { Mic } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { WindowSetSize } from "@wailsjs/runtime";
 import { Log } from "@/lib/utils";
-import { StartRecording, StopRecording } from "@wailsjs/go/main/App"; // Import Wails bindings
+import { StartRecording, StopRecording } from "@wailsjs/go/main/App";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
@@ -18,7 +18,6 @@ export function RecordingWindow() {
   const recordingModeRef = useRef<"tap" | "hold" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Start recording using Wails backend
   const startRecording = useCallback(async () => {
     try {
       const result = await StartRecording();
@@ -33,30 +32,23 @@ export function RecordingWindow() {
     }
   }, []);
 
-  // Stop recording using Wails backend
   const stopRecording = useCallback(async () => {
     try {
+      setState("transcribing");
       const result = await StopRecording();
       if (!result.success) {
         throw new Error(result.error || "Unknown error stopping recording");
       }
       finalRecordingTimeRef.current = recordingTime;
-      setState("transcribing");
-      // Simulate transcription (replace with actual transcription logic later)
-      setTimeout(() => {
-        setTranscriptionResult(
-          "This is a mock transcription result that demonstrates how the transcribed text will appear in the interface. It shows how the text flows and wraps within the window. The transcription includes multiple sentences to show proper formatting and spacing. This example also helps visualize how longer transcriptions will affect the window size and scrolling behavior. Feel free to adjust the window dimensions to see how the text adapts to different sizes."
-        );
-        setState("results");
-      }, 2000);
+      setTranscriptionResult(result.transcript || "");
+      setState("results");
     } catch (error) {
       Log.e(`Error stopping recording: ${error}`);
       setState("idle");
-      alert("Failed to stop recording. Please try again.");
+      alert(`Failed to stop recording: ${error}`);
     }
   }, [recordingTime]);
 
-  // Keyboard handling
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.code === "Space" && !e.repeat) {
@@ -103,7 +95,6 @@ export function RecordingWindow() {
     };
   }, [state, startRecording, stopRecording]);
 
-  // Timer for recording duration
   useEffect(() => {
     if (state === "recording") {
       timerRef.current = setInterval(() => {
@@ -123,7 +114,6 @@ export function RecordingWindow() {
     };
   }, [state]);
 
-  // Window resizing
   useEffect(() => {
     if (!containerRef.current) return;
     const observer = new ResizeObserver((entries) => {
@@ -168,21 +158,21 @@ export function RecordingWindow() {
           <div className="flex-1 flex flex-col ml-4">
             {state === "results" ? (
               <>
-                <p className="text-sm text-foreground mb-4 text-left">
-                  {transcriptionResult}
+                <p className="text-sm text-foreground mb-4 text-left whitespace-pre-wrap">
+                  {transcriptionResult || "No transcription available."}
                 </p>
                 <span className="text-muted-foreground font-mono mb-2 text-center">
                   {formatTime(finalRecordingTimeRef.current)}
                 </span>
                 <p className="text-xs text-muted-foreground text-center">
-                  Press &lt;esc&gt; to reset
+                  Press <kbd>Esc</kbd> to reset
                 </p>
               </>
             ) : (
               <>
                 {state === "idle" && (
                   <p className="text-muted-foreground text-center">
-                    Press and hold &lt;space&gt; to record
+                    Press and hold <kbd>Space</kbd> to record
                   </p>
                 )}
                 {state === "recording" && (
@@ -192,12 +182,12 @@ export function RecordingWindow() {
                     </span>
                     {recordingModeRef.current === "tap" && (
                       <p className="text-muted-foreground text-sm mt-1 text-center">
-                        Press &lt;space&gt; again to stop recording
+                        Press <kbd>Space</kbd> again to stop recording
                       </p>
                     )}
                     {recordingModeRef.current === "hold" && (
                       <p className="text-muted-foreground text-sm mt-1 text-center">
-                        Release &lt;space&gt; to stop recording
+                        Release <kbd>Space</kbd> to stop recording
                       </p>
                     )}
                   </>
