@@ -6,7 +6,7 @@ set -o pipefail # pipe return value = status of last command with exit status !=
 # set -x          # print commands as they are executed
 
 ROOT=$(dirname $(dirname $(realpath $0)))
-LIB="$ROOT/lib"
+BIN="$ROOT/bin"
 
 BUILD_FLAGS=""
 if [[ "$(uname)" == "Linux" ]]; then
@@ -17,14 +17,16 @@ if [[ "$(uname)" == "Linux" ]]; then
   fi
 fi
 
-mkdir -p $LIB && cd $LIB
+if [ -d $BIN ]; then
+  rm -r $BIN
+fi
+
+mkdir -p $BIN && cd $BIN
 wget https://github.com/ggerganov/whisper.cpp/archive/refs/tags/v1.7.4.zip
 unzip v1.7.4.zip && cd whisper.cpp-1.7.4
 
 cmake -B build $BUILD_FLAGS
 cmake --build build -j $(($(nproc) - 2)) --config Release
 
-# # mv build/bin/whisper-server ..
-# mv build/bin/whisper-* ..
-# cd .. && rm -r v1.7.4.zip whisper.cpp-1.7.4
-#
+cd .. && rm v1.7.4.zip
+ln -s $BIN/whisper.cpp-1.7.4/build/bin/whisper-server $BIN/whisper-server
