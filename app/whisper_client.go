@@ -91,7 +91,7 @@ func (wc *WhisperClient) Transcribe(fp string) (string, error) {
 
 	// Add API key if provided
 	if wc.ApiKey != "" {
-		req.Header.Set("X-API-Key", wc.ApiKey)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", wc.ApiKey))
 	}
 
 	// Send request
@@ -128,7 +128,7 @@ func (wc *WhisperClient) SupportsModelsEndpoint() bool {
 	}
 
 	if wc.ApiKey != "" {
-		req.Header.Set("X-API-Key", wc.ApiKey)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", wc.ApiKey))
 	}
 
 	client := &http.Client{
@@ -157,7 +157,7 @@ func (wc *WhisperClient) ListModels() ([]ModelInfo, error) {
 	}
 
 	if wc.ApiKey != "" {
-		req.Header.Set("X-API-Key", wc.ApiKey)
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", wc.ApiKey))
 	}
 
 	client := &http.Client{}
