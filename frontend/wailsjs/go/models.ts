@@ -34,10 +34,10 @@ export namespace main {
 	    }
 	}
 	export class WhisperSettings {
-	    api_url: string;
-	    api_key: string;
-	    default_model: string;
-	    supports_models: boolean;
+	    apiUrl: string;
+	    apiKey: string;
+	    defaultModel: string;
+	    supportsModels: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new WhisperSettings(source);
@@ -45,10 +45,10 @@ export namespace main {
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.api_url = source["api_url"];
-	        this.api_key = source["api_key"];
-	        this.default_model = source["default_model"];
-	        this.supports_models = source["supports_models"];
+	        this.apiUrl = source["apiUrl"];
+	        this.apiKey = source["apiKey"];
+	        this.defaultModel = source["defaultModel"];
+	        this.supportsModels = source["supportsModels"];
 	    }
 	}
 

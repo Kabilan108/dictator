@@ -9,6 +9,9 @@ import { SettingsPanel } from "./SettingsPanel";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
+const WINDOW_WIDTH = 300
+const DEFAULT_WINDOW_HEIGHT = 180
+
 export function RecordingWindow() {
   const { colors } = useTheme();
   const [state, setState] = useState<RecordingState>("idle");
@@ -142,9 +145,9 @@ export function RecordingWindow() {
       for (const entry of entries) {
         if (state === "results") {
           const { height } = entry.contentRect;
-          WindowSetSize(500, Math.ceil(height));
+          WindowSetSize(WINDOW_WIDTH, Math.ceil(height));
         } else {
-          WindowSetSize(500, 150);
+          WindowSetSize(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
         }
       }
     });
@@ -173,7 +176,7 @@ export function RecordingWindow() {
         className="flex justify-between items-center px-4 py-2"
         style={{ backgroundColor: colors.mantle }}
       >
-        <div className="text-sm font-medium">Dictator</div>
+        <div className="text-sm font-medium" style={{ color: colors.lavender }}>Dictator</div>
         <button
           onClick={toggleSettings}
           className="p-1 hover:opacity-80 transition-opacity"
@@ -195,16 +198,18 @@ export function RecordingWindow() {
             className="flex items-center justify-center rounded-full w-14 h-14 transition-all duration-300"
             style={{
               backgroundColor: state === "recording" ? colors.red : colors.accent,
-              boxShadow: `0 0 10px ${state === "recording" ? colors.red : colors.accent}40`
+              boxShadow: `0 0 10px ${state === "recording" ? colors.red : colors.accent}90`
             }}
           >
             {state === "recording" ? (
               <StopCircle className="h-6 w-6" />
             ) : state === "transcribing" ? (
-              <div className="animate-spin h-6 w-6 border-2 rounded-full border-b-transparent"
-                style={{ borderColor: colors.text, borderBottomColor: 'transparent' }} />
+              <div
+                className="animate-spin h-6 w-6 border-2 rounded-full border-b-transparent"
+                style={{ borderColor: colors.text, borderBottomColor: 'transparent' }}
+              />
             ) : (
-              <Mic className="h-6 w-6" />
+              <Mic className="h-6 w-6" style={{ color: colors.base }} />
             )}
           </button>
 

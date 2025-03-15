@@ -26,7 +26,7 @@ export const themes = {
       pink: "#f5c2e7",
       flamingo: "#f2cdcd",
       rosewater: "#f5e0dc",
-      accent: "#cba6f7", // mauve as default accent
+      accent: "#f5c2e7", // mauve as default accent
       highlight: "#89b4fa", // blue as highlight
     },
   },
