@@ -17,7 +17,14 @@ import (
 type App struct {
 	ctx context.Context
 	ar  *app.AudioRecorder
-	ws  *app.WhisperServer
+	wc  *app.WhisperClient
+}
+
+type WhisperSettings struct {
+	ApiUrl         string `json:"api_url"`
+	ApiKey         string `json:"api_key"`
+	DefaultModel   string `json:"default_model"`
+	SupportsModels bool   `json:"supports_models"`
 }
 
 type Result struct {
@@ -38,19 +45,14 @@ func (a *App) startup(ctx context.Context) {
 		panic(fmt.Sprintf("failed to start audio recorder: %v", err))
 	}
 
-	ws, err := app.NewWhisperServer()
+	wc, err := app.NewWhisperClient()
 	if err != nil {
-		panic(fmt.Sprintf("failed to start whisper server: %v", err))
-	}
-
-	err = ws.Start()
-	if err != nil {
-		panic(fmt.Sprintf("failed to start whisper server: %v", err))
+		panic(fmt.Sprintf("failed to create whisper client: %v", err))
 	}
 
 	a.ctx = ctx
 	a.ar = ar
-	a.ws = ws
+	a.wc = wc
 }
 
 // domReady is called after front-end resources have been loaded
@@ -69,9 +71,6 @@ func (a *App) beforeClose(ctx context.Context) (prevent bool) {
 func (a *App) shutdown(ctx context.Context) {
 	if err := a.ar.Terminate(); err != nil {
 		app.Log.E("Failed to terminate audio recorder:", err)
-	}
-	if err := a.ws.Stop(); err != nil {
-		app.Log.E("Failed to stop whisper server:", err)
 	}
 	app.Log.I("Successfully cleaned up resources.")
 }
@@ -107,7 +106,7 @@ func (a *App) StopRecording() Result {
 	}
 
 	app.Log.D("Transcribing audio...")
-	transcript, err := a.ws.Transcribe(fp)
+	transcript, err := a.wc.Transcribe(fp)
 	if err != nil {
 		app.Log.E("Failed to transcribe audio:", err)
 		return Result{Success: false, Error: "Failed to transcribe audio"}
@@ -115,4 +114,46 @@ func (a *App) StopRecording() Result {
 
 	app.Log.D("Transcription complete: %s", transcript)
 	return Result{Success: true, Transcript: transcript}
+}
+
+func (a *App) GetWhisperSettings() WhisperSettings {
+	supports := false
+	if a.wc != nil {
+		supports = a.wc.SupportsModelsEndpoint()
+	}
+
+	return WhisperSettings{
+		ApiUrl:         a.wc.ApiUrl,
+		ApiKey:         a.wc.ApiKey,
+		DefaultModel:   a.wc.DefaultModel,
+		SupportsModels: supports,
+	}
+}
+
+func (a *App) SaveWhisperSettings(settings WhisperSettings) Result {
+	// save settings to config
+	if err := app.SaveConfig("api_url", settings.ApiUrl); err != nil {
+		return Result{Success: false, Error: "Failed to save API URL"}
+	}
+
+	if err := app.SaveConfig("api_key", settings.ApiKey); err != nil {
+		return Result{Success: false, Error: "Failed to save API key"}
+	}
+
+	if err := app.SaveConfig("default_model", settings.DefaultModel); err != nil {
+		return Result{Success: false, Error: "Failed to save default model"}
+	}
+
+	a.wc.ApiUrl = settings.ApiUrl
+	a.wc.ApiKey = settings.ApiKey
+	a.wc.DefaultModel = settings.DefaultModel
+
+	return Result{Success: true}
+}
+
+func (a *App) ListAvailableModels() ([]app.ModelInfo, error) {
+	if a.wc == nil {
+		return nil, fmt.Errorf("whisper client not initialized")
+	}
+	return a.wc.ListModels()
 }

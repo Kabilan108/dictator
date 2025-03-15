@@ -10,8 +10,8 @@ import (
 type AppDir int
 
 const (
-	Cache AppDir = iota
-	Config
+	CacheDir AppDir = iota
+	ConfigDir
 )
 
 func createDir(path string) error {
@@ -27,9 +27,9 @@ func createDir(path string) error {
 func CreateAppDir(ad AppDir) func(name string) (string, error) {
 	var d string
 	switch ad {
-	case Cache:
+	case CacheDir:
 		d = CACHE_DIR
-	case Config:
+	case ConfigDir:
 		d = CONFIG_DIR
 	}
 	return func(name string) (string, error) {
@@ -42,7 +42,7 @@ func CreateAppDir(ad AppDir) func(name string) (string, error) {
 }
 
 func NewRecordingFile() (string, error) {
-	d, err := CreateAppDir(Cache)("recordings")
+	d, err := CreateAppDir(CacheDir)("recordings")
 	if err != nil {
 		return "", fmt.Errorf("failed to create recording directory: %w", err)
 	}
@@ -52,7 +52,7 @@ func NewRecordingFile() (string, error) {
 }
 
 func NewLogFile(prefix string) (*os.File, error) {
-	d, err := CreateAppDir(Config)("logs")
+	d, err := CreateAppDir(ConfigDir)("logs")
 	if err != nil {
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func NewLogFile(prefix string) (*os.File, error) {
 	now := time.Now().Format("01022006-150405")
 	fp := filepath.Join(d, fmt.Sprintf("%v-%v.log", prefix, now))
 
-	f, err := os.OpenFile(fp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	f, err := os.OpenFile(fp, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
