@@ -1,16 +1,20 @@
+// src/components/RecordingWindow.tsx
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Mic } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { Mic, StopCircle, Copy, Settings } from "lucide-react";
 import { WindowSetSize } from "@wailsjs/runtime";
 import { Log } from "@/lib/utils";
 import { StartRecording, StopRecording } from "@wailsjs/go/main/App";
+import { useTheme } from "@/lib/ThemeContext";
+import { SettingsPanel } from "./SettingsPanel";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
 export function RecordingWindow() {
+  const { colors } = useTheme();
   const [state, setState] = useState<RecordingState>("idle");
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcriptionResult, setTranscriptionResult] = useState<string>("");
+  const [showSettings, setShowSettings] = useState(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const finalRecordingTimeRef = useRef<number>(0);
   const keyDownTimestampRef = useRef<number>(0);
@@ -49,8 +53,18 @@ export function RecordingWindow() {
     }
   }, [recordingTime]);
 
+  const copyToClipboard = useCallback(() => {
+    navigator.clipboard.writeText(transcriptionResult).then(() => {
+      Log.i("Copied transcription to clipboard");
+    }).catch(err => {
+      Log.e(`Failed to copy: ${err}`);
+    });
+  }, [transcriptionResult]);
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (showSettings) return; // Ignore keyboard shortcuts when settings are open
+
       if (e.code === "Space" && !e.repeat) {
         e.preventDefault();
         if (state === "idle") {
@@ -67,13 +81,19 @@ export function RecordingWindow() {
           }
           stopRecording();
         }
-      } else if (e.code === "Escape" && state === "results") {
+      } else if (e.code === "Escape") {
         e.preventDefault();
-        setState("idle");
+        if (showSettings) {
+          setShowSettings(false);
+        } else if (state === "results") {
+          setState("idle");
+        }
       }
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (showSettings) return; // Ignore keyboard shortcuts when settings are open
+
       if (e.code === "Space" && state === "recording") {
         e.preventDefault();
         if (holdTimerRef.current) {
@@ -93,7 +113,7 @@ export function RecordingWindow() {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [state, startRecording, stopRecording]);
+  }, [state, startRecording, stopRecording, showSettings]);
 
   useEffect(() => {
     if (state === "recording") {
@@ -104,7 +124,9 @@ export function RecordingWindow() {
       if (timerRef.current) {
         clearInterval(timerRef.current);
       }
-      setRecordingTime(0);
+      if (state === "idle") {
+        setRecordingTime(0);
+      }
     }
 
     return () => {
@@ -122,7 +144,7 @@ export function RecordingWindow() {
           const { height } = entry.contentRect;
           WindowSetSize(500, Math.ceil(height));
         } else {
-          WindowSetSize(500, 100);
+          WindowSetSize(500, 150);
         }
       }
     });
@@ -136,72 +158,112 @@ export function RecordingWindow() {
     return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
   };
 
+  const toggleSettings = () => {
+    setShowSettings(!showSettings);
+  };
+
   return (
     <div
       ref={containerRef}
-      className="w-screen items-center bg-background text-foreground dark"
+      className="flex flex-col w-full overflow-hidden relative"
+      style={{ backgroundColor: colors.base, color: colors.text }}
     >
+      {/* Header with minimal controls */}
       <div
-        className={cn(
-          "bg-background transition-all duration-300 ease-in-out p-6",
-          "w-full flex items-center",
-          state === "results" ? "min-h-[8rem] h-auto" : "h-[140px]"
-        )}
+        className="flex justify-between items-center px-4 py-2"
+        style={{ backgroundColor: colors.mantle }}
       >
-        <div className="flex items-center w-full">
-          <Mic
-            className={cn(
-              "w-8 h-8 shrink-0",
-              state === "recording" ? "text-green-500" : "text-blue-500"
-            )}
-          />
-          <div className="flex-1 flex flex-col ml-4">
-            {state === "results" ? (
-              <>
-                <p className="text-sm text-foreground mb-4 text-left whitespace-pre-wrap">
-                  {transcriptionResult || "No transcription available."}
-                </p>
-                <span className="text-muted-foreground font-mono mb-2 text-center">
-                  {formatTime(finalRecordingTimeRef.current)}
-                </span>
-                <p className="text-xs text-muted-foreground text-center">
-                  Press <kbd>Esc</kbd> to reset
-                </p>
-              </>
+        <div className="text-sm font-medium">Dictator</div>
+        <button
+          onClick={toggleSettings}
+          className="p-1 hover:opacity-80 transition-opacity"
+          style={{ color: colors.lavender }}
+        >
+          <Settings size={16} />
+        </button>
+      </div>
+
+      {/* Settings Panel */}
+      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+
+      {/* Main content area */}
+      <div className="p-4 flex flex-col items-center">
+        {/* Recording button */}
+        <div className="flex flex-col items-center mb-4">
+          <button
+            onClick={state === "idle" ? startRecording : state === "recording" ? stopRecording : undefined}
+            className="flex items-center justify-center rounded-full w-14 h-14 transition-all duration-300"
+            style={{
+              backgroundColor: state === "recording" ? colors.red : colors.accent,
+              boxShadow: `0 0 10px ${state === "recording" ? colors.red : colors.accent}40`
+            }}
+          >
+            {state === "recording" ? (
+              <StopCircle className="h-6 w-6" />
+            ) : state === "transcribing" ? (
+              <div className="animate-spin h-6 w-6 border-2 rounded-full border-b-transparent"
+                style={{ borderColor: colors.text, borderBottomColor: 'transparent' }} />
             ) : (
-              <>
-                {state === "idle" && (
-                  <p className="text-muted-foreground text-center">
-                    Press and hold <kbd>Space</kbd> to record
-                  </p>
-                )}
-                {state === "recording" && (
-                  <>
-                    <span className="text-green-500 font-mono text-center">
-                      {formatTime(recordingTime)}
-                    </span>
-                    {recordingModeRef.current === "tap" && (
-                      <p className="text-muted-foreground text-sm mt-1 text-center">
-                        Press <kbd>Space</kbd> again to stop recording
-                      </p>
-                    )}
-                    {recordingModeRef.current === "hold" && (
-                      <p className="text-muted-foreground text-sm mt-1 text-center">
-                        Release <kbd>Space</kbd> to stop recording
-                      </p>
-                    )}
-                  </>
-                )}
-                {state === "transcribing" && (
-                  <div className="flex items-center justify-center space-x-2">
-                    <div className="animate-spin rounded-full h-4 w-4 border-2 border-primary border-t-transparent" />
-                    <span className="text-primary">Transcribing</span>
-                  </div>
-                )}
-              </>
+              <Mic className="h-6 w-6" />
+            )}
+          </button>
+
+          <div className="mt-2 text-sm">
+            {state === "idle" && (
+              <span style={{ color: colors.subtext }}>Press Space to record</span>
+            )}
+            {state === "transcribing" && (
+              <span style={{ color: colors.blue }}>Transcribing...</span>
             )}
           </div>
         </div>
+
+        {/* Waveform visualization (only during recording) */}
+        {state === "recording" && (
+          <div className="w-full flex flex-col items-center">
+            <span
+              className="font-mono text-base"
+              style={{ color: colors.accent }}
+            >
+              {formatTime(recordingTime)}
+            </span>
+          </div>
+        )}
+
+        {/* Transcript */}
+        {state === "results" && (
+          <div className="w-full mt-2">
+            <div
+              className="p-4 rounded-md text-sm leading-relaxed whitespace-pre-wrap relative group"
+              style={{ backgroundColor: colors.surface0 }}
+            >
+              {transcriptionResult}
+
+              {/* Copy button inside transcript box */}
+              <button
+                onClick={copyToClipboard}
+                className="absolute top-2 right-2 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+                style={{
+                  backgroundColor: colors.surface1,
+                  color: colors.subtext
+                }}
+              >
+                <Copy size={14} />
+              </button>
+            </div>
+
+            <div
+              className="flex justify-center items-center mt-3 text-xs"
+              style={{ color: colors.overlay }}
+            >
+              <div className="flex items-center gap-2">
+                <span className="font-mono">{formatTime(finalRecordingTimeRef.current)}</span>
+                <span className="mx-2">•</span>
+                <span>Press Esc to reset</span>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

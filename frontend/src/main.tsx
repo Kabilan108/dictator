@@ -3,13 +3,18 @@ import ReactDOM from "react-dom/client";
 
 import { RecordingWindow } from "./components/RecordingWindow";
 import "./index.css";
+import { ThemeProvider } from "./lib/ThemeContext";
 
 function App() {
-	return <RecordingWindow />;
+  return (
+    <ThemeProvider>
+      <RecordingWindow />
+    </ThemeProvider>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-	<React.StrictMode>
-		<App />
-	</React.StrictMode>,
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
 );
