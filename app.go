@@ -21,10 +21,10 @@ type App struct {
 }
 
 type WhisperSettings struct {
-	ApiUrl         string `json:"api_url"`
-	ApiKey         string `json:"api_key"`
-	DefaultModel   string `json:"default_model"`
-	SupportsModels bool   `json:"supports_models"`
+	ApiUrl         string `json:"apiUrl"`
+	ApiKey         string `json:"apiKey"`
+	DefaultModel   string `json:"defaultModel"`
+	SupportsModels bool   `json:"supportsModels"`
 }
 
 type Result struct {

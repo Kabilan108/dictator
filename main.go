@@ -26,9 +26,9 @@ func main() {
 	// Create application with options
 	err := wails.Run(&options.App{
 		Title:             "dictator",
-		Width:             500,
-		MinWidth:          500,
-		MaxWidth:          500,
+		Width:             375,
+		MinWidth:          375,
+		MaxWidth:          375,
 		Height:            150,
 		MinHeight:         150,
 		MaxHeight:         600,
