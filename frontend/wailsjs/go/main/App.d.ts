@@ -3,11 +3,11 @@
 import {main} from '../models';
 import {app} from '../models';
 
-export function GetWhisperSettings():Promise<main.WhisperSettings>;
+export function GetSettings():Promise<main.DictatorSettings>;
 
 export function ListAvailableModels():Promise<Array<app.ModelInfo>>;
 
-export function SaveWhisperSettings(arg1:main.WhisperSettings):Promise<main.Result>;
+export function SaveSettings(arg1:main.DictatorSettings):Promise<main.Result>;
 
 export function StartRecording():Promise<main.Result>;
 

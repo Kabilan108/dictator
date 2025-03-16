@@ -4,7 +4,7 @@ import { Mic, Copy, Settings, Square, X } from "lucide-react";
 import { StartRecording, StopRecording } from "@wailsjs/go/main/App";
 import { WindowSetSize } from "@wailsjs/runtime";
 
-import { SettingsPanel } from "@/components/SettingsPanel";
+import SettingsPanel from "@/components/SettingsPanel";
 import { useTheme } from "@/lib/ThemeContext";
 import { Log, formatTime } from "@/lib/utils";
 

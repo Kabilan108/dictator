@@ -17,6 +17,26 @@ export namespace app {
 
 export namespace main {
 	
+	export class DictatorSettings {
+	    apiUrl: string;
+	    apiKey: string;
+	    defaultModel: string;
+	    supportsModels: boolean;
+	    theme: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new DictatorSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.apiUrl = source["apiUrl"];
+	        this.apiKey = source["apiKey"];
+	        this.defaultModel = source["defaultModel"];
+	        this.supportsModels = source["supportsModels"];
+	        this.theme = source["theme"];
+	    }
+	}
 	export class Result {
 	    success: boolean;
 	    transcript?: string;
@@ -31,24 +51,6 @@ export namespace main {
 	        this.success = source["success"];
 	        this.transcript = source["transcript"];
 	        this.error = source["error"];
-	    }
-	}
-	export class WhisperSettings {
-	    apiUrl: string;
-	    apiKey: string;
-	    defaultModel: string;
-	    supportsModels: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new WhisperSettings(source);
-	    }
-	
-	    constructor(source: any = {}) {
-	        if ('string' === typeof source) source = JSON.parse(source);
-	        this.apiUrl = source["apiUrl"];
-	        this.apiKey = source["apiKey"];
-	        this.defaultModel = source["defaultModel"];
-	        this.supportsModels = source["supportsModels"];
 	    }
 	}
 
