@@ -5,6 +5,7 @@ import { useTheme } from "@/lib/ThemeContext";
 import { app } from "@wailsjs/go/models";
 import { GetSettings, ListAvailableModels, SaveSettings } from "@wailsjs/go/main/App";
 import { Log } from "@/lib/utils";
+import SelectBox from "./SelectBox";
 
 interface SettingsForm {
   apiUrl: string;
@@ -34,7 +35,7 @@ interface FormButtonProps extends FormProps {
 }
 
 const ThemeSelection = ({ settings, handleChange }: FormProps) => {
-  const { colors, changeTheme } = useTheme();
+  const { changeTheme } = useTheme();
 
   const onChangeTheme = (theme: string) => {
     changeTheme(theme as ThemeName)
@@ -42,35 +43,19 @@ const ThemeSelection = ({ settings, handleChange }: FormProps) => {
   }
 
   return (
-    <div
-      className="flex justify-between items-center text-sm mb-2"
-    >
+    <div className="flex justify-between items-center text-sm mb-2">
       <label>Theme</label>
-      <select
-        value={settings.theme}
-        onChange={(e) => onChangeTheme(e.target.value)}
-        disabled={!settings.isEditing}
-        className="border rounded px-1"
-        style={{
-          background: !settings.isEditing ? colors.mantle : colors.surface0,
-          borderColor: !settings.isEditing ? colors.mantle : colors.surface1,
-          color: colors.text,
-          opacity: !settings.isEditing ? 0.7 : 1
-        }}
-      >
-        {Object.keys(themes).map((name) => (
-          <option
-            key={name}
-            value={name}
-            style={{
-              backgroundColor: colors.surface0,
-              color: colors.text
-            }}
-          >
-            {themes[name as ThemeName].name}
-          </option>
-        ))}
-      </select>
+      <div className="w-40"> {/* Fixed width container for consistent sizing */}
+        <SelectBox
+          value={settings.theme}
+          onChange={onChangeTheme}
+          disabled={!settings.isEditing}
+          options={Object.keys(themes).map((name) => ({
+            value: name,
+            label: themes[name as ThemeName].name
+          }))}
+        />
+      </div>
     </div>
   )
 }
@@ -136,30 +121,14 @@ const APISettings = ({
           <label className="text-sm">Model</label>
         </div>
         {availableModels.length > 0 && settings.isEditing ? (
-          <select
+          <SelectBox
             value={settings.defaultModel}
-            onChange={(e) => handleChange('defaultModel', e.target.value)}
-            className="w-full px-3 py-1 rounded mt-1"
-            style={{
-              backgroundColor: colors.surface0,
-              color: colors.text,
-              borderColor: colors.surface1
-            }}
-          >
-            <option value="">Select a model</option>
-            {availableModels.map((model) => (
-              <option
-                key={model.id}
-                value={model.id}
-                style={{
-                  backgroundColor: colors.surface0,
-                  color: colors.text
-                }}
-              >
-                {model.id}
-              </option>
-            ))}
-          </select>
+            onChange={(value) => handleChange('defaultModel', value)}
+            options={[
+              ...availableModels.map(model => ({ value: model.id, label: model.id }))
+            ]}
+            className="w-full mt-1"
+          />
         ) : (
           <input
             type="text"
@@ -184,30 +153,46 @@ const APISettings = ({
           className="w-[50%] mx-auto mb-3 py-1 px-1 flex rounded-md justify-center items-center rounded"
           style={{
             backgroundColor: colors.surface1,
-            color: colors.text
+            color: colors.sky
           }}
         >
           {settings.isSubmitting ? (
-            <div className="animate-spin h-4 w-4 border-2 rounded-full border-b-transparent mr-2"
-              style={{ borderColor: colors.text, borderBottomColor: 'transparent' }} />
+            <div
+              className="animate-spin h-4 w-4 border-2 rounded-full border-b-transparent mr-2"
+              style={{ borderColor: colors.text, borderBottomColor: 'transparent' }}
+            />
           ) : null}
           Test Connection
         </button>
       )}
 
-      {/* Success Message */}
+      {/* Success Message as transient status badge */}
       {settings.testSuccess === true && !settings.errorMessage && (
         <div
-          className="text-sm px-3 py-2 rounded mb-3"
+          className="text-sm px-2 py-1 rounded mb-3 w-[75%] mx-auto text-center transition-opacity"
           style={{
             backgroundColor: colors.green + '20',
-            color: colors.green
+            color: colors.green,
+            border: `1px solid ${colors.green}30`,
           }}
         >
-          Connection successful!
+          Connection Successful
         </div>
       )}
 
+      {/* Error Message */}
+      {settings.errorMessage && (
+        <div
+          className="text-sm px-2 py-1 rounded mb-3 w-[75%] mx-auto text-center transition-opacity"
+          style={{
+            backgroundColor: colors.red + '20',
+            color: colors.red,
+            border: `1px solid ${colors.red}30`,
+          }}
+        >
+          {settings.errorMessage}
+        </div>
+      )}
     </div>
   )
 }
@@ -221,54 +206,56 @@ const FormButtons = ({
   const { colors } = useTheme();
 
   return (
-    <div className="flex justify-end gap-2 mb-2 sticky bottom-0 bg-inherit pt-2 px-4">
-      {!settings.isEditing ? (
-        <button
-          onClick={toggleEditMode}
-          className="py-1 px-3 rounded"
-          style={{
-            backgroundColor: colors.surface0,
-            color: colors.text
-          }}
-        >
-          Edit
-        </button>
-      ) : (
-        <>
+    <div className="flex flex-col justify-end mb-2 sticky bottom-0 bg-inherit pt-2 px-4">
+      <div className="flex justify-end gap-2">
+        {!settings.isEditing ? (
           <button
-            onClick={cancelEdit}
+            onClick={toggleEditMode}
             className="py-1 px-3 rounded"
             style={{
-              backgroundColor: 'transparent',
-              color: colors.overlay
+              backgroundColor: colors.surface0,
+              color: colors.text
             }}
           >
-            Cancel
+            Edit
           </button>
-          <button
-            onClick={saveSettings}
-            disabled={settings.isSubmitting}
-            className="py-1 px-5 rounded"
-            style={{
-              backgroundColor: colors.accent,
-              color: colors.base
-            }}
-          >
-            {settings.isSubmitting ? 'Saving...' : 'Save'}
-          </button>
-        </>
-      )}
+        ) : (
+          <>
+            <button
+              onClick={cancelEdit}
+              className="py-1 px-3 rounded"
+              style={{
+                backgroundColor: 'transparent',
+                color: colors.overlay
+              }}
+            >
+              Cancel
+            </button>
+            <button
+              onClick={saveSettings}
+              disabled={settings.isSubmitting}
+              className="py-1 px-5 rounded"
+              style={{
+                backgroundColor: colors.accent,
+                color: colors.base
+              }}
+            >
+              {settings.isSubmitting ? 'Saving...' : 'Save'}
+            </button>
+          </>
+        )}
+      </div>
     </div>
   )
 }
 
 const SettingsPanel = () => {
-  const { colors } = useTheme();
+  const { colors, themeName } = useTheme();
   const [settings, setSettings] = useState<SettingsForm>({
     apiUrl: "",
     apiKey: "",
     defaultModel: "",
-    theme: "",
+    theme: themeName, // Initialize with the current theme from ThemeContext
     isEditing: false,
     isSubmitting: false,
     errorMessage: "",
@@ -288,7 +275,8 @@ const SettingsPanel = () => {
         ...prev,
         apiUrl: response.apiUrl,
         apiKey: response.apiKey,
-        defaultModel: response.defaultModel
+        defaultModel: response.defaultModel,
+        theme: response.theme || themeName // Use theme from backend or fallback to current context theme
       }));
 
       // If models endpoint is supported, fetch available models
