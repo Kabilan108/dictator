@@ -6,7 +6,7 @@ import { app } from "@wailsjs/go/models";
 import { GetSettings, ListAvailableModels, SaveSettings } from "@wailsjs/go/main/App";
 import { Log } from "@/lib/utils";
 
-interface WhisperSettingsForm {
+interface SettingsForm {
   apiUrl: string;
   apiKey: string;
   defaultModel: string;
@@ -17,9 +17,254 @@ interface WhisperSettingsForm {
   testSuccess: boolean | null;
 }
 
+interface FormProps {
+  settings: SettingsForm,
+  handleChange: (field: keyof SettingsForm, value: string) => void,
+}
+
+interface APISettingsProps extends FormProps {
+  availableModels: app.ModelInfo[],
+  testConnection: () => void,
+}
+
+interface FormButtonProps extends FormProps {
+  cancelEdit: () => void,
+  saveSettings: () => void,
+  toggleEditMode: () => void,
+}
+
+const ThemeSelection = ({ settings, handleChange }: FormProps) => {
+  const { colors, changeTheme } = useTheme();
+
+  const onChangeTheme = (theme: string) => {
+    changeTheme(theme as ThemeName)
+    handleChange("theme", theme)
+  }
+
+  return (
+    <div
+      className="flex justify-between items-center text-sm mb-2"
+    >
+      <label>Theme</label>
+      <select
+        value={settings.theme}
+        onChange={(e) => onChangeTheme(e.target.value)}
+        disabled={!settings.isEditing}
+        className="border rounded px-1"
+        style={{
+          background: !settings.isEditing ? colors.mantle : colors.surface0,
+          borderColor: !settings.isEditing ? colors.mantle : colors.surface1,
+          color: colors.text,
+          opacity: !settings.isEditing ? 0.7 : 1
+        }}
+      >
+        {Object.keys(themes).map((name) => (
+          <option
+            key={name}
+            value={name}
+            style={{
+              backgroundColor: colors.surface0,
+              color: colors.text
+            }}
+          >
+            {themes[name as ThemeName].name}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+const APISettings = ({
+  availableModels,
+  settings,
+  handleChange,
+  testConnection,
+}: APISettingsProps) => {
+  const { colors } = useTheme();
+
+  return (
+    <div className="mb-4">
+      <h4
+        className="text-sm mb-3 pb-1 border-b"
+        style={{ borderColor: colors.surface1 }}
+      >
+        Whisper API Settings
+      </h4>
+
+      {/* API URL */}
+      <div className="mb-2">
+        <div className="flex justify-between items-center">
+          <label className="text-sm">API URL</label>
+        </div>
+        <input
+          type="text"
+          value={settings.apiUrl}
+          onChange={(e) => handleChange('apiUrl', e.target.value)}
+          disabled={!settings.isEditing}
+          className="w-full px-3 py-1 rounded mt-1"
+          style={{
+            backgroundColor: colors.surface0,
+            color: colors.text,
+            borderColor: colors.surface1
+          }}
+        />
+      </div>
+
+      {/* API Key */}
+      <div className="mb-2">
+        <div className="flex justify-between items-center">
+          <label className="text-sm">API Key</label>
+        </div>
+        <input
+          type="password"
+          value={settings.apiKey}
+          onChange={(e) => handleChange('apiKey', e.target.value)}
+          disabled={!settings.isEditing}
+          className="w-full px-3 py-1 rounded mt-1"
+          style={{
+            backgroundColor: colors.surface0,
+            color: colors.text,
+            borderColor: colors.surface1
+          }}
+        />
+      </div>
+
+      {/* Model */}
+      <div className="mb-3">
+        <div className="flex justify-between items-center">
+          <label className="text-sm">Model</label>
+        </div>
+        {availableModels.length > 0 && settings.isEditing ? (
+          <select
+            value={settings.defaultModel}
+            onChange={(e) => handleChange('defaultModel', e.target.value)}
+            className="w-full px-3 py-1 rounded mt-1"
+            style={{
+              backgroundColor: colors.surface0,
+              color: colors.text,
+              borderColor: colors.surface1
+            }}
+          >
+            <option value="">Select a model</option>
+            {availableModels.map((model) => (
+              <option
+                key={model.id}
+                value={model.id}
+                style={{
+                  backgroundColor: colors.surface0,
+                  color: colors.text
+                }}
+              >
+                {model.id}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <input
+            type="text"
+            value={settings.defaultModel}
+            onChange={(e) => handleChange('defaultModel', e.target.value)}
+            disabled={!settings.isEditing}
+            className="w-full px-3 py-1 rounded mt-1"
+            style={{
+              backgroundColor: colors.surface0,
+              color: colors.text,
+              borderColor: colors.surface1
+            }}
+          />
+        )}
+      </div>
+
+      {/* Test Connection Button */}
+      {settings.isEditing && (
+        <button
+          onClick={testConnection}
+          disabled={settings.isSubmitting}
+          className="w-[50%] mx-auto mb-3 py-1 px-1 flex rounded-md justify-center items-center rounded"
+          style={{
+            backgroundColor: colors.surface1,
+            color: colors.text
+          }}
+        >
+          {settings.isSubmitting ? (
+            <div className="animate-spin h-4 w-4 border-2 rounded-full border-b-transparent mr-2"
+              style={{ borderColor: colors.text, borderBottomColor: 'transparent' }} />
+          ) : null}
+          Test Connection
+        </button>
+      )}
+
+      {/* Success Message */}
+      {settings.testSuccess === true && !settings.errorMessage && (
+        <div
+          className="text-sm px-3 py-2 rounded mb-3"
+          style={{
+            backgroundColor: colors.green + '20',
+            color: colors.green
+          }}
+        >
+          Connection successful!
+        </div>
+      )}
+
+    </div>
+  )
+}
+
+const FormButtons = ({
+  settings,
+  cancelEdit,
+  saveSettings,
+  toggleEditMode,
+}: FormButtonProps) => {
+  const { colors } = useTheme();
+
+  return (
+    <div className="flex justify-end gap-2 mb-2 sticky bottom-0 bg-inherit pt-2 px-4">
+      {!settings.isEditing ? (
+        <button
+          onClick={toggleEditMode}
+          className="py-1 px-3 rounded"
+          style={{
+            backgroundColor: colors.surface0,
+            color: colors.text
+          }}
+        >
+          Edit
+        </button>
+      ) : (
+        <>
+          <button
+            onClick={cancelEdit}
+            className="py-1 px-3 rounded"
+            style={{
+              backgroundColor: 'transparent',
+              color: colors.overlay
+            }}
+          >
+            Cancel
+          </button>
+          <button
+            onClick={saveSettings}
+            disabled={settings.isSubmitting}
+            className="py-1 px-5 rounded"
+            style={{
+              backgroundColor: colors.accent,
+              color: colors.base
+            }}
+          >
+            {settings.isSubmitting ? 'Saving...' : 'Save'}
+          </button>
+        </>
+      )}
+    </div>
+  )
+}
+
 const SettingsPanel = () => {
-  const { themeName, colors, changeTheme } = useTheme();
-  const [settings, setSettings] = useState<WhisperSettingsForm>({
+  const { colors } = useTheme();
+  const [settings, setSettings] = useState<SettingsForm>({
     apiUrl: "",
     apiKey: "",
     defaultModel: "",
@@ -68,7 +313,7 @@ const SettingsPanel = () => {
     }
   };
 
-  const handleChange = (field: keyof WhisperSettingsForm, value: string) => {
+  const handleChange = (field: keyof SettingsForm, value: string) => {
     setSettings(prev => ({
       ...prev,
       [field]: value,
@@ -190,234 +435,41 @@ const SettingsPanel = () => {
   };
 
   return (
-    <>
-      <div className="flex justify-between items-center mt-2 mb-4">
+    <div
+      className="flex flex-col h-full"
+      style={{ maxHeight: "calc(400px - 60px)" }} // Account for header height
+    >
+      <div className="flex items-center justify-center w-full mb-4">
         <h3 className="font-medium">Settings</h3>
-        {settings.isEditing && (
-          <button
-            onClick={toggleEditMode}
-            className="text-xs py-1 px-2 rounded"
-            style={{
-              backgroundColor: colors.surface0,
-              color: colors.text
-            }}
-          >
-            Cancel Edit
-          </button>
-        )}
       </div>
 
-      {/* Theme Selection */}
-      <div className="mb-4">
-        <div
-          className="flex justify-between items-center text-sm mb-2"
-          style={{ borderBottom: `1px solid ${colors.surface1}` }}
-        >
-          <label>Theme</label>
-          <select
-            value={themeName}
-            onChange={(e) => changeTheme(e.target.value as ThemeName)}
-            className="bg-transparent border rounded px-2 py-1"
-            style={{
-              borderColor: colors.surface1,
-              color: colors.text
-            }}
-          >
-            {Object.keys(themes).map((name) => (
-              <option
-                key={name}
-                value={name}
-                style={{
-                  backgroundColor: colors.surface0,
-                  color: colors.text
-                }}
-              >
-                {themes[name as ThemeName].name}
-              </option>
-            ))}
-          </select>
-        </div>
+      <div
+        className="flex-1 overflow-y-auto px-4 space-y-4"
+        style={{
+          scrollbarWidth: 'thin',
+          scrollbarColor: `${colors.surface2} ${colors.surface0}`
+        }}
+      >
+        {/* Theme Selection */}
+        <ThemeSelection settings={settings} handleChange={handleChange} />
+
+        {/* API Settings */}
+        <APISettings
+          availableModels={availableModels}
+          settings={settings}
+          handleChange={handleChange}
+          testConnection={testConnection}
+        />
       </div>
 
-      {/* API Settings */}
-      <div className="mb-4">
-        <h4
-          className="text-sm mb-3 pb-1 border-b"
-          style={{ borderColor: colors.surface1 }}
-        >
-          Whisper API Settings
-        </h4>
-
-        {/* API URL */}
-        <div className="mb-2">
-          <div className="flex justify-between items-center">
-            <label className="text-sm">API URL</label>
-          </div>
-          <input
-            type="text"
-            value={settings.apiUrl}
-            onChange={(e) => handleChange('apiUrl', e.target.value)}
-            disabled={!settings.isEditing}
-            className="w-full px-3 py-1 rounded mt-1"
-            style={{
-              backgroundColor: colors.surface0,
-              color: colors.text,
-              borderColor: colors.surface1
-            }}
-          />
-        </div>
-
-        {/* API Key */}
-        <div className="mb-2">
-          <div className="flex justify-between items-center">
-            <label className="text-sm">API Key</label>
-          </div>
-          <input
-            type="password"
-            value={settings.apiKey}
-            onChange={(e) => handleChange('apiKey', e.target.value)}
-            disabled={!settings.isEditing}
-            className="w-full px-3 py-1 rounded mt-1"
-            style={{
-              backgroundColor: colors.surface0,
-              color: colors.text,
-              borderColor: colors.surface1
-            }}
-          />
-        </div>
-
-        {/* Model */}
-        <div className="mb-3">
-          <div className="flex justify-between items-center">
-            <label className="text-sm">Model</label>
-          </div>
-          {availableModels.length > 0 && settings.isEditing ? (
-            <select
-              value={settings.defaultModel}
-              onChange={(e) => handleChange('defaultModel', e.target.value)}
-              className="w-full px-3 py-1 rounded mt-1"
-              style={{
-                backgroundColor: colors.surface0,
-                color: colors.text,
-                borderColor: colors.surface1
-              }}
-            >
-              <option value="">Select a model</option>
-              {availableModels.map((model) => (
-                <option
-                  key={model.id}
-                  value={model.id}
-                  style={{
-                    backgroundColor: colors.surface0,
-                    color: colors.text
-                  }}
-                >
-                  {model.id}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              type="text"
-              value={settings.defaultModel}
-              onChange={(e) => handleChange('defaultModel', e.target.value)}
-              disabled={!settings.isEditing}
-              className="w-full px-3 py-1 rounded mt-1"
-              style={{
-                backgroundColor: colors.surface0,
-                color: colors.text,
-                borderColor: colors.surface1
-              }}
-            />
-          )}
-        </div>
-
-        {/* Test Connection Button */}
-        {settings.isEditing && (
-          <button
-            onClick={testConnection}
-            disabled={settings.isSubmitting}
-            className="w-full mb-3 py-2 flex justify-center items-center rounded"
-            style={{
-              backgroundColor: colors.surface1,
-              color: colors.text
-            }}
-          >
-            {settings.isSubmitting ? (
-              <div className="animate-spin h-4 w-4 border-2 rounded-full border-b-transparent mr-2"
-                style={{ borderColor: colors.text, borderBottomColor: 'transparent' }} />
-            ) : null}
-            Test Connection
-          </button>
-        )}
-
-        {/* Error Message */}
-        {settings.errorMessage && (
-          <div
-            className="text-sm px-3 py-2 rounded mb-3"
-            style={{
-              backgroundColor: settings.testSuccess ? colors.green + '20' : colors.red + '20',
-              color: settings.testSuccess ? colors.green : colors.red
-            }}
-          >
-            {settings.errorMessage}
-          </div>
-        )}
-
-        {/* Success Message */}
-        {settings.testSuccess === true && !settings.errorMessage && (
-          <div
-            className="text-sm px-3 py-2 rounded mb-3"
-            style={{
-              backgroundColor: colors.green + '20',
-              color: colors.green
-            }}
-          >
-            Connection successful!
-          </div>
-        )}
-
-        {/* Edit/Save Buttons */}
-        <div className="flex justify-end gap-2 mt-4">
-          {!settings.isEditing ? (
-            <button
-              onClick={toggleEditMode}
-              className="py-1 px-3 rounded"
-              style={{
-                backgroundColor: colors.surface0,
-                color: colors.text
-              }}
-            >
-              Edit
-            </button>
-          ) : (
-            <>
-              <button
-                onClick={cancelEdit}
-                className="py-1 px-3 rounded"
-                style={{
-                  backgroundColor: 'transparent',
-                  color: colors.overlay
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={saveSettings}
-                disabled={settings.isSubmitting}
-                className="py-1 px-5 rounded"
-                style={{
-                  backgroundColor: colors.accent,
-                  color: colors.base
-                }}
-              >
-                {settings.isSubmitting ? 'Saving...' : 'Save'}
-              </button>
-            </>
-          )}
-        </div>
-      </div>
-    </>
+      <FormButtons
+        settings={settings}
+        cancelEdit={cancelEdit}
+        handleChange={handleChange}
+        saveSettings={saveSettings}
+        toggleEditMode={toggleEditMode}
+      />
+    </div>
   );
 };
 

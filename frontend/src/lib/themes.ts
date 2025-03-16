@@ -1,4 +1,7 @@
 // src/lib/themes.ts
+//
+// implement a catpuccin latte theme
+//
 export const themes = {
   catppuccinMocha: {
     name: "Catppuccin Mocha",
@@ -30,6 +33,37 @@ export const themes = {
       highlight: "#89b4fa", // blue as highlight
     },
   },
+  catppuccinLatte: {
+    name: "Catppuccin Latte",
+    colors: {
+      base: "#eff1f5",
+      mantle: "#e6e9ef",
+      crust: "#dce0e8",
+      text: "#4c4f69",
+      subtext: "#5c5f77",
+      overlay: "#6c6f85",
+      surface0: "#ccd0da",
+      surface1: "#bcc0cc",
+      surface2: "#acb0be",
+      blue: "#1e66f5",
+      lavender: "#7287fd",
+      sapphire: "#209fb5",
+      sky: "#04a5e5",
+      teal: "#179299",
+      green: "#40a02b",
+      yellow: "#df8e1d",
+      peach: "#fe640b",
+      maroon: "#e64553",
+      red: "#d20f39",
+      mauve: "#8839ef",
+      pink: "#ea76cb",
+      flamingo: "#dd7878",
+      rosewater: "#dc8a78",
+      accent: "#8839ef",
+      highlight: "#1e66f5",
+    },
+  },
 };
 
 export type ThemeName = keyof typeof themes;
+

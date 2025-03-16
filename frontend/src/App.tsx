@@ -14,6 +14,7 @@ const WINDOW_WIDTH = 300;
 const DEFAULT_WINDOW_HEIGHT = 180;
 const MAX_WINDOW_HEIGHT = 350; // Maximum window height when showing transcript
 const MIN_RESULTS_HEIGHT = 250; // Minimum height for displaying transcript
+const SETTINGS_WINDOW_HEIGHT = 400;
 
 const StatusText = ({ text, color }: { text: string, color: string }) => {
   return (
@@ -267,7 +268,9 @@ const App = () => {
 
   // Dynamic window sizing logic based on transcript content
   useEffect(() => {
-    if (state === "idle" || state === "recording" || state === "transcribing") {
+    if (showSettings) {
+      WindowSetSize(WINDOW_WIDTH, SETTINGS_WINDOW_HEIGHT);
+    } else if (state === "idle" || state === "recording" || state === "transcribing") {
       WindowSetSize(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
     } else if (state === "results") {
       // Initial sizing to the minimum height
@@ -299,7 +302,7 @@ const App = () => {
         }
       }, 100); // Small delay to ensure the DOM has rendered
     }
-  }, [state, transcriptionResult]);
+  }, [state, transcriptionResult, showSettings]);
 
   const toggleSettings = () => {
     setShowSettings(!showSettings);
