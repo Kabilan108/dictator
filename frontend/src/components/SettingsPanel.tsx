@@ -1,29 +1,15 @@
 // src/components/SettingsPanel.tsx
 import { useTheme } from "@/lib/ThemeContext";
 import { themes, ThemeName } from "@/lib/themes";
-import { Check, X } from "lucide-react";
+import { Check} from "lucide-react";
 
-interface SettingsPanelProps {
-  onClose: () => void;
-}
-
-export function SettingsPanel({ onClose }: SettingsPanelProps) {
+export function SettingsPanel() {
   const { themeName, colors, changeTheme } = useTheme();
 
   return (
-    <div
-      className="absolute inset-0 z-10 flex flex-col p-4"
-      style={{ backgroundColor: colors.base }}
-    >
-      <div className="flex justify-between items-center mb-4">
+    <>
+      <div className="flex mt-2 mb-2">
         <h3 className="font-medium">Settings</h3>
-        <button
-          onClick={onClose}
-          className="p-1 hover:opacity-80 transition-opacity"
-          style={{ color: colors.overlay }}
-        >
-          <X size={16} />
-        </button>
       </div>
 
       <div className="mb-4">
@@ -53,6 +39,6 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
           </button>
         ))}
       </div>
-    </div>
+    </>
   );
 }

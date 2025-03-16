@@ -1,6 +1,6 @@
 // src/components/RecordingWindow.tsx
-import { useState, useEffect, useRef, useCallback } from "react";
-import { Mic, StopCircle, Copy, Settings } from "lucide-react";
+import { useState, useEffect, useRef, useCallback, RefObject } from "react";
+import { Mic, Copy, Settings, Square, X } from "lucide-react";
 import { WindowSetSize } from "@wailsjs/runtime";
 import { Log } from "@/lib/utils";
 import { StartRecording, StopRecording } from "@wailsjs/go/main/App";
@@ -9,8 +9,141 @@ import { SettingsPanel } from "./SettingsPanel";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
-const WINDOW_WIDTH = 300
-const DEFAULT_WINDOW_HEIGHT = 180
+const WINDOW_WIDTH = 300;
+const DEFAULT_WINDOW_HEIGHT = 180;
+const MAX_WINDOW_HEIGHT = 350; // Maximum window height when showing transcript
+const MIN_RESULTS_HEIGHT = 250; // Minimum height for displaying transcript
+
+const formatTime = (seconds: number) => {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+};
+
+const StatusText = ({ text, color }: { text: string, color: string }) => {
+  return (
+    <div className="w-full flex flex-col items-center mt-2 text-sm">
+      <span style={{ color: color }}>{text}</span>
+    </div>
+  )
+}
+
+const RecordButton = ({ state, onStartRecording, onStopRecording }: {
+  state: RecordingState,
+  onStartRecording: () => Promise<void>,
+  onStopRecording: () => Promise<void>,
+}) => {
+  const { colors } = useTheme()
+
+  return (
+    <div className="flex flex-col items-center mt-2 mb-4">
+      <button
+        onClick={state === "idle" ? onStartRecording : state === "recording" ? onStopRecording : undefined}
+        className="flex items-center justify-center rounded-full w-14 h-14 transition-all duration-300"
+        style={{
+          backgroundColor: state === "recording" ? colors.pink : colors.accent,
+          boxShadow: `0 0 10px ${state === "recording" ? colors.pink : colors.accent}90`
+        }}
+      >
+        {state === "recording" ? (
+          <Square className="h-6 w-6" style={{ color: colors.surface1, fill: colors.surface1 }} />
+        ) : state === "transcribing" ? (
+          <div
+            className="animate-spin h-6 w-6 border-2 rounded-full border-b-transparent"
+            style={{ borderColor: colors.text, borderBottomColor: 'transparent' }}
+          />
+        ) : (
+          <Mic className="h-6 w-6" style={{ color: colors.base }} />
+        )}
+      </button>
+    </div>
+  )
+}
+
+const Header = ({ showSettings, onToggleSettings }: {
+  showSettings: boolean,
+  onToggleSettings: () => void
+}) => {
+  const { colors } = useTheme()
+
+  return (
+    <div
+      className="flex justify-between items-center px-4 py-2"
+      style={{ backgroundColor: colors.mantle }}
+    >
+      <div className="flex items-center text-sm font-medium" style={{ color: colors.lavender }}>
+        {showSettings && <Settings size={16} className="mr-2" />} Dictator
+      </div>
+      <button
+        onClick={onToggleSettings}
+        className="p-1 hover:opacity-80 transition-opacity"
+        style={{ color: colors.lavender }}
+      >
+        {showSettings ? <X size={16} /> : <Settings size={16} />}
+      </button>
+    </div>
+  )
+}
+
+// Transcript text area with dynamic height and scrolling
+const TranscriptContainer = ({ transcript, transcriptRef, onCopy }: {
+  transcript: string,
+  transcriptRef: RefObject<HTMLDivElement>,
+  onCopy: () => void,
+}) => {
+  const { colors } = useTheme()
+
+  return (
+    <div
+      className="rounded-md text-sm relative group flex-grow"
+      style={{ backgroundColor: colors.surface0 }}
+    >
+      <div
+        ref={transcriptRef}
+        className="p-4 leading-relaxed whitespace-pre-wrap overflow-y-auto"
+        style={{
+          maxHeight: "calc(100vh - 200px)",  // Reduced max height to ensure footer visibility
+          minHeight: "80px",  // Minimum height to always show some content
+          overflowY: "auto"   // Ensure scrollbar appears when needed
+        }}
+      >
+        {transcript}
+      </div>
+
+      {/* Copy button */}
+      <button
+        onClick={onCopy}
+        className="absolute top-2 right-2 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity"
+        style={{
+          backgroundColor: colors.surface1,
+          color: colors.subtext
+        }}
+      >
+        <Copy size={14} />
+      </button>
+    </div>
+  )
+}
+
+const ResultsFooter = ({ duration }: { duration: number }) => {
+  const { colors } = useTheme()
+
+  return (
+    <div
+      className="flex justify-center items-center mt-2 pt-2 pb-4 text-xs flex-shrink-0"
+      style={{
+        color: colors.overlay,
+        paddingBottom: "8px" // Extra bottom padding to ensure visibility
+      }}
+    >
+      <div className="flex items-center gap-2">
+        <span className="font-medium">{formatTime(duration)}</span>
+        <span className="mx-2">•</span>
+        <span>Press Esc to reset</span>
+      </div>
+    </div>
+  )
+}
 
 export function RecordingWindow() {
   const { colors } = useTheme();
@@ -24,6 +157,7 @@ export function RecordingWindow() {
   const holdTimerRef = useRef<NodeJS.Timeout | null>(null);
   const recordingModeRef = useRef<"tap" | "hold" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
 
   const startRecording = useCallback(async () => {
     try {
@@ -57,11 +191,8 @@ export function RecordingWindow() {
   }, [recordingTime]);
 
   const copyToClipboard = useCallback(() => {
-    navigator.clipboard.writeText(transcriptionResult).then(() => {
-      Log.i("Copied transcription to clipboard");
-    }).catch(err => {
-      Log.e(`Failed to copy: ${err}`);
-    });
+    navigator.clipboard.writeText(transcriptionResult)
+      .catch(err => Log.e(`Failed to copy: ${err}`));
   }, [transcriptionResult]);
 
   useEffect(() => {
@@ -139,27 +270,41 @@ export function RecordingWindow() {
     };
   }, [state]);
 
+  // Dynamic window sizing logic based on transcript content
   useEffect(() => {
-    if (!containerRef.current) return;
-    const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        if (state === "results") {
-          const { height } = entry.contentRect;
-          WindowSetSize(WINDOW_WIDTH, Math.ceil(height));
-        } else {
-          WindowSetSize(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
-        }
-      }
-    });
-    observer.observe(containerRef.current);
-    return () => observer.disconnect();
-  }, [state]);
+    if (state === "idle" || state === "recording" || state === "transcribing") {
+      WindowSetSize(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+    } else if (state === "results") {
+      // Initial sizing to the minimum height
+      WindowSetSize(WINDOW_WIDTH, MIN_RESULTS_HEIGHT);
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-  };
+      // After render, measure the transcript content height and adjust window size
+      setTimeout(() => {
+        if (transcriptRef.current) {
+          // Get the height of the transcript content
+          const contentHeight = transcriptRef.current.scrollHeight;
+
+          // Calculate the necessary window height
+          // The container will need space for:
+          // header (40px) + transcript content + footer (50px) + padding (30px)
+          const footerHeight = 50;
+          const headerHeight = 40;
+          const paddingSpace = 30;
+
+          const necessaryHeight = Math.min(
+            contentHeight + headerHeight + footerHeight + paddingSpace,
+            MAX_WINDOW_HEIGHT
+          );
+
+          // Use at least the minimum height, but not more than the maximum
+          const newHeight = Math.max(MIN_RESULTS_HEIGHT, necessaryHeight);
+
+          // Set the window size with additional buffer to ensure footer is visible
+          WindowSetSize(WINDOW_WIDTH, newHeight + 20); // Extra buffer for footer
+        }
+      }, 100); // Small delay to ensure the DOM has rendered
+    }
+  }, [state, transcriptionResult]);
 
   const toggleSettings = () => {
     setShowSettings(!showSettings);
@@ -168,107 +313,41 @@ export function RecordingWindow() {
   return (
     <div
       ref={containerRef}
-      className="flex flex-col w-full overflow-hidden relative"
+      className="flex flex-col w-full h-full overflow-hidden relative flex-grow"
       style={{ backgroundColor: colors.base, color: colors.text }}
     >
       {/* Header with minimal controls */}
-      <div
-        className="flex justify-between items-center px-4 py-2"
-        style={{ backgroundColor: colors.mantle }}
-      >
-        <div className="text-sm font-medium" style={{ color: colors.lavender }}>Dictator</div>
-        <button
-          onClick={toggleSettings}
-          className="p-1 hover:opacity-80 transition-opacity"
-          style={{ color: colors.lavender }}
-        >
-          <Settings size={16} />
-        </button>
-      </div>
+      <Header showSettings={showSettings} onToggleSettings={toggleSettings} />
 
-      {/* Settings Panel */}
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
 
-      {/* Main content area */}
-      <div className="p-4 flex flex-col items-center">
-        {/* Recording button */}
-        <div className="flex flex-col items-center mb-4">
-          <button
-            onClick={state === "idle" ? startRecording : state === "recording" ? stopRecording : undefined}
-            className="flex items-center justify-center rounded-full w-14 h-14 transition-all duration-300"
-            style={{
-              backgroundColor: state === "recording" ? colors.red : colors.accent,
-              boxShadow: `0 0 10px ${state === "recording" ? colors.red : colors.accent}90`
-            }}
-          >
-            {state === "recording" ? (
-              <StopCircle className="h-6 w-6" />
-            ) : state === "transcribing" ? (
-              <div
-                className="animate-spin h-6 w-6 border-2 rounded-full border-b-transparent"
-                style={{ borderColor: colors.text, borderBottomColor: 'transparent' }}
-              />
-            ) : (
-              <Mic className="h-6 w-6" style={{ color: colors.base }} />
-            )}
-          </button>
+      {/* Main content area with padding adjustments to ensure footer visibility */}
+      <div className="px-4 pt-2 pb-2 flex flex-col flex-1">
+        {showSettings ? <SettingsPanel onClose={() => setShowSettings(false)} /> : (
+          <>
+            {/* Recording button */}
+            <RecordButton state={state} onStartRecording={startRecording} onStopRecording={stopRecording} />
 
-          <div className="mt-2 text-sm">
-            {state === "idle" && (
-              <span style={{ color: colors.subtext }}>Press Space to record</span>
-            )}
-            {state === "transcribing" && (
-              <span style={{ color: colors.blue }}>Transcribing...</span>
-            )}
-          </div>
-        </div>
+            {state === "idle" && <StatusText text={"Press Space to record"} color={colors.subtext} />}
+            {state === "transcribing" && <StatusText text={"Transcribing..."} color={colors.accent} />}
+            {state === "recording" && <StatusText text={formatTime(recordingTime)} color={colors.accent} />}
 
-        {/* Waveform visualization (only during recording) */}
-        {state === "recording" && (
-          <div className="w-full flex flex-col items-center">
-            <span
-              className="font-mono text-base"
-              style={{ color: colors.accent }}
-            >
-              {formatTime(recordingTime)}
-            </span>
-          </div>
-        )}
+            {/* Results area with dynamic sizing and reliable scrolling */}
+            {state === "results" && (
+              <div className="w-full mt-2 flex flex-col flex-grow flex-shrink-0">
+                {/* Transcript text area with dynamic height and scrolling */}
+                <TranscriptContainer
+                  transcript={transcriptionResult}
+                  transcriptRef={transcriptRef}
+                  onCopy={copyToClipboard}
+                />
 
-        {/* Transcript */}
-        {state === "results" && (
-          <div className="w-full mt-2">
-            <div
-              className="p-4 rounded-md text-sm leading-relaxed whitespace-pre-wrap relative group"
-              style={{ backgroundColor: colors.surface0 }}
-            >
-              {transcriptionResult}
-
-              {/* Copy button inside transcript box */}
-              <button
-                onClick={copyToClipboard}
-                className="absolute top-2 right-2 p-1.5 rounded opacity-0 group-hover:opacity-100 transition-opacity"
-                style={{
-                  backgroundColor: colors.surface1,
-                  color: colors.subtext
-                }}
-              >
-                <Copy size={14} />
-              </button>
-            </div>
-
-            <div
-              className="flex justify-center items-center mt-3 text-xs"
-              style={{ color: colors.overlay }}
-            >
-              <div className="flex items-center gap-2">
-                <span className="font-mono">{formatTime(finalRecordingTimeRef.current)}</span>
-                <span className="mx-2">•</span>
-                <span>Press Esc to reset</span>
+                {/* Time and reset instructions - always at bottom with extra padding */}
+                <ResultsFooter duration={finalRecordingTimeRef.current} />
               </div>
-            </div>
-          </div>
+            )}
+          </>
         )}
+
       </div>
     </div>
   );

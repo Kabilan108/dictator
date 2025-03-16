@@ -29,7 +29,7 @@ func main() {
 		Width:             375,
 		MinWidth:          375,
 		MaxWidth:          375,
-		Height:            150,
+		Height:            180, // Match DEFAULT_WINDOW_HEIGHT from frontend
 		MinHeight:         150,
 		MaxHeight:         600,
 		DisableResize:     false,
@@ -37,7 +37,7 @@ func main() {
 		Frameless:         false,
 		StartHidden:       false,
 		HideWindowOnClose: false,
-		BackgroundColour:  &options.RGBA{R: 255, G: 255, B: 255, A: 255},
+		BackgroundColour:  &options.RGBA{R: 30, G: 32, B: 33, A: 255},
 		AssetServer: &assetserver.Options{
 			Assets: assets,
 		},
