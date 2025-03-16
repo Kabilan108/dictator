@@ -1,11 +1,10 @@
-// src/components/RecordingWindow.tsx
 import { useState, useEffect, useRef, useCallback, RefObject } from "react";
-import { Mic, Copy, Settings, Square, X } from "lucide-react";
-import { WindowSetSize } from "@wailsjs/runtime";
-import { Log } from "@/lib/utils";
+import { Mic, Copy, Check, Settings, Square, X } from "lucide-react";
 import { StartRecording, StopRecording } from "@wailsjs/go/main/App";
+import { WindowSetSize } from "@wailsjs/runtime";
+import { themes, ThemeName } from "@/lib/themes";
 import { useTheme } from "@/lib/ThemeContext";
-import { SettingsPanel } from "./SettingsPanel";
+import { Log, formatTime } from "@/lib/utils";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
@@ -13,12 +12,6 @@ const WINDOW_WIDTH = 300;
 const DEFAULT_WINDOW_HEIGHT = 180;
 const MAX_WINDOW_HEIGHT = 350; // Maximum window height when showing transcript
 const MIN_RESULTS_HEIGHT = 250; // Minimum height for displaying transcript
-
-const formatTime = (seconds: number) => {
-  const mins = Math.floor(seconds / 60);
-  const secs = seconds % 60;
-  return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
-};
 
 const StatusText = ({ text, color }: { text: string, color: string }) => {
   return (
@@ -145,7 +138,48 @@ const ResultsFooter = ({ duration }: { duration: number }) => {
   )
 }
 
-export function RecordingWindow() {
+
+export function SettingsPanel() {
+  const { themeName, colors, changeTheme } = useTheme();
+
+  return (
+    <>
+      <div className="flex mt-2 mb-2">
+        <h3 className="font-medium">Settings</h3>
+      </div>
+
+      <div className="mb-4">
+        <h4
+          className="text-sm mb-2 pb-1 border-b"
+          style={{ borderColor: colors.surface1 }}
+        >
+          Theme
+        </h4>
+        {Object.keys(themes).map((name) => (
+          <button
+            key={name}
+            onClick={() => changeTheme(name as ThemeName)}
+            className="flex items-center w-full px-2 py-1.5 rounded mb-1 hover:cursor-pointer"
+            style={{
+              backgroundColor: themeName === name ? colors.surface0 : 'transparent',
+            }}
+          >
+            <div
+              className="w-4 h-4 rounded-full mr-2"
+              style={{ backgroundColor: themes[name as ThemeName].colors.accent }}
+            />
+            <span className="flex-1 text-left text-sm">{themes[name as ThemeName].name}</span>
+            {themeName === name && (
+              <Check size={14} style={{ color: colors.green }} />
+            )}
+          </button>
+        ))}
+      </div>
+    </>
+  );
+}
+
+const App = () => {
   const { colors } = useTheme();
   const [state, setState] = useState<RecordingState>("idle");
   const [recordingTime, setRecordingTime] = useState(0);
@@ -322,7 +356,7 @@ export function RecordingWindow() {
 
       {/* Main content area with padding adjustments to ensure footer visibility */}
       <div className="px-4 pt-2 pb-2 flex flex-col flex-1">
-        {showSettings ? <SettingsPanel onClose={() => setShowSettings(false)} /> : (
+        {showSettings ? <SettingsPanel /> : (
           <>
             {/* Recording button */}
             <RecordButton state={state} onStartRecording={startRecording} onStopRecording={stopRecording} />
@@ -352,3 +386,4 @@ export function RecordingWindow() {
     </div>
   );
 }
+export default App;

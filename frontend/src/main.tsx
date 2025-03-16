@@ -1,20 +1,14 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 
-import { RecordingWindow } from "./components/RecordingWindow";
+import App from "@/App"
+import { ThemeProvider } from "@/lib/ThemeContext";
 import "./index.css";
-import { ThemeProvider } from "./lib/ThemeContext";
-
-function App() {
-  return (
-    <ThemeProvider>
-      <RecordingWindow />
-    </ThemeProvider>
-  );
-}
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    <ThemeProvider>
+      <App />
+    </ThemeProvider>
   </React.StrictMode>,
 );
