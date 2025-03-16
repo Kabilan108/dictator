@@ -1,9 +1,5 @@
 package main
 
-// TODO: make this better for longer recordings
-//       when the recording > THRESHOLD sec long -> split and start
-//       transcribing each part
-
 // TODO: run a job on start up that will remove old recordings
 
 import (
@@ -20,11 +16,12 @@ type App struct {
 	wc  *app.WhisperClient
 }
 
-type WhisperSettings struct {
+type DictatorSettings struct {
 	ApiUrl         string `json:"apiUrl"`
 	ApiKey         string `json:"apiKey"`
 	DefaultModel   string `json:"defaultModel"`
 	SupportsModels bool   `json:"supportsModels"`
+	Theme          string `json:"theme"`
 }
 
 type Result struct {
@@ -116,37 +113,37 @@ func (a *App) StopRecording() Result {
 	return Result{Success: true, Transcript: transcript}
 }
 
-func (a *App) GetWhisperSettings() WhisperSettings {
+func (a *App) GetSettings() DictatorSettings {
 	supports := false
 	if a.wc != nil {
 		supports = a.wc.SupportsModelsEndpoint()
 	}
 
-	return WhisperSettings{
+	return DictatorSettings{
 		ApiUrl:         a.wc.ApiUrl,
 		ApiKey:         a.wc.ApiKey,
 		DefaultModel:   a.wc.DefaultModel,
 		SupportsModels: supports,
+		Theme:          a.wc.Theme,
 	}
 }
 
-func (a *App) SaveWhisperSettings(settings WhisperSettings) Result {
-	// save settings to config
-	if err := app.SaveConfig("api_url", settings.ApiUrl); err != nil {
-		return Result{Success: false, Error: "Failed to save API URL"}
+func (a *App) SaveSettings(settings DictatorSettings) Result {
+	newConfig := app.DictatorConfig{
+		ApiUrl:       settings.ApiUrl,
+		ApiKey:       settings.ApiKey,
+		DefaultModel: settings.DefaultModel,
+		Theme:        settings.Theme,
 	}
 
-	if err := app.SaveConfig("api_key", settings.ApiKey); err != nil {
-		return Result{Success: false, Error: "Failed to save API key"}
-	}
-
-	if err := app.SaveConfig("default_model", settings.DefaultModel); err != nil {
-		return Result{Success: false, Error: "Failed to save default model"}
+	if err := app.SaveConfig(newConfig); err != nil {
+		return Result{Success: false, Error: "Failed to save config"}
 	}
 
 	a.wc.ApiUrl = settings.ApiUrl
 	a.wc.ApiKey = settings.ApiKey
 	a.wc.DefaultModel = settings.DefaultModel
+	a.wc.Theme = settings.Theme
 
 	return Result{Success: true}
 }

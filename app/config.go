@@ -2,9 +2,17 @@ package app
 
 import (
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 )
+
+type DictatorConfig struct {
+	ApiUrl       string `json:"apiUrl"`
+	ApiKey       string `json:"apiKey"`
+	DefaultModel string `json:"defaultModel"`
+	Theme        string `json:"theme"`
+}
 
 var CONFIG_DIR = func() string {
 	dir, err := os.UserConfigDir()
@@ -22,58 +30,47 @@ var CACHE_DIR = func() string {
 	return filepath.Join(dir, "dictator")
 }()
 
-// GetConfigString retrieves a string value from configuration with a fallback
-func GetConfigString(key string, fallback string) string {
-	// Then check config file (implementation will depend on your preference)
-	configPath := filepath.Join(CONFIG_DIR, "config.json")
-	if _, err := os.Stat(configPath); err == nil {
-		// Config file exists, parse it
-		configFile, err := os.ReadFile(configPath)
-		if err == nil {
-			var config map[string]interface{}
-			if err := json.Unmarshal(configFile, &config); err == nil {
-				if val, ok := config[key].(string); ok && val != "" {
-					return val
-				}
-			}
-		}
-	}
-
-	return fallback
+var defaultConfig = DictatorConfig{
+	ApiUrl:       "http://localhost:9934",
+	ApiKey:       "",
+	DefaultModel: "",
+	Theme:        "catppuccinMocha",
 }
 
-// SaveConfig saves a configuration value
-func SaveConfig(key string, value string) error {
-	// Ensure config directory exists
-	if err := createDir(CONFIG_DIR); err != nil {
-		return err
-	}
-
+func LoadConfig() DictatorConfig {
 	configPath := filepath.Join(CONFIG_DIR, "config.json")
+	config := defaultConfig
 
-	// Load existing config or create new
-	var config map[string]interface{}
 	if _, err := os.Stat(configPath); err == nil {
 		configFile, err := os.ReadFile(configPath)
-		if err != nil {
-			return err
+		if err == nil {
+			err = json.Unmarshal(configFile, &config)
+			if err != nil {
+				log.Printf("Error parsing config file: %v", err)
+			}
+		} else {
+			log.Printf("Error reading config file: %v", err)
 		}
-
-		if err := json.Unmarshal(configFile, &config); err != nil {
-			config = make(map[string]interface{})
-		}
-	} else {
-		config = make(map[string]interface{})
 	}
 
-	// Update config
-	config[key] = value
+	return config
+}
 
-	// Save config
-	configData, err := json.MarshalIndent(config, "", "  ")
+func SaveConfig(config DictatorConfig) error {
+	configPath := filepath.Join(CONFIG_DIR, "config.json")
+
+	// Ensure directory exists
+	err := os.MkdirAll(CONFIG_DIR, 0o755)
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(configPath, configData, 0o644)
+	// Marshal config to JSON
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// Write to file
+	return os.WriteFile(configPath, data, 0o644)
 }

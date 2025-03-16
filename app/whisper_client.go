@@ -17,6 +17,7 @@ type WhisperClient struct {
 	ApiUrl       string
 	ApiKey       string
 	DefaultModel string
+	Theme        string
 }
 
 type WhisperResponse struct {
@@ -32,17 +33,13 @@ type ModelsResponse struct {
 }
 
 func NewWhisperClient() (*WhisperClient, error) {
-	// load config
-	apiUrl := GetConfigString("api_url", "http://localhost:9934")
-	apiKey := GetConfigString("api_key", "")
-	defautModel := GetConfigString("default_model", "")
-
+	c := LoadConfig()
 	client := &WhisperClient{
-		ApiUrl:       apiUrl,
-		ApiKey:       apiKey,
-		DefaultModel: defautModel,
+		ApiUrl:       c.ApiUrl,
+		ApiKey:       c.ApiKey,
+		DefaultModel: c.DefaultModel,
+		Theme:        c.Theme,
 	}
-
 	return client, nil
 }
 
