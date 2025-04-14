@@ -1,6 +1,42 @@
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v2.3.0
+    rev: v4.5.0
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: biome-check
+        name: Biome Check
+        description: Run Biome linter on staged files
+        entry: npx @biomejs/biome check
+        language: system
+        types: [file]
+        files: \.(js|ts|jsx|tsx)$
+
+      - id: biome-format
+        name: Biome Format
+        description: Run Biome formatter on staged files
+        entry: npx @biomejs/biome format --write
+        language: system
+        types: [file]
+        files: \.(js|ts|jsx|tsx)$
+        
+      - id: cargo-clippy
+        name: Cargo Clippy
+        description: Run Rust linter on staged files
+        entry: cd src-tauri && cargo clippy -- -D warnings
+        language: system
+        pass_filenames: false
+        types: [file]
+        files: ^src-tauri/src/.*\.rs$
+
+      - id: cargo-fmt
+        name: Cargo Format
+        description: Run Rust formatter on staged files
+        entry: cd src-tauri && cargo fmt
+        language: system
+        pass_filenames: false
+        types: [file]
+        files: ^src-tauri/src/.*\.rs$
