@@ -22,7 +22,7 @@ repos:
         language: system
         types: [file]
         files: \.(js|ts|jsx|tsx)$
-        
+
       - id: cargo-clippy
         name: Cargo Clippy
         description: Run Rust linter on staged files
