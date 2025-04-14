@@ -21,7 +21,7 @@ pub enum WhisperError {
     Json(#[from] serde_json::Error),
     #[error("File not found: {0}")]
     FileNotFound(String),
-     #[error("Model listing not supported by this API")]
+    #[error("Model listing not supported by this API")]
     ModelListingNotSupported,
 }
 
@@ -62,10 +62,13 @@ impl WhisperClient {
 
     // Helper to get current config values safely
     fn get_api_details(&self) -> (String, String, String) {
-         let config = self.config.lock().unwrap();
-         (config.api_url.clone(), config.api_key.clone(), config.default_model.clone())
+        let config = self.config.lock().unwrap();
+        (
+            config.api_url.clone(),
+            config.api_key.clone(),
+            config.default_model.clone(),
+        )
     }
-
 
     pub async fn transcribe(&self, file_path: &Path) -> Result<WhisperResponse, WhisperError> {
         if !file_path.exists() {
@@ -108,7 +111,10 @@ impl WhisperClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-            let error_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
             log::error!("API Error: Status {}, Body: {}", status, error_text);
             return Err(WhisperError::ApiError {
                 status,
@@ -124,8 +130,7 @@ impl WhisperClient {
         let (api_url, api_key, _) = self.get_api_details();
         let url = format!("{}/v1/models", api_url);
 
-        let mut request_builder = self.client.get(&url)
-            .timeout(Duration::from_secs(5)); // Shorter timeout for check
+        let mut request_builder = self.client.get(&url).timeout(Duration::from_secs(5)); // Shorter timeout for check
 
         if !api_key.is_empty() {
             request_builder = request_builder.bearer_auth(api_key);
@@ -136,21 +141,20 @@ impl WhisperClient {
             Err(e) => {
                 // Distinguish between network errors and non-200 responses
                 if e.is_connect() || e.is_timeout() {
-                     log::warn!("Could not connect to models endpoint: {}", e);
-                     Ok(false) // Treat connection errors as "not supported"
+                    log::warn!("Could not connect to models endpoint: {}", e);
+                    Ok(false) // Treat connection errors as "not supported"
                 } else {
-                     log::error!("Error checking models endpoint: {}", e);
-                     Err(WhisperError::Reqwest(e)) // Other reqwest errors
+                    log::error!("Error checking models endpoint: {}", e);
+                    Err(WhisperError::Reqwest(e)) // Other reqwest errors
                 }
             }
         }
     }
 
-
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>, WhisperError> {
-         if !self.supports_models_endpoint().await? {
-             return Err(WhisperError::ModelListingNotSupported);
-         }
+        if !self.supports_models_endpoint().await? {
+            return Err(WhisperError::ModelListingNotSupported);
+        }
 
         let (api_url, api_key, _) = self.get_api_details();
         let url = format!("{}/v1/models", api_url);
@@ -165,8 +169,14 @@ impl WhisperClient {
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
-             let error_text = response.text().await.unwrap_or_else(|_| "Failed to read error body".to_string());
-            return Err(WhisperError::ApiError { status, message: error_text });
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Failed to read error body".to_string());
+            return Err(WhisperError::ApiError {
+                status,
+                message: error_text,
+            });
         }
 
         let models_response: ModelsResponse = response.json().await?;

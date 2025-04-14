@@ -279,7 +279,7 @@ const App = () => {
     const resizeWindow = async (width: number, height: number) => {
       try {
         Log.d(`Resizing window to ${width}x${height}`);
-        // FIXME: 
+        // FIXME:
         // await appWindow.setSize(new LogicalSize(width, height));
       } catch (e) {
         Log.e("Failed to resize window:", e);

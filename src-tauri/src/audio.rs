@@ -57,7 +57,6 @@ unsafe impl Send for SendStream {}
 unsafe impl Sync for SendStream {}
 // --- End Wrapper ---
 
-
 // Main struct, needs to be Send + Sync
 pub struct AudioRecorder {
     shared_state: Arc<Mutex<RecorderSharedState>>,
@@ -70,7 +69,6 @@ pub struct AudioRecorder {
     // Use the wrapper type here
     active_stream: Mutex<Option<SendStream>>,
 }
-
 
 impl AudioRecorder {
     pub fn new() -> Result<Self, AudioError> {
@@ -86,12 +84,23 @@ impl AudioRecorder {
         let target_channels = 1;
 
         let config = supported_configs
-            .filter(|c| c.sample_format() == SampleFormat::F32 || c.sample_format() == SampleFormat::I16)
-            .find(|c| c.min_sample_rate() <= target_sr && target_sr <= c.max_sample_rate() && c.channels() == target_channels)
+            .filter(|c| {
+                c.sample_format() == SampleFormat::F32 || c.sample_format() == SampleFormat::I16
+            })
+            .find(|c| {
+                c.min_sample_rate() <= target_sr
+                    && target_sr <= c.max_sample_rate()
+                    && c.channels() == target_channels
+            })
             .map(|c| c.with_sample_rate(target_sr))
             .or_else(|| {
-                device.supported_input_configs().ok()?
-                    .filter(|c| c.sample_format() == SampleFormat::F32 || c.sample_format() == SampleFormat::I16)
+                device
+                    .supported_input_configs()
+                    .ok()?
+                    .filter(|c| {
+                        c.sample_format() == SampleFormat::F32
+                            || c.sample_format() == SampleFormat::I16
+                    })
                     .find(|c| c.channels() == target_channels)
                     .map(|c| c.with_max_sample_rate())
             })
@@ -115,7 +124,7 @@ impl AudioRecorder {
 
         let mut shared_state_guard = self.shared_state.lock().unwrap();
         if shared_state_guard.is_recording {
-             return Err(AudioError::AlreadyRecording);
+            return Err(AudioError::AlreadyRecording);
         }
         shared_state_guard.buffer.clear();
         shared_state_guard.is_recording = true;
@@ -130,7 +139,7 @@ impl AudioRecorder {
         let config_ref = &self.config;
 
         let stream = match config_ref.sample_format() {
-             SampleFormat::F32 => self.device.build_input_stream(
+            SampleFormat::F32 => self.device.build_input_stream(
                 &config_ref.config(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     let mut state = shared_state_clone.lock().unwrap();
@@ -146,7 +155,8 @@ impl AudioRecorder {
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     let mut state = shared_state_clone.lock().unwrap();
                     if state.is_recording {
-                        let samples_f32: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                        let samples_f32: Vec<f32> =
+                            data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
                         state.buffer.extend_from_slice(&samples_f32);
                     }
                 },
@@ -186,7 +196,10 @@ impl AudioRecorder {
             buffer_copy
         };
 
-        log::info!("Stopping recording. Buffer size: {} samples", buffer_copy.len());
+        log::info!(
+            "Stopping recording. Buffer size: {} samples",
+            buffer_copy.len()
+        );
 
         // --- Write WAV file ---
         let spec = hound::WavSpec {
@@ -202,7 +215,8 @@ impl AudioRecorder {
         let mut wav_writer = hound::WavWriter::new(buf_writer, spec)?;
 
         for sample_f32 in buffer_copy {
-            let sample_i16 = (sample_f32 * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+            let sample_i16 =
+                (sample_f32 * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
             wav_writer.write_sample(sample_i16)?;
         }
 
@@ -214,17 +228,17 @@ impl AudioRecorder {
 
     // list_devices remains the same
     pub fn list_devices() -> Result<Vec<String>, String> {
-         let host = cpal::default_host();
-         let devices = host.input_devices().map_err(|e| e.to_string())?;
-         let mut device_names = Vec::new();
-         for device in devices {
-             match device.name() {
-                 Ok(name) => device_names.push(name),
-                 Err(e) => log::warn!("Failed to get device name: {}", e),
-             }
-         }
-         Ok(device_names)
-     }
+        let host = cpal::default_host();
+        let devices = host.input_devices().map_err(|e| e.to_string())?;
+        let mut device_names = Vec::new();
+        for device in devices {
+            match device.name() {
+                Ok(name) => device_names.push(name),
+                Err(e) => log::warn!("Failed to get device name: {}", e),
+            }
+        }
+        Ok(device_names)
+    }
 }
 
 // Note: If errors persist related to Device or SupportedStreamConfig not being Send/Sync,

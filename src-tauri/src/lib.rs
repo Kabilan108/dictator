@@ -108,12 +108,15 @@ pub async fn run() {
             crate::commands::supports_models_endpoint,
             // Add other commands here
         ])
-        .setup(|app| {
-            log::info!("Tauri setup hook running.");
-            // You can perform setup tasks here if needed, like creating the main window
-            // let main_window = app.get_webview_window("main").unwrap();
-            Ok(())
-        })
+        .setup(
+            #[allow(unused_variables)]
+            |app| {
+                log::info!("Tauri setup hook running.");
+                // You can perform setup tasks here if needed, like creating the main window
+                // let main_window = app.get_webview_window("main").unwrap();
+                Ok(())
+            },
+        )
         .run(tauri::generate_context!()) // generate_context! usually works fine here
         .expect("error while running tauri application");
 

@@ -66,4 +66,3 @@ export const themes = {
 };
 
 export type ThemeName = keyof typeof themes;
-
