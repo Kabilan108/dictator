@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback, RefObject } from "react";
 import { Mic, Copy, Settings, Square, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow, LogicalSize  } from "@tauri-apps/api/window"
 
 import SettingsPanel from "@/components/SettingsPanel";
 import { useTheme } from "@/lib/ThemeContext";
@@ -15,6 +16,9 @@ const DEFAULT_WINDOW_HEIGHT = 180;
 const MAX_WINDOW_HEIGHT = 350;
 const MIN_RESULTS_HEIGHT = 250;
 const SETTINGS_WINDOW_HEIGHT = 400; // Or adjust as needed
+
+// handle to get current Tauri window
+const appWindow = getCurrentWindow();
 
 const StatusText = ({ text, color }: { text: string, color: string }) => {
   return (
@@ -279,8 +283,7 @@ const App = () => {
     const resizeWindow = async (width: number, height: number) => {
       try {
         Log.d(`Resizing window to ${width}x${height}`);
-        // FIXME:
-        // await appWindow.setSize(new LogicalSize(width, height));
+        await appWindow.setSize(new LogicalSize(width, height));
       } catch (e) {
         Log.e("Failed to resize window:", e);
       }
