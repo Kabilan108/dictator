@@ -10,7 +10,7 @@
     "tauri": "tauri",
     "lint": "biome check src/",
     "format": "biome format src/ --write",
-    "format:check": "biome format src/ --write=false",
+    "format:check": "biome format src/ --write=false"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.0.5",

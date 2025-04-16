@@ -43,3 +43,6 @@ build/bin
 bin/
 models/
 data/
+
+src-tauri/target/
+src-tauri/gen/schemas
