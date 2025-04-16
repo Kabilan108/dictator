@@ -46,6 +46,7 @@ pub fn create_new_recording_file_path() -> Result<PathBuf, FileError> {
 }
 
 // TODO: Implement cleanup function for old recordings
+// Issue URL: https://github.com/Kabilan108/dictator/issues/1
 pub fn cleanup_old_recordings() -> Result<(), FileError> {
     log::info!("Running cleanup for old recordings (Not Implemented Yet)");
     // 1. Get recordings dir
