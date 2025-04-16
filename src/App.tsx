@@ -1,17 +1,15 @@
 import { useState, useEffect, useRef, useCallback, RefObject } from "react";
 import { Mic, Copy, Settings, Square, X } from "lucide-react";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window"
 
 import SettingsPanel from "@/components/SettingsPanel";
-import { useRecording } from "@/hooks/useRecording";
+import useRecording from "@/hooks/useRecording";
+import useWindowSize from "@/hooks/useWindowSize";
 import { useTheme } from "@/lib/ThemeContext";
 import { Log, formatTime } from "@/lib/utils";
+import { RecordingState } from "@/types"
 import { WINDOW, KEY_HOLD_DELAY } from "@/config"
 
-type RecordingState = "idle" | "recording" | "transcribing" | "results";
-
 // handle to get current Tauri window
-const appWindow = getCurrentWindow();
 
 const StatusText = ({ text, color }: { text: string, color: string }) => {
   return (
@@ -156,6 +154,8 @@ const App = () => {
   const containerRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
+  useWindowSize(state, transcript, showSettings, transcriptRef);
+
   const copyToClipboard = useCallback(() => {
     navigator.clipboard.writeText(transcript)
       .then(() => Log.i("Transcript copied to clipboard"))
@@ -215,42 +215,6 @@ const App = () => {
       window.removeEventListener("keyup", handleKeyUp);
     };
   }, [state, startRecording, stopRecording, showSettings]);
-
-  // Dynamic window sizing logic based on transcript content
-  useEffect(() => {
-    const resizeWindow = async (width: number, height: number) => {
-      try {
-        Log.d(`Resizing window to ${width}x${height}`);
-        await appWindow.setSize(new LogicalSize(width, height));
-      } catch (e) {
-        Log.e("Failed to resize window:", e);
-      }
-    };
-
-    if (showSettings) {
-      resizeWindow(WINDOW.WIDTH, WINDOW.SETTINGS_HEIGHT);
-    } else if (state === "idle" || state === "recording" || state === "transcribing") {
-      resizeWindow(WINDOW.WIDTH, WINDOW.HEIGHT);
-    } else if (state === "results") {
-      // Keep your existing logic, just replace WindowSetSize with resizeWindow
-      resizeWindow(WINDOW.WIDTH, WINDOW.MIN_RESULTS_HEIGHT);
-      setTimeout(() => {
-        if (transcriptRef.current) {
-          const contentHeight = transcriptRef.current.scrollHeight;
-          const footerHeight = 50;
-          const headerHeight = 40;
-          const paddingSpace = 30;
-          const necessaryHeight = Math.min(
-            contentHeight + headerHeight + footerHeight + paddingSpace,
-            WINDOW.MAX_HEIGHT
-          );
-          const newHeight = Math.max(WINDOW.MIN_RESULTS_HEIGHT, necessaryHeight);
-          // Add a small buffer just in case calculation is slightly off
-          resizeWindow(WINDOW.WIDTH, newHeight + 10);
-        }
-      }, 100); // Delay might need adjustment
-    }
-  }, [state, transcript, showSettings]);
 
   const toggleSettings = () => {
     setShowSettings(!showSettings);

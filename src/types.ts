@@ -1,5 +1,4 @@
-
-// src/types.ts
+export type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
 // Matches the Rust struct DictatorConfig in config.rs
 export interface DictatorConfig {

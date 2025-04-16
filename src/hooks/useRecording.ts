@@ -1,11 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
+
 import { Log } from "@/lib/utils";
-import type { Result, TranscriptionResult } from "@/types";
+import type { RecordingState, Result, TranscriptionResult } from "@/types";
 
-export type RecordingState = "idle" | "recording" | "transcribing" | "results";
-
-export function useRecording() {
+export default function useRecording() {
   const [state, setState] = useState<RecordingState>("idle");
   const [recordingTime, setRecordingTime] = useState(0);
   const [transcript, setTranscript] = useState<string>("");
