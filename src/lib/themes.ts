@@ -1,7 +1,3 @@
-// src/lib/themes.ts
-//
-// implement a catpuccin latte theme
-//
 export const themes = {
   catppuccinMocha: {
     name: "Catppuccin Mocha",
@@ -66,3 +62,4 @@ export const themes = {
 };
 
 export type ThemeName = keyof typeof themes;
+export type Colors = typeof themes.catppuccinMocha.colors

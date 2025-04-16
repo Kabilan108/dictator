@@ -1,4 +1,4 @@
-import { useTheme } from "@/lib/ThemeContext";
+import { useTheme } from "@/contexts/ThemeContext";
 import * as SelectPrimitive from '@radix-ui/react-select';
 
 interface SelectBoxProps {

@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { themes, ThemeName } from '@/lib/themes';
-import { useTheme } from "@/lib/ThemeContext";
+import { useTheme } from "@/contexts/ThemeContext";
 import { Log } from "@/lib/utils";
 import { DictatorConfig, ModelInfo, Result } from "@/types"
 import SelectBox from "@/components/SelectBox";

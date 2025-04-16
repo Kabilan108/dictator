@@ -1,10 +1,9 @@
-// src/lib/ThemeContext.tsx
 import { createContext, useState, useContext, ReactNode } from 'react';
-import { themes, ThemeName } from '@/lib/themes';
+import { themes, ThemeName, Colors } from '@/lib/themes';
 
 type ThemeContextType = {
   themeName: ThemeName;
-  colors: typeof themes.catppuccinMocha.colors;
+  colors: Colors;
   changeTheme: (name: ThemeName) => void;
 };
 
