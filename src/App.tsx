@@ -1,15 +1,13 @@
-import { useState, useEffect, useRef, useCallback, RefObject } from "react";
+import { useState, useRef, useCallback, RefObject } from "react";
 import { Mic, Copy, Settings, Square, X } from "lucide-react";
 
 import SettingsPanel from "@/components/SettingsPanel";
-import useRecording from "@/hooks/useRecording";
+import useKeyboardControls from "@/hooks/useKeyboardControls";
 import useWindowSize from "@/hooks/useWindowSize";
+import useRecording from "@/hooks/useRecording";
 import { useTheme } from "@/lib/ThemeContext";
 import { Log, formatTime } from "@/lib/utils";
 import { RecordingState } from "@/types"
-import { WINDOW, KEY_HOLD_DELAY } from "@/config"
-
-// handle to get current Tauri window
 
 const StatusText = ({ text, color }: { text: string, color: string }) => {
   return (
@@ -148,9 +146,6 @@ const App = () => {
     stopRecording,
   } = useRecording();
   const [showSettings, setShowSettings] = useState(false);
-  const keyDownTimestampRef = useRef<number>(0);
-  const holdTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const recordingModeRef = useRef<"tap" | "hold" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
@@ -162,59 +157,13 @@ const App = () => {
       .catch(err => Log.e(`Failed to copy: ${err}`));
   }, [transcript]);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (showSettings) return; // Ignore keyboard shortcuts when settings are open
-
-      if (e.code === "Space" && !e.repeat) {
-        e.preventDefault();
-        if (state === "idle") {
-          keyDownTimestampRef.current = Date.now();
-          startRecording();
-          recordingModeRef.current = "tap";
-          holdTimerRef.current = setTimeout(() => {
-            recordingModeRef.current = "hold";
-          }, KEY_HOLD_DELAY);
-        } else if (state === "recording" && recordingModeRef.current === "tap") {
-          if (holdTimerRef.current) {
-            clearTimeout(holdTimerRef.current);
-            holdTimerRef.current = null;
-          }
-          stopRecording();
-        }
-      } else if (e.code === "Escape") {
-        e.preventDefault();
-        if (showSettings) {
-          setShowSettings(false);
-        } else if (state === "results") {
-          setState("idle");
-        }
-      }
-    };
-
-    const handleKeyUp = (e: KeyboardEvent) => {
-      if (showSettings) return; // Ignore keyboard shortcuts when settings are open
-
-      if (e.code === "Space" && state === "recording") {
-        e.preventDefault();
-        if (holdTimerRef.current) {
-          clearTimeout(holdTimerRef.current);
-          holdTimerRef.current = null;
-        }
-        if (recordingModeRef.current === "hold") {
-          stopRecording();
-        }
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    window.addEventListener("keyup", handleKeyUp);
-
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-      window.removeEventListener("keyup", handleKeyUp);
-    };
-  }, [state, startRecording, stopRecording, showSettings]);
+  useKeyboardControls({
+    state,
+    showSettings,
+    onStart: startRecording,
+    onStop: stopRecording,
+    onReset: () => setState("idle"),
+  })
 
   const toggleSettings = () => {
     setShowSettings(!showSettings);
