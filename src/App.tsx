@@ -1,21 +1,15 @@
 import { useState, useEffect, useRef, useCallback, RefObject } from "react";
 import { Mic, Copy, Settings, Square, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow, LogicalSize  } from "@tauri-apps/api/window"
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window"
 
 import SettingsPanel from "@/components/SettingsPanel";
 import { useTheme } from "@/lib/ThemeContext";
 import { Log, formatTime } from "@/lib/utils";
+import { WINDOW, KEY_HOLD_DELAY } from "@/config"
 import { SimpleResult, TranscriptionResult } from "@/types";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
-
-// Define constants (consider moving to a config file or utils)
-const WINDOW_WIDTH = 375; // Match your tauri.conf.json
-const DEFAULT_WINDOW_HEIGHT = 180;
-const MAX_WINDOW_HEIGHT = 350;
-const MIN_RESULTS_HEIGHT = 250;
-const SETTINGS_WINDOW_HEIGHT = 400; // Or adjust as needed
 
 // handle to get current Tauri window
 const appWindow = getCurrentWindow();
@@ -215,7 +209,7 @@ const App = () => {
           recordingModeRef.current = "tap";
           holdTimerRef.current = setTimeout(() => {
             recordingModeRef.current = "hold";
-          }, 1000);
+          }, KEY_HOLD_DELAY);
         } else if (state === "recording" && recordingModeRef.current === "tap") {
           if (holdTimerRef.current) {
             clearTimeout(holdTimerRef.current);
@@ -290,12 +284,12 @@ const App = () => {
     };
 
     if (showSettings) {
-      resizeWindow(WINDOW_WIDTH, SETTINGS_WINDOW_HEIGHT);
+      resizeWindow(WINDOW.WIDTH, WINDOW.SETTINGS_HEIGHT);
     } else if (state === "idle" || state === "recording" || state === "transcribing") {
-      resizeWindow(WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+      resizeWindow(WINDOW.WIDTH, WINDOW.HEIGHT);
     } else if (state === "results") {
       // Keep your existing logic, just replace WindowSetSize with resizeWindow
-      resizeWindow(WINDOW_WIDTH, MIN_RESULTS_HEIGHT);
+      resizeWindow(WINDOW.WIDTH, WINDOW.MIN_RESULTS_HEIGHT);
       setTimeout(() => {
         if (transcriptRef.current) {
           const contentHeight = transcriptRef.current.scrollHeight;
@@ -304,11 +298,11 @@ const App = () => {
           const paddingSpace = 30;
           const necessaryHeight = Math.min(
             contentHeight + headerHeight + footerHeight + paddingSpace,
-            MAX_WINDOW_HEIGHT
+            WINDOW.MAX_HEIGHT
           );
-          const newHeight = Math.max(MIN_RESULTS_HEIGHT, necessaryHeight);
+          const newHeight = Math.max(WINDOW.MIN_RESULTS_HEIGHT, necessaryHeight);
           // Add a small buffer just in case calculation is slightly off
-          resizeWindow(WINDOW_WIDTH, newHeight + 10);
+          resizeWindow(WINDOW.WIDTH, newHeight + 10);
         }
       }, 100); // Delay might need adjustment
     }
