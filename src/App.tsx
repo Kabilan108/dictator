@@ -1,13 +1,12 @@
 import { useState, useEffect, useRef, useCallback, RefObject } from "react";
 import { Mic, Copy, Settings, Square, X } from "lucide-react";
-import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window"
 
 import SettingsPanel from "@/components/SettingsPanel";
+import { useRecording } from "@/hooks/useRecording";
 import { useTheme } from "@/lib/ThemeContext";
 import { Log, formatTime } from "@/lib/utils";
 import { WINDOW, KEY_HOLD_DELAY } from "@/config"
-import { SimpleResult, TranscriptionResult } from "@/types";
 
 type RecordingState = "idle" | "recording" | "transcribing" | "results";
 
@@ -141,61 +140,27 @@ const ResultsFooter = ({ duration }: { duration: number }) => {
 
 const App = () => {
   const { colors } = useTheme();
-  const [state, setState] = useState<RecordingState>("idle");
-  const [recordingTime, setRecordingTime] = useState(0);
-  const [transcriptionResult, setTranscriptionResult] = useState<string>("");
+  const {
+    state,
+    setState,
+    recordingTime,
+    transcript,
+    finalRecordingTime,
+    startRecording,
+    stopRecording,
+  } = useRecording();
   const [showSettings, setShowSettings] = useState(false);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
-  const finalRecordingTimeRef = useRef<number>(0);
   const keyDownTimestampRef = useRef<number>(0);
   const holdTimerRef = useRef<NodeJS.Timeout | null>(null);
   const recordingModeRef = useRef<"tap" | "hold" | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
 
-  const startRecording = useCallback(async () => {
-    try {
-      Log.d("Invoking start_recording");
-      // Use invoke, passing no arguments
-      const result: SimpleResult = await invoke("start_recording");
-      if (!result.success) {
-        throw new Error(result.error || "Unknown error starting recording");
-      }
-      Log.d("start_recording successful");
-      setState("recording");
-    } catch (error) {
-      Log.e(`Error starting recording: ${error}`);
-      setState("idle");
-      // Provide more context in the alert
-      alert(`Failed to start recording: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }, []);
-
-  const stopRecording = useCallback(async () => {
-    try {
-      setState("transcribing");
-      Log.d("Invoking stop_recording");
-      // Use invoke, passing no arguments
-      const result: TranscriptionResult = await invoke("stop_recording");
-      if (!result.success) {
-        throw new Error(result.error || "Unknown error stopping recording");
-      }
-      finalRecordingTimeRef.current = recordingTime;
-      setTranscriptionResult(result.transcript || "");
-      Log.d("stop_recording successful, transcript received.");
-      setState("results");
-    } catch (error) {
-      Log.e(`Error stopping recording: ${error}`);
-      setState("idle");
-      alert(`Failed to stop recording or transcribe: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }, [recordingTime]);
-
   const copyToClipboard = useCallback(() => {
-    navigator.clipboard.writeText(transcriptionResult)
+    navigator.clipboard.writeText(transcript)
       .then(() => Log.i("Transcript copied to clipboard"))
       .catch(err => Log.e(`Failed to copy: ${err}`));
-  }, [transcriptionResult]);
+  }, [transcript]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -251,27 +216,6 @@ const App = () => {
     };
   }, [state, startRecording, stopRecording, showSettings]);
 
-  useEffect(() => {
-    if (state === "recording") {
-      timerRef.current = setInterval(() => {
-        setRecordingTime((prev) => prev + 1);
-      }, 1000);
-    } else {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-      }
-      if (state === "idle") {
-        setRecordingTime(0);
-      }
-    }
-
-    return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-      }
-    };
-  }, [state]);
-
   // Dynamic window sizing logic based on transcript content
   useEffect(() => {
     const resizeWindow = async (width: number, height: number) => {
@@ -306,7 +250,7 @@ const App = () => {
         }
       }, 100); // Delay might need adjustment
     }
-  }, [state, transcriptionResult, showSettings]);
+  }, [state, transcript, showSettings]);
 
   const toggleSettings = () => {
     setShowSettings(!showSettings);
@@ -338,13 +282,13 @@ const App = () => {
               <div className="w-full mt-2 flex flex-col flex-grow flex-shrink-0">
                 {/* Transcript text area with dynamic height and scrolling */}
                 <TranscriptContainer
-                  transcript={transcriptionResult}
+                  transcript={transcript}
                   transcriptRef={transcriptRef}
                   onCopy={copyToClipboard}
                 />
 
                 {/* Time and reset instructions - always at bottom with extra padding */}
-                <ResultsFooter duration={finalRecordingTimeRef.current} />
+                <ResultsFooter duration={finalRecordingTime} />
               </div>
             )}
           </>

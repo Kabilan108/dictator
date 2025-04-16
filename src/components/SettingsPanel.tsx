@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { themes, ThemeName } from '@/lib/themes';
 import { useTheme } from "@/lib/ThemeContext";
 import { Log } from "@/lib/utils";
-import { DictatorConfig, ModelInfo, SimpleResult } from "@/types"
+import { DictatorConfig, ModelInfo, Result } from "@/types"
 import SelectBox from "@/components/SelectBox";
 
 interface SettingsForm {
@@ -441,7 +441,7 @@ const SettingsPanel = () => {
         // supportsModels is not part of the saved config
       };
 
-      const result: SimpleResult = await invoke("save_settings", { settings: newSettingsPayload });
+      const result: Result = await invoke("save_settings", { settings: newSettingsPayload });
 
       if (!result.success) {
         throw new Error(result.error || "Failed to save settings");

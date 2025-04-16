@@ -17,7 +17,7 @@ export interface ModelInfo {
 }
 
 // Matches the Rust struct SimpleResult in commands.rs
-export interface SimpleResult {
+export interface Result {
   success: boolean;
   error?: string; // Optional error message
 }
