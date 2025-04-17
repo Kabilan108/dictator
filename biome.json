@@ -21,9 +21,6 @@
   "organizeImports": {
     "enabled": true
   },
-  "files": {
-    "include": ["**/*.{js,ts,jsx,tsx,html,css}"]
-  },
   "javascript": {
     "formatter": {
       "quoteStyle": "double"
