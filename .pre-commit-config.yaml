@@ -4,30 +4,10 @@ repos:
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
-
-  - repo: https://github.com/biomejs/pre-commit
-    rev: v0.5.0
-    hooks:
-      - id: biome-check
-        args: [ --config-path=./biome.json ]
-        additional_dependencies: ["@biomejs/biome@1.9.4"]
-
   - repo: local
     hooks:
-      - id: cargo-clippy
-        name: Cargo Clippy
-        description: Run Rust linter on staged files
-        entry: bash -c 'cd src-tauri && cargo clippy -- -D warnings'
+      - id: gofmt
+        name: gofmt
+        entry: gofmt -w
         language: system
-        pass_filenames: false
-        types: [file]
-        files: ^src-tauri/src/.*\.rs$
-
-      - id: cargo-fmt
-        name: Cargo Format
-        description: Run Rust formatter on staged files
-        entry: bash -c 'cd src-tauri && cargo fmt'
-        language: system
-        pass_filenames: false
-        types: [file]
-        files: ^src-tauri/src/.*\.rs$
+        types: [go]
