@@ -8,6 +8,62 @@ Dictator is a voice-to-text daemon for Linux that enables voice typing anywhere 
 - Daemon mode: Background service handling audio recording, transcription, and typing
 - Client mode: CLI commands that communicate with the daemon via Unix socket IPC
 
+## Useful Devtools
+
+### Code and file search: `dump`
+
+If you want to read a number of files that match some filter quickly, use the `dump` tool in the bash shell. The command line flags available for dump are listed below.
+
+```
+usage: dump [options] [directories...]
+
+  recursively dumps text files from specified directories,
+  respecting .gitignore and custom ignore rules.
+
+options:
+  -d|--dir <value>       directory to scan (can be repeated)
+  -g|--glob <value>      glob pattern to match (can be repeated)
+  -f|--filter <string>   skip lines matching this regex
+  -h|--help              display help message
+  -i|--ignore <value>    glob pattern to ignore (can be repeated)
+  -o|--out-fmt <string>  xml or md (default "xml")
+  -l|--list              list file paths only
+  --xml-tag <string>     custom XML tag name (only for xml output) (default "file")
+```
+
+Here are some examples of situations where you could use `dump`:
+
+```
+# Dump from specific directories
+dump src/ tests/ docs/
+
+# Dump with directory flags
+dump -d src/ -d tests/
+
+# List file paths only (no content). Helpful for refining your search filters before fetching the file contents
+dump -l
+
+# Include specific files using glob patterns
+dump -g "**.go" -g "*.md"
+
+# Add ignore patterns (can use multiple times)
+dump -i "**.log" -i "node_modules"
+
+# Filter out lines matching a regex pattern
+dump -f "TODO|FIXME"
+
+# Markdown output format instead of XML
+dump -o md
+
+# Custom XML tag name
+dump --xml-tag source
+
+# Combine options
+dump src/ tests/ -g "*.go" -i "vendor" -f "^//.*"
+```
+
+By default, `dump` will print files to STDOUT formatted as XML in <file>...</file> tags. You can request markdown output by passing the `-o md` flag
+
 ## Build Commands
 
 ```bash

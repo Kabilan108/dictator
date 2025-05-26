@@ -27,6 +27,8 @@
         nodejs_20
         xorg.xrandr
         ffmpeg
+        pkg-config
+        portaudio
       ];
       shellHook = ''
         export NPM_CONFIG_PREFIX="$HOME/.npm-global"

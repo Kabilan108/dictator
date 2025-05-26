@@ -1,13 +1,18 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
-	"github.com/kabilan108/dictator/internal/logger"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
+
+	"github.com/kabilan108/dictator/internal/audio"
+	"github.com/kabilan108/dictator/internal/config"
+	"github.com/kabilan108/dictator/internal/utils"
 )
 
 var cfgFile string
@@ -23,8 +28,57 @@ var daemonCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "daemon")
+		config.InitConfigFile()
+		c, err := config.GetConfig()
+		if err != nil {
+			utils.Fatal("daemon", "failed to load config: %v", err)
+		}
+
+		Log := utils.NewLogger(c.App.LogLevel, "daemon")
 		Log.D("daemon called")
+
+		rec, err := audio.NewRecorder(c.Audio, c.App.LogLevel)
+		if err != nil {
+			utils.Fatal("daemon", "failed to create recorder: %v", err)
+		}
+
+		whispr := audio.NewWhisperClient(&c.API, c.App.LogLevel)
+
+		if err := rec.Start(); err != nil {
+			utils.Fatal("daemon", "failed to start recording: %v", err)
+		}
+
+		for range 10 {
+			time.Sleep(1 * time.Second)
+		}
+
+		wav, path, err := rec.Stop()
+		if err != nil {
+			utils.Fatal("daemon", "failed to stop recording: %v", err)
+		}
+
+		wavFile, err := audio.WriteAudioData(path, wav)
+		if err != nil {
+			utils.Fatal("daemon", "failed to write audio to file: %v", err)
+		}
+
+		if err := rec.Close(); err != nil {
+			Log.W("failed to stop PortAudio")
+		}
+
+		Log.I("recording saved to '%v'")
+
+		ctx, _ := context.WithCancel(context.Background())
+		req := audio.TranscriptionRequest{
+			AudioData: wav,
+			Filename: wavFile.Name(),
+			Model: c.API.Model,
+		}
+		resp, err := whispr.Transcribe(ctx, &req)
+		if err != nil {
+			utils.Fatal("daemon", "failed to transcribe audio: %v", err)
+		}
+		Log.I("transcript: '%s'", resp.Text)
 	},
 }
 
@@ -33,7 +87,7 @@ var startCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "start")
+		Log := utils.NewLogger(utils.LevelDebug, "start")
 		Log.D("start called")
 	},
 }
@@ -43,7 +97,7 @@ var stopCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "stop")
+		Log := utils.NewLogger(utils.LevelDebug, "stop")
 		Log.D("stop called")
 	},
 }
@@ -53,7 +107,7 @@ var toggleCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "toggle")
+		Log := utils.NewLogger(utils.LevelDebug, "toggle")
 		Log.D("toggle called")
 	},
 }
@@ -63,7 +117,7 @@ var cancelCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "cancel")
+		Log := utils.NewLogger(utils.LevelDebug, "cancel")
 		Log.D("cancel called")
 	},
 }
@@ -73,7 +127,7 @@ var statusCmd = &cobra.Command{
 	Short: "",
 	Long:  ``,
 	Run: func(cmd *cobra.Command, args []string) {
-		Log := logger.NewLogger(logger.DEBUG, "status")
+		Log := utils.NewLogger(utils.LevelDebug, "status")
 		Log.D("status called")
 	},
 }

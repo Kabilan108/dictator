@@ -4,6 +4,7 @@ go 1.24.3
 
 require (
 	github.com/fatih/color v1.18.0
+	github.com/gordonklaus/portaudio v0.0.0-20250206071425-98a94950218b
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/viper v1.20.1
 )

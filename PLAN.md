@@ -52,8 +52,8 @@ dictator/
 │   │   └── daemon.go        # daemon implementation
 │   ├── notifier/
 │   │   └── dunst.go         # Dunst integration
-│   ├── transcribe/
-│   │   └── whisper.go       # Whisper API client
+│   ├── utils/
+│   │   └── utils.go         # Utilities, logger, and file management
 │   └── typing/
 │       └── xdotool.go       # Keyboard input
 │   └── ipc/
@@ -129,25 +129,43 @@ WantedBy=default.target
     - Channels: Mono (1 channel)
     - Format: 16-bit PCM
     - Container: WAV format for API upload
-    - Max Duration: 300 seconds (enforce in recorder, provide flag in the `dictator start` command)
+    - Max Duration: configurable via audio config (enforced in recorder)
 
 **Implementation Notes:**
 ```go
-// Use malgo (miniaudio Go bindings) for cross-platform audio
-// Alternative: portaudio-go
-import "github.com/gen2brain/malgo"
+// Uses PortAudio Go bindings for cross-platform audio
+import "github.com/gordonklaus/portaudio"
 
 type Recorder struct {
-    device     *malgo.Device
-    context    *malgo.AllocatedContext
-    buffers    [][]byte
-    recording  bool
+    stream        *portaudio.Stream
+    buffer        []float32
+    isInitialized bool
+    config        config.AudioConfig
+    mu            sync.RWMutex
+    state         RecorderState
+    audioData     []byte
+    startTime     time.Time
+    doneChan      chan struct{}
+    errorChan     chan error
+    durationTimer *time.Timer
+    wg            sync.WaitGroup
+    log           utils.Logger
 }
 
 // Key methods:
+// - NewRecorder(config.AudioConfig, utils.LogLevel) (*Recorder, error)
 // - Start() error
-// - Stop() []byte  // Returns PCM data
+// - Stop() ([]byte, string, error)  // Returns WAV data, file path, error
+// - Close() error
 // - IsRecording() bool
+// - GetRecordingDuration() time.Duration
+// - EncodeToWAV([]byte) ([]byte, error)
+// - HasTimedOut() bool
+
+// State management:
+// - StateIdle, StateRecording, StateStopped
+// - Thread-safe with mutex protection
+// - Automatic timeout handling with configurable duration
 ```
 
 #### 4.2 Dunst Notifier (`internal/notifier/dunst.go`)
@@ -178,24 +196,45 @@ type DunstNotifier struct {
 - Method: `Notify` for updates
 - Method: `CloseNotification` for dismissal
 
-#### 4.3 Whisper API Client (`internal/transcribe/whisper.go`)
+#### 4.3 Whisper API Client (`internal/audio/transcribe.go`)
 
 **Requirements:**
-- Send audio to OpenAI Whisper API
+- Send audio to Whisper API (OpenAI-compatible)
 - Handle API authentication
 - Return transcribed text
+- Support retry logic for reliability
 
 **Implementation Notes:**
 ```go
-// Use standard net/http with multipart form upload
-type WhisperClient struct {
-    apiKey   string
-    endpoint string
+// Uses standard net/http with multipart form upload
+type WhisperClient interface {
+    Transcribe(ctx context.Context, req *TranscriptionRequest) (*TranscriptionResponse, error)
 }
 
-// API endpoint: https://api.openai.com/v1/audio/transcriptions
-// Method: POST with multipart/form-data
-// Fields: file (audio), model ("whisper-1"), language ("en")
+type whisperClient struct {
+    config     *config.APIConfig
+    httpClient *http.Client
+    log        utils.Logger
+}
+
+type TranscriptionRequest struct {
+    AudioData []byte
+    Filename  string
+    Model     string // optional, defaults to config or "distil-large-v3"
+    Language  string // optional
+}
+
+type TranscriptionResponse struct {
+    Text string `json:"text"`
+}
+
+// Key features:
+// - Configurable endpoint with automatic path completion
+// - Bearer token authentication
+// - 2-attempt retry logic with 1-second delay
+// - Comprehensive error handling and logging
+// - Model fallback chain (request > config > "distil-large-v3")
+// - Timeout support via context
 ```
 
 **Endpoint Schema:**
@@ -251,21 +290,63 @@ type Response struct {
 
 **Config File Location:** `~/.config/dictator/config.json`
 
-**Config Structure:**
+**Implementation Notes:**
+```go
+type Config struct {
+    API   APIConfig   `json:"api" mapstructure:"api"`
+    App   AppConfig   `json:"app" mapstructure:"app"`
+    Audio AudioConfig `json:"audio" mapstructure:"audio"`
+}
+
+type APIConfig struct {
+    Endpoint   string `json:"endpoint" mapstructure:"endpoint"`
+    Key        string `json:"key" mapstructure:"key"`
+    Model      string `json:"model" mapstructure:"model"`
+    TimeoutSec int    `json:"timeout" mapstructure:"timeout"`
+}
+
+type AudioConfig struct {
+    SampleRate     int `json:"sample_rate" mapstructure:"sample_rate"`
+    Channels       int `json:"channels" mapstructure:"channels"`
+    BitDepth       int `json:"bit_depth" mapstructure:"bit_depth"`
+    FramesPerBlock int `json:"frames_per_block" mapstructure:"frames_per_block"`
+    MaxDurationMin int `json:"max_duration_min" mapstructure:"max_duration_min"`
+}
+
+type AppConfig struct {
+    LogLevel        utils.LogLevel `json:"log_level" mapstructure:"log_level"`
+    MaxRecordingMin int           `json:"max_recording_min" mapstructure:"max_recording_seconds"`
+    TypingDelayMS   int           `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
+}
+
+// Key features:
+// - Uses Viper for configuration management with environment variable support
+// - Automatic config file creation with sensible defaults
+// - Comprehensive validation of all config fields
+// - Global config singleton pattern
+// - Integrates with utils package for directory management
+```
+
+**Default Config Structure:**
 ```json
 {
   "api": {
-    "endpoint": "https://api.openai.com/v1/audio/transcriptions",
-    "key": "api-key-string-xxxxx",
-    "model": "whisper-1"
+    "endpoint": "https://sietch.sole-pierce.ts.net/siren/v1/audio/transcriptions",
+    "key": "",
+    "model": "distil-large-v3",
+    "timeout": 60
   },
   "audio": {
     "sample_rate": 16000,
-    "channels": 1
+    "channels": 1,
+    "bit_depth": 16,
+    "frames_per_block": 1024,
+    "max_duration_min": 5
   },
-  "behavior": {
-    "typing_delay_ms": 10,
-    "max_recording_seconds": 300
+  "app": {
+    "log_level": 0,
+    "max_recording_min": 5,
+    "typing_delay_ms": 10
   }
 }
 ```
@@ -323,17 +404,34 @@ Transitions:
 
 - Note: use mutex/waitgroups to track state and manage concurrency where necessary and appropriate
 
-### 7. CLI Commands
+### 7. CLI Commands (`internal/cmd/commands.go`)
 
-- The CLI should be implemented using cobra to set up commands and viper to handle configuration
+**Implementation Notes:**
+```go
+// Uses Cobra for CLI framework with Viper for configuration
+// Current implementation includes basic command structure
+
+// Commands implemented:
+// - daemon: Runs full audio recording and transcription test (10 seconds)
+// - start, stop, toggle, cancel, status: Command stubs for future IPC integration
+
+// The daemon command currently:
+// 1. Initializes configuration
+// 2. Creates recorder with PortAudio
+// 3. Creates Whisper client
+// 4. Records for 10 seconds
+// 5. Stops recording and saves WAV file
+// 6. Transcribes audio via API
+// 7. Logs transcript result
+```
 
 ```bash
-dictator daemon   # Run the daemon (foreground)
-dictator start    # Start recording
-dictator stop     # Stop recording and transcribe
-dictator toggle   # Toggle recording (start if idle, stop if recording)
-dictator cancel   # Cancel current operation
-dictator status   # Get current state (returns: idle|recording|transcribing|typing)
+dictator daemon   # Run the daemon (currently: test recording/transcription)
+dictator start    # Start recording (stub - needs IPC integration)
+dictator stop     # Stop recording and transcribe (stub - needs IPC integration)
+dictator toggle   # Toggle recording (stub - needs IPC integration)
+dictator cancel   # Cancel current operation (stub - needs IPC integration)
+dictator status   # Get current state (stub - needs IPC integration)
 ```
 
 ### 8. i3 Integration
@@ -370,15 +468,37 @@ bindsym $mod+Shift+c exec --no-startup-id dictator cancel
 
 **Go Dependencies:**
 ```go
-github.com/godbus/dbus/v5      // D-Bus for notifications
-github.com/gen2brain/malgo     // Audio recording
+github.com/gordonklaus/portaudio  // Audio recording via PortAudio
+github.com/spf13/cobra           // CLI framework
+github.com/spf13/viper           // Configuration management
+github.com/fatih/color           // Terminal colors for logging
+```
+
+**Additional Utilities Package:**
+```go
+// internal/utils/utils.go provides:
+// - Structured logging with levels (Debug, Info, Warn, Error, Fatal)
+// - Directory management for config and cache
+// - File path utilities for recordings
+// - Cross-platform config/cache directory detection
 ```
 
 ### 11. Build and Packaging
 
-**Nix Derivation:**
+**Current Nix Support:**
 ```nix
-{ lib, buildGoModule, fetchFromGitHub, xdotool }:
+# flake.nix includes PortAudio and pkg-config for development
+buildInputs = [
+  go
+  pkg-config
+  portaudio
+  # ... other dependencies
+];
+```
+
+**Future Nix Derivation:**
+```nix
+{ lib, buildGoModule, fetchFromGitHub, xdotool, portaudio, pkg-config }:
 
 buildGoModule rec {
   pname = "dictator";
@@ -388,7 +508,8 @@ buildGoModule rec {
 
   vendorSha256 = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
 
-  buildInputs = [ xdotool ];
+  nativeBuildInputs = [ pkg-config ];
+  buildInputs = [ xdotool portaudio ];
 
   postInstall = ''
     # Install systemd service file
@@ -396,3 +517,19 @@ buildGoModule rec {
   '';
 }
 ```
+
+## Current Implementation Status
+
+### Completed Components:
+- ✅ **Audio Recording**: Full PortAudio integration with WAV encoding
+- ✅ **Transcription**: OpenAI-compatible Whisper API client with retry logic
+- ✅ **Configuration**: Viper-based config with validation and defaults
+- ✅ **Utilities**: Logging, directory management, file paths
+- ✅ **Basic CLI**: Cobra framework with working daemon test command
+
+### Next Steps:
+- 🔄 **IPC System**: Unix socket communication between CLI and daemon
+- 🔄 **Daemon State Machine**: Proper state management and event loop
+- 🔄 **Typing Integration**: xdotool integration for text input
+- 🔄 **Notifications**: Dunst integration for visual feedback
+- 🔄 **Error Handling**: Graceful error recovery and user feedback
