@@ -12,6 +12,7 @@ import (
 
 	"github.com/kabilan108/dictator/internal/audio"
 	"github.com/kabilan108/dictator/internal/config"
+	"github.com/kabilan108/dictator/internal/notifier"
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
@@ -132,6 +133,58 @@ var statusCmd = &cobra.Command{
 	},
 }
 
+var testNotifyCmd = &cobra.Command{
+	Use:   "test-notify",
+	Short: "Test dunst notification functionality",
+	Long:  `Test command to verify dunst notifier is working correctly`,
+	Run: func(cmd *cobra.Command, args []string) {
+		config.InitConfigFile()
+		c, err := config.GetConfig()
+		if err != nil {
+			utils.Fatal("test-notify", "failed to load config: %v", err)
+		}
+
+		Log := utils.NewLogger(c.App.LogLevel, "test-notify")
+		Log.I("testing dunst notifier...")
+
+		// Create notifier
+		n, err := notifier.New(c.App.LogLevel)
+		if err != nil {
+			utils.Fatal("test-notify", "failed to create notifier: %v", err)
+		}
+		defer n.Close()
+
+		// Test all states
+		states := []notifier.NotificationState{
+			notifier.StateIdle,
+			notifier.StateRecording,
+			notifier.StateTranscribing,
+			notifier.StateTyping,
+			notifier.StateError,
+		}
+
+		for i, state := range states {
+			Log.I("testing state %d...", i+1)
+			if err := n.UpdateState(state); err != nil {
+				Log.E("failed to update state: %v", err)
+				continue
+			}
+			time.Sleep(2 * time.Second)
+		}
+
+		// Test custom notification
+		Log.I("testing custom notification...")
+		if err := n.Update("🧪 Test Complete", "All notification states tested successfully!", "dialog-information"); err != nil {
+			Log.E("failed to send custom notification: %v", err)
+		} else {
+			Log.I("custom notification sent")
+		}
+
+		time.Sleep(3 * time.Second)
+		Log.I("test completed")
+	},
+}
+
 // Execute adds all child commands to the root command and sets flags appropriately.
 func Execute() {
 	err := rootCmd.Execute()
@@ -168,6 +221,7 @@ func init() {
 	rootCmd.AddCommand(toggleCmd)
 	rootCmd.AddCommand(cancelCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(testNotifyCmd)
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/dictator/config.json)")
 	rootCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
