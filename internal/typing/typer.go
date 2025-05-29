@@ -73,7 +73,7 @@ func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 	if x.config.TypingDelayMS > 0 {
 		delay := time.Duration(x.config.TypingDelayMS) * time.Millisecond
 		x.log.D("applying typing delay: %v", delay)
-		
+
 		select {
 		case <-time.After(delay):
 			// Normal delay completion
@@ -118,4 +118,3 @@ func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 	x.log.I("text copied to clipboard (%d characters) - paste with Ctrl+V", len(text))
 	return nil
 }
-

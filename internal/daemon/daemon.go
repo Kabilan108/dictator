@@ -33,6 +33,8 @@ type Daemon struct {
 
 	operationCtx    context.Context
 	operationCancel context.CancelFunc
+
+	notificationTimer *time.Timer
 }
 
 func NewDaemon(cfg *utils.Config) (*Daemon, error) {
@@ -115,6 +117,7 @@ func (d *Daemon) shutdown() error {
 	d.log.D("shutting down daemon...")
 
 	d.mu.Lock()
+	d.stopNotificationTimer()
 	if d.operationCancel != nil {
 		d.operationCancel()
 	}
@@ -170,6 +173,8 @@ func (d *Daemon) HandleStart() error {
 		d.log.W("failed to update notification: %v", err)
 	}
 
+	d.startNotificationTimer()
+
 	d.log.I("recording started")
 	return nil
 }
@@ -183,6 +188,8 @@ func (d *Daemon) HandleStop() error {
 	}
 
 	d.log.I("stopping recording and starting transcription...")
+
+	d.stopNotificationTimer()
 
 	d.state = ipc.StateTranscribing
 	if err := d.notifier.UpdateState(d.state); err != nil {
@@ -214,6 +221,8 @@ func (d *Daemon) HandleCancel() error {
 	defer d.mu.Unlock()
 
 	d.log.D("canceling current operation...")
+
+	d.stopNotificationTimer()
 
 	if d.operationCancel != nil {
 		d.operationCancel()
@@ -292,7 +301,7 @@ func (d *Daemon) transcribeAndType() {
 		return
 	}
 
-	d.log.I("transcription complete: %s", resp.Text)
+	d.log.I("transcription complete")
 
 	d.mu.Lock()
 	d.state = ipc.StateTyping
@@ -322,12 +331,53 @@ func (d *Daemon) transcribeAndType() {
 	d.state = ipc.StateIdle
 	d.lastError = nil
 	d.mu.Unlock()
+
+	if err := d.notifier.UpdateState(d.state); err != nil {
+		d.log.W("failed to update notification: %v", err)
+	}
 }
 
-// handleError sets the daemon to error state
+func (d *Daemon) startNotificationTimer() {
+	d.stopNotificationTimer()
+	d.notificationTimer = time.AfterFunc(1*time.Second, func() {
+		d.updateRecordingNotification()
+	})
+}
+
+func (d *Daemon) stopNotificationTimer() {
+	if d.notificationTimer != nil {
+		d.notificationTimer.Stop()
+		d.notificationTimer = nil
+	}
+}
+
+func (d *Daemon) updateRecordingNotification() {
+	d.mu.RLock()
+	state := d.state
+	d.mu.RUnlock()
+
+	if state == ipc.StateRecording {
+		duration := d.recorder.GetRecordingDuration()
+		if err := d.notifier.UpdateStateWithDuration(state, duration); err != nil {
+			d.log.W("failed to update recording notification: %v", err)
+		}
+
+		// Schedule next update
+		d.mu.Lock()
+		if d.state == ipc.StateRecording {
+			d.notificationTimer = time.AfterFunc(1*time.Second, func() {
+				d.updateRecordingNotification()
+			})
+		}
+		d.mu.Unlock()
+	}
+}
+
 func (d *Daemon) handleError(errorMsg string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	d.stopNotificationTimer()
 
 	d.state = ipc.StateError
 	d.lastError = &errorMsg

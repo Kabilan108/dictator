@@ -138,7 +138,7 @@ func (c *Client) IsConnected(ctx context.Context) bool {
 // WaitForDaemon waits for the daemon to become available
 func (c *Client) WaitForDaemon(ctx context.Context, checkInterval time.Duration) error {
 	c.log.D("waiting for daemon to become available...")
-	
+
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 

@@ -27,17 +27,17 @@ type Server struct {
 	listener   net.Listener
 	handler    CommandHandler
 	log        utils.Logger
-	
+
 	mu      sync.RWMutex
 	running bool
-	
+
 	ctx    context.Context
 	cancel context.CancelFunc
 }
 
 func NewServer(handler CommandHandler, logLevel utils.LogLevel) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	return &Server{
 		socketPath: SocketPath,
 		handler:    handler,
@@ -51,58 +51,58 @@ func NewServer(handler CommandHandler, logLevel utils.LogLevel) *Server {
 func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	if s.running {
 		return fmt.Errorf("server is already running")
 	}
-	
+
 	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
 		s.log.W("failed to remove existing socket file: %v", err)
 	}
-	
+
 	// create unix socket listener
 	listener, err := net.Listen("unix", s.socketPath)
 	if err != nil {
 		s.log.E("failed to create unix socket listener: %v", err)
 		return fmt.Errorf("failed to create unix socket listener: %w", err)
 	}
-	
+
 	s.listener = listener
 	s.running = true
-	
+
 	s.log.I("ipc server started on %s", s.socketPath)
-	
+
 	go s.acceptConnections()
-	
+
 	return nil
 }
 
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	if !s.running {
 		return nil
 	}
-	
+
 	s.log.D("stopping ipc server...")
-	
+
 	// cancel context to stop all operations
 	s.cancel()
-	
+
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
 			s.log.E("failed to close listener: %v", err)
 		}
 	}
-	
+
 	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
 		s.log.W("failed to remove socket file: %v", err)
 	}
-	
+
 	s.running = false
 	s.log.I("ipc server stopped")
-	
+
 	return nil
 }
 
@@ -114,7 +114,7 @@ func (s *Server) acceptConnections() {
 			return
 		default:
 		}
-		
+
 		conn, err := s.listener.Accept()
 		if err != nil {
 			select {
@@ -126,9 +126,9 @@ func (s *Server) acceptConnections() {
 				continue
 			}
 		}
-		
+
 		s.log.D("new client connection accepted")
-		
+
 		// Handle connection in goroutine
 		go s.handleConnection(conn)
 	}
@@ -141,12 +141,12 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		s.log.D("client connection closed")
 	}()
-	
+
 	// set connection timeout
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		s.log.W("failed to set connection deadline: %v", err)
 	}
-	
+
 	// decode command from connection
 	var cmd Command
 	decoder := json.NewDecoder(conn)
@@ -155,9 +155,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 		s.sendErrorResponse(conn, "", ErrInvalidCommand, err)
 		return
 	}
-	
+
 	s.log.D("received command: %s (ID: %s)", cmd.Action, cmd.ID)
-	
+
 	// process command and send response
 	response := s.processCommand(&cmd)
 	s.sendResponse(conn, response)
@@ -169,9 +169,9 @@ func (s *Server) processCommand(cmd *Command) *Response {
 		Success: false,
 		Data:    make(map[string]string),
 	}
-	
+
 	var err error
-	
+
 	switch cmd.Action {
 	case ActionStart:
 		err = s.handler.HandleStart()
@@ -179,51 +179,51 @@ func (s *Server) processCommand(cmd *Command) *Response {
 			response.Success = true
 			response.Data[DataKeyState] = StateRecording.String()
 		}
-		
+
 	case ActionStop:
 		err = s.handler.HandleStop()
 		if err == nil {
 			response.Success = true
 			response.Data[DataKeyState] = StateIdle.String()
 		}
-		
+
 	case ActionToggle:
 		err = s.handler.HandleToggle()
 		if err == nil {
 			response.Success = true
 			// State will be determined by the handler
 		}
-		
+
 	case ActionCancel:
 		err = s.handler.HandleCancel()
 		if err == nil {
 			response.Success = true
 			response.Data[DataKeyState] = StateIdle.String()
 		}
-		
+
 	case ActionStatus:
 		status := s.handler.GetStatus()
 		response.Success = true
 		response.Data[DataKeyState] = status.State.String()
 		response.Data[DataKeyUptime] = status.Uptime.String()
-		
+
 		if status.RecordingDuration != nil {
 			response.Data[DataKeyRecordingDuration] = status.RecordingDuration.String()
 		}
 		if status.LastError != nil {
 			response.Data[DataKeyLastError] = *status.LastError
 		}
-		
+
 	default:
 		err = fmt.Errorf("unknown action: %s", cmd.Action)
 		response.Error = ErrInvalidCommand
 	}
-	
+
 	if err != nil && response.Error == "" {
 		response.Error = err.Error()
 		s.log.E("command failed: %v", err)
 	}
-	
+
 	return response
 }
 
@@ -233,7 +233,7 @@ func (s *Server) sendResponse(conn net.Conn, response *Response) {
 		s.log.E("failed to encode response: %v", err)
 		return
 	}
-	
+
 	if response.Success {
 		s.log.D("sent success response for command ID: %s", response.ID)
 	} else {
@@ -247,10 +247,10 @@ func (s *Server) sendErrorResponse(conn net.Conn, id, errorMsg string, originalE
 		Success: false,
 		Error:   errorMsg,
 	}
-	
+
 	if originalErr != nil {
 		s.log.E("sending error response: %v", originalErr)
 	}
-	
+
 	s.sendResponse(conn, response)
 }

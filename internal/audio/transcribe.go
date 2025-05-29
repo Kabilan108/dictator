@@ -149,8 +149,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	c.log.I("transcription completed successfully, text length: %d characters", len(transcriptionResp.Text))
-	c.log.D("transcribed text: %s", transcriptionResp.Text)
+	c.log.D("transcription completed successfully, text length: %d characters", len(transcriptionResp.Text))
 
 	return &transcriptionResp, nil
 }

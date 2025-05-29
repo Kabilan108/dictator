@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/kabilan108/dictator/internal/ipc"
@@ -17,6 +18,7 @@ type NotificationContent struct {
 
 type Notifier interface {
 	UpdateState(state ipc.DaemonState) error
+	UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error
 	Update(title, body string) error
 	Close() error
 }
@@ -58,6 +60,14 @@ const (
 	methodNotify  = "org.freedesktop.Notifications.Notify"
 	methodClose   = "org.freedesktop.Notifications.CloseNotification"
 )
+
+// formatDuration formats a duration into a readable string (e.g., "0:15", "1:30")
+func formatDuration(d time.Duration) string {
+	totalSeconds := int(d.Seconds())
+	minutes := totalSeconds / 60
+	seconds := totalSeconds % 60
+	return fmt.Sprintf("%d:%02d", minutes, seconds)
+}
 
 func New(logLevel utils.LogLevel) (Notifier, error) {
 	log := utils.NewLogger(logLevel, "notifier")
@@ -105,6 +115,30 @@ func (n *DunstNotifier) UpdateState(state ipc.DaemonState) error {
 		return fmt.Errorf("unknown notification state: %d", state)
 	}
 
+	n.log.D("updating notification state to: %s", content.Title)
+	return n.updateNotification(content.Title, content.Body)
+}
+
+// UpdateStateWithDuration updates the notification with current recording duration
+func (n *DunstNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	content, exists := stateNotifications[state]
+	if !exists {
+		n.log.E("unknown notification state: %d", state)
+		return fmt.Errorf("unknown notification state: %d", state)
+	}
+
+	// Format duration and update body for recording state
+	if state == ipc.StateRecording {
+		formattedDuration := formatDuration(duration)
+		updatedBody := fmt.Sprintf("Recording audio... %s", formattedDuration)
+		n.log.D("updating recording notification with duration: %s", formattedDuration)
+		return n.updateNotification(content.Title, updatedBody)
+	}
+
+	// For non-recording states, use standard notification
 	n.log.D("updating notification state to: %s", content.Title)
 	return n.updateNotification(content.Title, content.Body)
 }
