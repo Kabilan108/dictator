@@ -37,7 +37,22 @@ sudo dnf install xdotool xclip pulseaudio-utils
    make install
    ```
 
-3. **Configure API access:**
+3. **Set up as systemd service:**
+
+   **For traditional Linux distributions:**
+   ```bash
+   # Copy the service file
+   sudo cp dictator.service /etc/systemd/system/dictator@.service
+
+   # Reload systemd and enable the service for your user
+   sudo systemctl daemon-reload
+   sudo systemctl enable dictator@$USER.service
+
+   # Start the service
+   sudo systemctl start dictator@$USER.service
+   ```
+
+4. **Configure API access:**
    ```bash
    # Edit the config file that gets created automatically
    ~/.config/dictator/config.json
@@ -57,37 +72,52 @@ sudo dnf install xdotool xclip pulseaudio-utils
 
 ### Basic Usage
 
-1. **Start the daemon:**
-   ```bash
-   dictator daemon
-   ```
+```bash
+# The daemon runs automatically in the background
+# Control voice recording with CLI commands:
 
-2. **In another terminal, control voice recording:**
-   ```bash
-   # Start recording
-   dictator start
+# Start recording
+dictator start
 
-   # Stop recording and transcribe
-   dictator stop
+# Stop recording and transcribe
+dictator stop
 
-   # Toggle recording on/off
-   dictator toggle
+# Toggle recording on/off
+dictator toggle
 
-   # Cancel current operation
-   dictator cancel
+# Cancel current operation
+dictator cancel
 
-   # Check daemon status
-   dictator status
-   ```
+# Check daemon status
+dictator status
+
+# You can also run the service manually:
+dictator daemon
+```
 
 ## 📖 Usage
 
 ### Daemon Mode
 
-The daemon runs in the background and handles all audio recording, transcription, and typing operations:
+The daemon runs in the background and handles all audio recording, transcription, and typing operations.
 
+#### Using systemd:
 ```bash
-# Run daemon in foreground (recommended for development)
+# Check service status
+sudo systemctl status dictator@$USER.service
+
+# Start/stop/restart the service
+sudo systemctl start dictator@$USER.service
+sudo systemctl stop dictator@$USER.service
+sudo systemctl restart dictator@$USER.service
+
+# View service logs
+journalctl -u dictator@$USER.service -f
+```
+
+#### Manual execution:
+```bash
+# Run daemon in foreground
 dictator daemon
 
 # Or run in background
@@ -103,14 +133,6 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `toggle` | Toggle between recording and idle states |
 | `cancel` | Cancel any ongoing operation |
 | `status` | Show daemon status and uptime |
-
-### Workflow
-
-1. **Start Recording**: Use `dictator start` or `dictator toggle`
-2. **Speak**: Talk into your microphone (you'll see a notification)
-3. **Stop Recording**: Use `dictator stop` or `dictator toggle`
-4. **Automatic Transcription**: The daemon sends audio to Whisper API
-5. **Text Insertion**: Transcribed text is typed at your cursor position
 
 ## ⚙️ Configuration
 
@@ -224,6 +246,8 @@ make deps
 
 **Daemon won't start:**
 - Check if another instance is running: `ps aux | grep dictator`
+- If using systemd: `sudo systemctl status dictator@$USER.service`
+- Check systemd logs: `journalctl -u dictator@$USER.service -n 20`
 - Verify audio permissions: `ls -la /dev/snd/`
 - Check socket permissions: `ls -la /tmp/dictator.sock`
 

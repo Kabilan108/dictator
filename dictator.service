@@ -1,0 +1,34 @@
+[Unit]
+Description=Dictator voice typing daemon
+Documentation=https://github.com/kabilan108/dictator
+After=network.target sound.target pulseaudio.service
+Wants=pulseaudio.service
+
+[Service]
+Type=simple
+User=%i
+ExecStart=/usr/local/bin/dictator daemon
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+Environment=XDG_RUNTIME_DIR=/run/user/%i
+Environment=PULSE_RUNTIME_PATH=/run/user/%i/pulse
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/dictator %h/.cache/dictator /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+# Allow access to audio devices and X11
+SupplementaryGroups=audio
+DeviceAllow=/dev/snd rw
+
+[Install]
+WantedBy=default.target
