@@ -23,6 +23,17 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config portaudio19-dev
+
+      - name: Verify PortAudio installation
+        run: |
+          pkg-config --exists portaudio-2.0
+          pkg-config --cflags portaudio-2.0
+          pkg-config --libs portaudio-2.0
+
       - name: Create build directory
         run: mkdir -p build
 
@@ -35,6 +46,6 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dump-linux-amd64.tar.gz
+          files: dictator-linux-amd64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
