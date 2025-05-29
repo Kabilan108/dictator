@@ -1,6 +1,7 @@
 package typing
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -10,7 +11,7 @@ import (
 )
 
 type Typer interface {
-	TypeText(text string) error
+	TypeText(ctx context.Context, text string) error
 	IsAvailable() bool
 }
 
@@ -51,27 +52,35 @@ func (x *XdotoolTyper) IsAvailable() bool {
 	return err == nil
 }
 
-func (x *XdotoolTyper) TypeText(text string) error {
+func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 	if text == "" {
 		x.log.W("empty text provided, nothing to type")
 		return nil
 	}
 
-	x.log.D("typing text: '%s' (length: %d)", text, len(text))
-
-	// Use xdotool with safety flags
-	cmd := exec.Command("xdotool", "type", "--clearmodifiers", "--", text)
+	cmd := exec.CommandContext(ctx, "xdotool", "type", "--clearmodifiers", "--", text)
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			x.log.I("typing cancelled by context")
+			return ctx.Err()
+		}
 		x.log.E("xdotool command failed: %v", err)
 		return fmt.Errorf("failed to type text with xdotool: %w", err)
 	}
 
-	// Apply typing delay if configured
+	// Apply typing delay if configured, but check for cancellation
 	if x.config.TypingDelayMS > 0 {
 		delay := time.Duration(x.config.TypingDelayMS) * time.Millisecond
 		x.log.D("applying typing delay: %v", delay)
-		time.Sleep(delay)
+		
+		select {
+		case <-time.After(delay):
+			// Normal delay completion
+		case <-ctx.Done():
+			x.log.I("typing cancelled during delay")
+			return ctx.Err()
+		}
 	}
 
 	x.log.I("successfully typed %d characters", len(text))
@@ -88,19 +97,20 @@ func (x *XclipTyper) IsAvailable() bool {
 	return err == nil
 }
 
-func (x *XclipTyper) TypeText(text string) error {
+func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 	if text == "" {
 		x.log.W("empty text provided, nothing to copy")
 		return nil
 	}
 
-	x.log.D("copying text to clipboard: '%s' (length: %d)", text, len(text))
-
-	// Copy text to clipboard using xclip
-	cmd := exec.Command("xclip", "-selection", "clipboard")
+	cmd := exec.CommandContext(ctx, "xclip", "-selection", "clipboard")
 	cmd.Stdin = strings.NewReader(text)
 
 	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			x.log.I("clipboard operation cancelled by context")
+			return ctx.Err()
+		}
 		x.log.E("xclip command failed: %v", err)
 		return fmt.Errorf("failed to copy text to clipboard with xclip: %w", err)
 	}

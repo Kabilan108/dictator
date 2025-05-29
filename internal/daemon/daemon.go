@@ -302,7 +302,15 @@ func (d *Daemon) transcribeAndType() {
 		d.log.W("failed to update notification: %v", err)
 	}
 
-	if err := d.typer.TypeText(resp.Text); err != nil {
+	if err := d.typer.TypeText(ctx, resp.Text); err != nil {
+		if ctx.Err() != nil {
+			d.log.I("typing cancelled")
+			d.mu.Lock()
+			d.state = ipc.StateIdle
+			d.lastError = nil
+			d.mu.Unlock()
+			return
+		}
 		d.log.E("typing failed: %v", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
 		return
