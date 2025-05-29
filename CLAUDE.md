@@ -2,151 +2,57 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## Commands
 
-Dictator is a voice-to-text daemon for Linux that enables voice typing anywhere the cursor is positioned. The system uses a CLI/daemon architecture where a single binary operates in two modes:
-- Daemon mode: Background service handling audio recording, transcription, and typing
-- Client mode: CLI commands that communicate with the daemon via Unix socket IPC
-
-## Useful Devtools
-
-### Code and file search: `dump`
-
-If you want to read a number of files that match some filter quickly, use the `dump` tool in the bash shell. The command line flags available for dump are listed below.
-
-```
-usage: dump [options] [directories...]
-
-  recursively dumps text files from specified directories,
-  respecting .gitignore and custom ignore rules.
-
-options:
-  -d|--dir <value>       directory to scan (can be repeated)
-  -g|--glob <value>      glob pattern to match (can be repeated)
-  -f|--filter <string>   skip lines matching this regex
-  -h|--help              display help message
-  -i|--ignore <value>    glob pattern to ignore (can be repeated)
-  -o|--out-fmt <string>  xml or md (default "xml")
-  -l|--list              list file paths only
-  --xml-tag <string>     custom XML tag name (only for xml output) (default "file")
-```
-
-Here are some examples of situations where you could use `dump`:
-
-```
-# Dump from specific directories
-dump src/ tests/ docs/
-
-# Dump with directory flags
-dump -d src/ -d tests/
-
-# List file paths only (no content). Helpful for refining your search filters before fetching the file contents
-dump -l
-
-# Include specific files using glob patterns
-dump -g "**.go" -g "*.md"
-
-# Add ignore patterns (can use multiple times)
-dump -i "**.log" -i "node_modules"
-
-# Filter out lines matching a regex pattern
-dump -f "TODO|FIXME"
-
-# Markdown output format instead of XML
-dump -o md
-
-# Custom XML tag name
-dump --xml-tag source
-
-# Combine options
-dump src/ tests/ -g "*.go" -i "vendor" -f "^//.*"
-```
-
-By default, `dump` will print files to STDOUT formatted as XML in <file>...</file> tags. You can request markdown output by passing the `-o md` flag
-
-## Build Commands
-
+Build and run the project:
 ```bash
-# Build the binary
-make build
-
-# Install to GOPATH/bin
-make install
-
-# Run the built binary
-make run
-
-# Update dependencies
-make deps
-
-# Clean build artifacts
-make clean
+make build         # builds to build/dictator
+make run           # build and run daemon
+make install       # install to GOPATH/bin
+make clean         # remove build artifacts
+make deps          # tidy dependencies
 ```
 
-## Development Commands
+No specific test or lint commands are defined in the makefile.
 
-```bash
-# Run daemon in foreground for development
-go run . daemon
+## Architecture
 
-# Test CLI commands (requires daemon running)
-go run . start
-go run . stop
-go run . toggle
-go run . cancel
-go run . status
-```
+Dictator is a voice typing daemon for Linux using a client-server architecture:
 
-## Architecture Overview
+- **Binary modes**: Single binary operates as both daemon and CLI client
+- **IPC**: Unix socket communication at `/tmp/dictator.sock`
+- **State machine**: Daemon manages states: idle → recording → transcribing → typing → idle
+- **Configuration**: JSON config at `~/.config/dictator/config.json`
 
-The application follows a modular design with these key packages:
+### Core Components
 
-- `internal/cmd/` - Cobra-based CLI command handlers with Viper configuration
-- `internal/daemon/` - Main daemon implementation and state machine
-- `internal/ipc/` - Unix socket IPC protocol for client-daemon communication
-- `internal/audio/` - Audio recording using malgo (miniaudio bindings)
-- `internal/transcribe/` - Whisper API client for speech-to-text
-- `internal/typing/` - Keyboard input via xdotool
-- `internal/notifier/` - Dunst integration for visual feedback
-- `internal/config/` - Configuration management
+- **Daemon** (`internal/daemon/`): Background service managing state transitions and orchestrating audio/transcription/typing
+- **IPC** (`internal/ipc/`): Unix socket protocol for client-daemon communication
+- **Audio** (`internal/audio/`): PortAudio recording and Whisper API transcription
+- **Typing** (`internal/typing/`): xdotool-based keyboard input simulation
+- **Notifier** (`internal/notifier/`): dunst desktop notifications for state changes
 
-## Key Dependencies
+### State Flow
 
-- `github.com/spf13/cobra` - CLI framework
-- `github.com/spf13/viper` - Configuration management
-- `github.com/fatih/color` - Terminal colors
+The daemon implements a linear state machine:
+1. **Idle**: Waiting for commands
+2. **Recording**: Audio capture active
+3. **Transcribing**: Sending audio to Whisper API
+4. **Typing**: Simulating keyboard input
+5. **Error**: Temporary error state (auto-returns to idle)
 
-Planned dependencies (from PLAN.md):
-- `github.com/godbus/dbus/v5` - D-Bus for notifications
-- `github.com/gen2brain/malgo` - Audio recording
+### Key Dependencies
 
-## Configuration
+- **Cobra/Viper**: CLI framework and configuration
+- **PortAudio**: Cross-platform audio I/O
+- **Whisper API**: Speech-to-text transcription
+- **xdotool**: X11 keyboard simulation
+- **dunst**: Linux desktop notifications
 
-Configuration file location: `~/.config/dictator/config.json`
+### Project Structure
 
-Expected structure includes API keys for Whisper, audio settings, and behavior parameters.
-
-## IPC Protocol
-
-Uses Unix socket at `/tmp/dictator.sock` with JSON-based request/response protocol for command correlation between CLI and daemon.
-
-## State Management
-
-Daemon implements a state machine:
-- Idle → Recording (start command)
-- Recording → Transcribing (stop command)
-- Transcribing → Typing (API response)
-- Typing → Idle (completion)
-- Any state → Idle (cancel command)
-
-## External Dependencies
-
-Required system packages:
-- `xdotool` - Text input at cursor position
-- `xclip` - Clipboard fallback
-- `dunst` - Notification daemon
-- Audio system (PulseAudio/PipeWire)
-
-## Testing
-
-Currently no test framework is configured. Check for test files or add testing setup as needed.
+- `main.go`: CLI command definitions and entry point
+- `internal/daemon/daemon.go`: Core daemon logic and state management
+- `internal/ipc/protocol.go`: IPC message definitions and constants
+- `internal/utils/config.go`: Configuration management
+- `dictator.service`: systemd service template
