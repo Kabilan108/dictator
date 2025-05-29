@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/kabilan108/dictator/internal/daemon"
 	"github.com/kabilan108/dictator/internal/ipc"
+	"github.com/kabilan108/dictator/internal/storage"
+	"github.com/kabilan108/dictator/internal/typing"
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
@@ -200,6 +203,97 @@ var statusCmd = func(lvl utils.LogLevel) *cobra.Command {
 	}
 }
 
+var transcriptCmd = &cobra.Command{
+	Use:   "transcript",
+	Short: "manage transcript history",
+	Long:  `commands to view and manage stored transcript history`,
+}
+
+var transcriptListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "list all transcripts as JSON",
+	Long:  `outputs all stored transcripts as JSON, ordered by timestamp (newest first)`,
+	Run: func(cmd *cobra.Command, args []string) {
+		db, err := storage.NewDB(utils.CONFIG_DIR)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
+			os.Exit(1)
+		}
+		defer db.Close()
+
+		transcripts, err := db.GetAllTranscripts()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to get transcripts: %v\n", err)
+			os.Exit(1)
+		}
+
+		jsonData, err := json.MarshalIndent(transcripts, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to marshal JSON: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println(string(jsonData))
+	},
+}
+
+var transcriptLastCmd = func(lvl utils.LogLevel) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "last",
+		Short: "get the most recent transcript",
+		Long:  `prints the text of the most recent transcript, or copies it to clipboard with --clip`,
+		Run: func(cmd *cobra.Command, args []string) {
+			clipFlag, _ := cmd.Flags().GetBool("clip")
+
+			db, err := storage.NewDB(utils.CONFIG_DIR)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
+				os.Exit(1)
+			}
+			defer db.Close()
+
+			transcript, err := db.GetLastTranscript()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to get last transcript: %v\n", err)
+				os.Exit(1)
+			}
+
+			if transcript == nil {
+				fmt.Fprintf(os.Stderr, "no transcripts found\n")
+				os.Exit(1)
+			}
+
+			if clipFlag {
+				// Check if xclip is available
+				xclipTyper := typing.XclipTyper{}
+				if !xclipTyper.IsAvailable() {
+					fmt.Fprintf(os.Stderr, "xclip not available - cannot copy to clipboard\n")
+					os.Exit(1)
+				}
+
+				// Use xclip to copy to clipboard
+				log := utils.NewLogger(lvl, "xclip")
+				xclipTyper = typing.XclipTyper{
+					Config: utils.AppConfig{},
+					Log:    log,
+				}
+
+				ctx := context.Background()
+				if err := xclipTyper.TypeText(ctx, transcript.Text); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to copy to clipboard: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Println("Text copied to clipboard")
+			} else {
+				fmt.Print(transcript.Text)
+			}
+		},
+	}
+
+	cmd.Flags().Bool("clip", false, "copy transcript text to clipboard instead of printing")
+	return cmd
+}
+
 func initConfig() {
 	if cfgFile != "" {
 		viper.SetConfigFile(cfgFile)
@@ -235,6 +329,10 @@ func init() {
 	rootCmd.AddCommand(toggleCmd(config.App.LogLevel))
 	rootCmd.AddCommand(cancelCmd(config.App.LogLevel))
 	rootCmd.AddCommand(statusCmd(config.App.LogLevel))
+
+	transcriptCmd.AddCommand(transcriptListCmd)
+	transcriptCmd.AddCommand(transcriptLastCmd(config.App.LogLevel))
+	rootCmd.AddCommand(transcriptCmd)
 
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/dictator/utils.json)")
 }

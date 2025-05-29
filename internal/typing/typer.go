@@ -29,8 +29,8 @@ func New(logLevel utils.LogLevel) Typer {
 
 	// Fallback to xclip
 	xclipTyper := &XclipTyper{
-		config: utils.AppConfig{},
-		log:    log,
+		Config: utils.AppConfig{},
+		Log:    log,
 	}
 	if xclipTyper.IsAvailable() {
 		log.W("xdotool not available, falling back to xclip (clipboard)")
@@ -62,7 +62,7 @@ func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			x.log.I("typing cancelled by context")
+			x.log.D("typing cancelled by context")
 			return ctx.Err()
 		}
 		x.log.E("xdotool command failed: %v", err)
@@ -88,8 +88,8 @@ func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 }
 
 type XclipTyper struct {
-	config utils.AppConfig
-	log    utils.Logger
+	Config utils.AppConfig
+	Log    utils.Logger
 }
 
 func (x *XclipTyper) IsAvailable() bool {
@@ -99,7 +99,7 @@ func (x *XclipTyper) IsAvailable() bool {
 
 func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 	if text == "" {
-		x.log.W("empty text provided, nothing to copy")
+		x.Log.W("empty text provided, nothing to copy")
 		return nil
 	}
 
@@ -108,13 +108,13 @@ func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			x.log.I("clipboard operation cancelled by context")
+			x.Log.D("clipboard operation cancelled by context")
 			return ctx.Err()
 		}
-		x.log.E("xclip command failed: %v", err)
+		x.Log.E("xclip command failed: %v", err)
 		return fmt.Errorf("failed to copy text to clipboard with xclip: %w", err)
 	}
 
-	x.log.I("text copied to clipboard (%d characters) - paste with Ctrl+V", len(text))
+	x.Log.D("text copied to clipboard (%d characters) - paste with Ctrl+V", len(text))
 	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/kabilan108/dictator/internal/audio"
 	"github.com/kabilan108/dictator/internal/ipc"
 	"github.com/kabilan108/dictator/internal/notifier"
+	"github.com/kabilan108/dictator/internal/storage"
 	"github.com/kabilan108/dictator/internal/typing"
 	"github.com/kabilan108/dictator/internal/utils"
 )
@@ -23,6 +24,7 @@ type Daemon struct {
 	notifier    notifier.Notifier
 	typer       typing.Typer
 	ipcServer   *ipc.Server
+	db          *storage.DB
 	log         utils.Logger
 
 	mu        sync.RWMutex
@@ -54,12 +56,18 @@ func NewDaemon(cfg *utils.Config) (*Daemon, error) {
 
 	typer := typing.New(cfg.App.LogLevel)
 
+	db, err := storage.NewDB(utils.CONFIG_DIR)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create database: %w", err)
+	}
+
 	daemon := &Daemon{
 		config:      cfg,
 		recorder:    recorder,
 		transcriber: transcriber,
 		notifier:    notifier,
 		typer:       typer,
+		db:          db,
 		log:         log,
 		state:       ipc.StateIdle,
 		startTime:   time.Now(),
@@ -135,6 +143,13 @@ func (d *Daemon) shutdown() error {
 	if d.notifier != nil {
 		if err := d.notifier.Close(); err != nil {
 			d.log.E("failed to close notifier: %v", err)
+			lastErr = err
+		}
+	}
+
+	if d.db != nil {
+		if err := d.db.Close(); err != nil {
+			d.log.E("failed to close database: %v", err)
 			lastErr = err
 		}
 	}
@@ -267,6 +282,8 @@ func (d *Daemon) GetStatus() ipc.StatusData {
 }
 
 func (d *Daemon) transcribeAndType() {
+	recordingDuration := d.recorder.GetRecordingDuration()
+	
 	audioData, audioPath, err := d.recorder.Stop()
 	if err != nil {
 		d.log.E("failed to stop recording: %v", err)
@@ -326,6 +343,13 @@ func (d *Daemon) transcribeAndType() {
 	}
 
 	d.log.I("typing complete")
+
+	durationMs := int(recordingDuration.Milliseconds())
+	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, d.config.API.Model); err != nil {
+		d.log.W("failed to save transcript to database: %v", err)
+	} else {
+		d.log.D("transcript saved to database")
+	}
 
 	d.mu.Lock()
 	d.state = ipc.StateIdle
