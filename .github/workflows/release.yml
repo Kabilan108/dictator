@@ -1,4 +1,4 @@
-name: Release dictator Binary
+name: Release dump Binary
 
 on:
   push:
@@ -23,28 +23,18 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      - name: Get version
-        id: version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - name: Create build directory
+        run: mkdir -p build
 
-      - name: Build Linux Binary
-        run: |
-          BINARY_NAME="dictator"
-          go build -ldflags="-s -w -X main.version=${{ steps.version.outputs.version }}" -o $BINARY_NAME .
+      - name: Build and package release
+        run: make release
         env:
           GOOS: linux
           GOARCH: amd64
 
-      - name: Create tarball
-        run: |
-          mkdir -p dictator-linux-amd64/bin
-          cp dictator capscreen-linux-amd64/bin/
-          tar czf dictator-linux-amd64.tar.gz capscreen-linux-amd64
-
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dictator-linux-amd64.tar.gz
+          files: dump-linux-amd64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
