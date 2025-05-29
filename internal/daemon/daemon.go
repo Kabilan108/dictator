@@ -335,11 +335,11 @@ func (d *Daemon) transcribeAndType() {
 			d.state = ipc.StateIdle
 			d.lastError = nil
 			d.mu.Unlock()
+		} else {
+			d.log.E("typing failed: %v", err)
+			d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
 			return
 		}
-		d.log.E("typing failed: %v", err)
-		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
-		return
 	}
 
 	d.log.I("typing complete")
