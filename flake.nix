@@ -14,6 +14,9 @@
 
       vendorHash = "sha256-NJdXa+h3VjTrpjs1B2xi9hWyCZ9YIUry3s3zUeCzpCw=";
 
+      nativeBuildInputs = with pkgs; [ pkg-config ];
+      buildInputs = with pkgs; [ portaudio ];
+
       buildPhase = ''
         runHook preBuild
         make build
