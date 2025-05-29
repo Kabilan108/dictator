@@ -13,14 +13,12 @@ deps:
 	go mod tidy
 
 clean:
-	rm -f build/dictator
-	rm -rf dictator-linux-amd64
-	rm -f dictator-linux-amd64.tar.gz
+	rm -f build/dictator dictator dictator-linux-amd64.tar.gz dictator-linux-amd64
 
 run: build
 	./build/dictator
 
 release: build/dictator-linux-amd64
-	cp build/dictator-linux-amd64 dictator
+	mv build/dictator-linux-amd64 build/dictator
 	tar czf dictator-linux-amd64.tar.gz -C build dictator
 	rm -rf dictator
