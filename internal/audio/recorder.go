@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gordonklaus/portaudio"
-	"github.com/kabilan108/dictator/internal/config"
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
@@ -27,7 +26,7 @@ type Recorder struct {
 	buffer        []float32
 	isInitialized bool
 
-	config config.AudioConfig
+	config utils.AudioConfig
 
 	mu        sync.RWMutex
 	state     RecorderState
@@ -44,7 +43,7 @@ type Recorder struct {
 	log utils.Logger
 }
 
-func NewRecorder(c config.AudioConfig, l utils.LogLevel) (*Recorder, error) {
+func NewRecorder(c utils.AudioConfig, l utils.LogLevel) (*Recorder, error) {
 	recorder := &Recorder{
 		config:        c,
 		state:         StateIdle,

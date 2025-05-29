@@ -9,24 +9,6 @@ import (
 	"github.com/fatih/color"
 )
 
-// consts
-
-var CONFIG_DIR = func() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		return filepath.Join(os.Getenv("HOME"), ".config", "dictator")
-	}
-	return filepath.Join(dir, "dictator")
-}()
-
-var CACHE_DIR = func() string {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return filepath.Join(os.Getenv("HOME"), ".cache", "dictator")
-	}
-	return filepath.Join(dir, "dictator")
-}()
-
 // logger
 
 type LogLevel int
@@ -75,17 +57,6 @@ func (l *logger) logMessage(
 	fmt.Fprintln(os.Stderr, logLine)
 }
 
-func Fatal(name, format string, args ...interface{}) {
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	coloredLevel := color.RedString("FATAL")
-	logLine := fmt.Sprintf(
-		"%s | %s | %-10s | %s", timestamp, coloredLevel, name,
-		fmt.Sprintf(format, args...),
-	)
-	fmt.Fprintln(os.Stderr, logLine)
-	os.Exit(1)
-}
-
 func (l *logger) D(format string, args ...interface{}) {
 	l.logMessage(LevelDebug, "DEBUG", color.CyanString, format, args...)
 }
@@ -107,8 +78,8 @@ func (l *logger) E(format string, args ...interface{}) {
 type AppDir int
 
 const (
-	Cache AppDir = iota
-	Config
+	CacheDir AppDir = iota
+	ConfigDir
 )
 
 func createDir(path string) error {
@@ -124,9 +95,9 @@ func createDir(path string) error {
 func CreateAppDir(ad AppDir) func(name string) (string, error) {
 	var d string
 	switch ad {
-	case Cache:
+	case CacheDir:
 		d = CACHE_DIR
-	case Config:
+	case ConfigDir:
 		d = CONFIG_DIR
 	}
 	return func(name string) (string, error) {
@@ -139,7 +110,7 @@ func CreateAppDir(ad AppDir) func(name string) (string, error) {
 }
 
 func GetPathToRecording(startTime time.Time) (string, error) {
-	d, err := CreateAppDir(Cache)("recordings")
+	d, err := CreateAppDir(CacheDir)("recordings")
 	if err != nil {
 		return "", fmt.Errorf("failed to create recording directory: %w", err)
 	}

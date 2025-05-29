@@ -1,4 +1,4 @@
-package config
+package utils
 
 import (
 	"encoding/json"
@@ -6,9 +6,24 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/kabilan108/dictator/internal/utils"
 	"github.com/spf13/viper"
 )
+
+var CONFIG_DIR = func() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return filepath.Join(os.Getenv("HOME"), ".config", "dictator")
+	}
+	return filepath.Join(dir, "dictator")
+}()
+
+var CACHE_DIR = func() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return filepath.Join(os.Getenv("HOME"), ".cache", "dictator")
+	}
+	return filepath.Join(dir, "dictator")
+}()
 
 type Config struct {
 	API   APIConfig   `json:"api" mapstructure:"api"`
@@ -32,9 +47,9 @@ type AudioConfig struct {
 }
 
 type AppConfig struct {
-	LogLevel        utils.LogLevel `json:"log_level" mapstructure:"log_level"`
-	MaxRecordingMin int            `json:"max_recording_min" mapstructure:"max_recording_seconds"`
-	TypingDelayMS   int            `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
+	LogLevel        LogLevel `json:"log_level" mapstructure:"log_level"`
+	MaxRecordingMin int      `json:"max_recording_min" mapstructure:"max_recording_seconds"`
+	TypingDelayMS   int      `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
 }
 
 func DefaultConfig() *Config {
@@ -55,7 +70,7 @@ func DefaultConfig() *Config {
 		App: AppConfig{
 			TypingDelayMS:   10,
 			MaxRecordingMin: 5,
-			LogLevel:        utils.LevelDebug,
+			LogLevel:        LevelDebug,
 		},
 	}
 }
@@ -65,7 +80,7 @@ func Load() (*Config, error) {
 
 	viper.SetConfigName("config")
 	viper.SetConfigType("json")
-	viper.AddConfigPath(utils.CONFIG_DIR)
+	viper.AddConfigPath(CONFIG_DIR)
 
 	viper.SetEnvPrefix("DICTATOR")
 	viper.AutomaticEnv()
@@ -126,13 +141,13 @@ func Validate(config *Config) error {
 }
 
 func InitConfigFile() error {
-	configPath := filepath.Join(utils.CONFIG_DIR, "config.json")
+	configPath := filepath.Join(CONFIG_DIR, "config.json")
 
 	if _, err := os.Stat(configPath); err == nil {
 		return nil
 	}
 
-	if err := os.MkdirAll(utils.CONFIG_DIR, 0o755); err != nil {
+	if err := os.MkdirAll(CONFIG_DIR, 0o755); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 

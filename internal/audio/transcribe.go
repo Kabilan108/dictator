@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kabilan108/dictator/internal/config"
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
@@ -32,12 +31,12 @@ type WhisperClient interface {
 }
 
 type whisperClient struct {
-	config     *config.APIConfig
+	config     *utils.APIConfig
 	httpClient *http.Client
 	log        utils.Logger
 }
 
-func NewWhisperClient(c *config.APIConfig, l utils.LogLevel) WhisperClient {
+func NewWhisperClient(c *utils.APIConfig, l utils.LogLevel) WhisperClient {
 	timeout := time.Duration(c.TimeoutSec) * time.Second
 	return &whisperClient{
 		config:     c,

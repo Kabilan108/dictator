@@ -7,17 +7,24 @@
     system = "x86_64-linux";
     pkgs = import nixpkgs { inherit system; };
   in {
-    # packages.${system}.default = pkgs.stdenv.mkDerivation rec {
-    #   pname = "capscreen";
-    #   version = "0.1.1";
-    #   src = pkgs.fetchurl {
-    #     url = "https://github.com/Kabilan108/capscreen/releases/download/v${version}/capscreen-linux-amd64.tar.gz";
-    #     sha256 = "sha256-dsAsWE2zIcrCeYJi8RAUwiXvzGSgtbIGqsHJJSF9NgI=";
-    #   };
+    # packages.${system}.default = pkgs.buildGoModule rec {
+    #   pname = "dictator";
+    #   version = "latest";
+    #   src = ./.;
+    #
+    #   vendorHash = "sha256-NJdXa+h3VjTrpjs1B2xi9hWyCZ9YIUry3s3zUeCzpCw=";
+    #
+    #   buildPhase = ''
+    #     runHook preBuild
+    #     make build
+    #     runHook postBuild
+    #   '';
+    #
     #   installPhase = ''
+    #     runHook preInstall
     #     mkdir -p $out/bin
-    #     cp bin/capscreen $out/bin/
-    #     chmod +x $out/bin/capscreen
+    #     cp build/dictator $out/bin/
+    #     runHook postInstall
     #   '';
     # };
     devShells.${system}.default = pkgs.mkShell {
@@ -29,6 +36,7 @@
         ffmpeg
         pkg-config
         portaudio
+        # self.packages.${system}.default
       ];
       shellHook = ''
         export NPM_CONFIG_PREFIX="$HOME/.npm-global"

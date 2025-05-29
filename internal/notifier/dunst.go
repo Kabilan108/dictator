@@ -6,28 +6,18 @@ import (
 	"sync"
 
 	"github.com/godbus/dbus/v5"
+	"github.com/kabilan108/dictator/internal/ipc"
 	"github.com/kabilan108/dictator/internal/utils"
-)
-
-type NotificationState int
-
-const (
-	StateIdle NotificationState = iota
-	StateRecording
-	StateTranscribing
-	StateTyping
-	StateError
 )
 
 type NotificationContent struct {
 	Title string
 	Body  string
-	Icon  string
 }
 
 type Notifier interface {
-	UpdateState(state NotificationState) error
-	Update(title, body, icon string) error
+	UpdateState(state ipc.DaemonState) error
+	Update(title, body string) error
 	Close() error
 }
 
@@ -38,31 +28,26 @@ type DunstNotifier struct {
 	mu             sync.Mutex
 }
 
-var stateNotifications = map[NotificationState]NotificationContent{
-	StateIdle: {
-		Title: "🏠 Dictator",
-		Body:  "Ready for voice input",
-		Icon:  "microphone-sensitivity-muted",
+var stateNotifications = map[ipc.DaemonState]NotificationContent{
+	ipc.StateIdle: {
+		Title: "dictator",
+		Body:  "ready for voice input",
 	},
-	StateRecording: {
-		Title: "🎤 Dictator",
+	ipc.StateRecording: {
+		Title: " dictator",
 		Body:  "Recording audio...",
-		Icon:  "audio-input-microphone",
 	},
-	StateTranscribing: {
-		Title: "🔄 Dictator",
-		Body:  "Transcribing audio...",
-		Icon:  "system-run",
+	ipc.StateTranscribing: {
+		Title: "dictator",
+		Body:  "transcribing audio...",
 	},
-	StateTyping: {
-		Title: "⌨️ Dictator",
-		Body:  "Typing text...",
-		Icon:  "input-keyboard",
+	ipc.StateTyping: {
+		Title: " dictator",
+		Body:  "typing text...",
 	},
-	StateError: {
-		Title: "❌ Dictator",
-		Body:  "An error occurred",
-		Icon:  "dialog-error",
+	ipc.StateError: {
+		Title: " dictator",
+		Body:  "an error occurred",
 	},
 }
 
@@ -110,7 +95,7 @@ func New(logLevel utils.LogLevel) (Notifier, error) {
 }
 
 // updatestate updates the notification based on the current daemon state
-func (n *DunstNotifier) UpdateState(state NotificationState) error {
+func (n *DunstNotifier) UpdateState(state ipc.DaemonState) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -121,16 +106,16 @@ func (n *DunstNotifier) UpdateState(state NotificationState) error {
 	}
 
 	n.log.D("updating notification state to: %s", content.Title)
-	return n.updateNotification(content.Title, content.Body, content.Icon)
+	return n.updateNotification(content.Title, content.Body)
 }
 
-// update sends a custom notification with specified title, body, and icon
-func (n *DunstNotifier) Update(title, body, icon string) error {
+// update sends a custom notification with specified title, and body
+func (n *DunstNotifier) Update(title, body string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
 	n.log.D("sending custom notification: %s", title)
-	return n.updateNotification(title, body, icon)
+	return n.updateNotification(title, body)
 }
 
 // Close dismisses the current notification
@@ -164,7 +149,7 @@ func (n *DunstNotifier) Close() error {
 }
 
 // updateNotification sends notification via D-Bus
-func (n *DunstNotifier) updateNotification(title, body, icon string) error {
+func (n *DunstNotifier) updateNotification(title, body string) error {
 	if n.conn == nil {
 		return fmt.Errorf("D-Bus connection is closed")
 	}
@@ -183,7 +168,7 @@ func (n *DunstNotifier) updateNotification(title, body, icon string) error {
 		methodNotify, 0,
 		appName,   // app_name
 		replaceID, // replaces_id (0 for new, or existing ID to update)
-		icon,      // app_icon
+		"",        // app_icon
 		title,     // summary
 		body,      // body
 		actions,   // actions
