@@ -22,8 +22,16 @@ var cfgFile string
 
 var rootCmd = &cobra.Command{
 	Use:   "dictator",
-	Short: "hello world",
-	Long:  `hello world`,
+	Short: "whisper typing daemon for linux",
+	Long: `dictator is a voice typing daemon for linux that enables voice typing anywhere
+the cursor is positioned. the system uses a cli/daemon architecture where a single
+binary operates in two modes:
+
+- daemon mode: background service handling audio recording, transcription, and typing
+- client mode: cli commands that communicate with the daemon via unix socket ipc
+
+start the daemon with 'dictator daemon' then use commands like 'start', 'stop',
+'toggle', 'cancel', and 'status' to control voice recording and transcription.`,
 }
 
 var daemonCmd = func(c *utils.Config) *cobra.Command {
