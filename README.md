@@ -273,5 +273,3 @@ Enable debug logging in your config:
 - [dunst](https://dunst-project.org/) for desktop notifications
 
 ---
-
-**Made with ❤️ for the Linux community**
