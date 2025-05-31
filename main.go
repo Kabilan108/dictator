@@ -306,10 +306,10 @@ func initConfig() {
 		viper.SetConfigType("json")
 	}
 	viper.AutomaticEnv() // read in environment variables that match
-	if err := viper.ReadInConfig(); err != nil {
+	if err := utils.InitConfigFile(); err != nil {
 		cobra.CheckErr(err)
 	}
-	if err := utils.InitConfigFile(); err != nil {
+	if err := viper.ReadInConfig(); err != nil {
 		cobra.CheckErr(err)
 	}
 }
