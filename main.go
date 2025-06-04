@@ -2,6 +2,10 @@
 Copyright © 2025 kabilan108 tonykabilanokeke@gmail.com
 */
 
+// BUG: need to separate xdotool input from real keyboard input 
+//      right now dictator is typing and the user hits the fn key to, for example pause music, 
+//      that will trigger `fn+ [key]` and similarly with other modifiers
+
 package main
 
 import (
