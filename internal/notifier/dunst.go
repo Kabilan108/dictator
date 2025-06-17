@@ -2,13 +2,13 @@ package notifier
 
 import (
 	"fmt"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/kabilan108/dictator/internal/ipc"
-	"github.com/kabilan108/dictator/internal/utils"
 )
 
 type NotificationContent struct {
@@ -26,7 +26,6 @@ type Notifier interface {
 type DunstNotifier struct {
 	conn           *dbus.Conn
 	notificationID uint32
-	log            utils.Logger
 	mu             sync.Mutex
 }
 
@@ -37,15 +36,15 @@ var stateNotifications = map[ipc.DaemonState]NotificationContent{
 	},
 	ipc.StateRecording: {
 		Title: " dictator",
-		Body:  "Recording audio...",
+		Body:  "Recording audio",
 	},
 	ipc.StateTranscribing: {
 		Title: "dictator",
-		Body:  "transcribing audio...",
+		Body:  "transcribing audio",
 	},
 	ipc.StateTyping: {
 		Title: " dictator",
-		Body:  "typing text...",
+		Body:  "typing text",
 	},
 	ipc.StateError: {
 		Title: " dictator",
@@ -69,12 +68,10 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", minutes, seconds)
 }
 
-func New(logLevel utils.LogLevel) (Notifier, error) {
-	log := utils.NewLogger(logLevel, "notifier")
-
+func New(logLevel string) (Notifier, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
-		log.E("failed to connect to session D-Bus: %v", err)
+		slog.Error("failed to connect to session D-Bus", "err", err)
 		return nil, fmt.Errorf("failed to connect to D-Bus session bus: %w", err)
 	}
 
@@ -83,24 +80,23 @@ func New(logLevel utils.LogLevel) (Notifier, error) {
 	err = conn.BusObject().Call("org.freedesktop.DBus.ListNames", 0).Store(&names)
 	if err != nil {
 		conn.Close()
-		log.E("failed to list D-Bus names: %v", err)
+		slog.Error("failed to list D-Bus names", "err", err)
 		return nil, fmt.Errorf("failed to query D-Bus services: %w", err)
 	}
 
 	serviceAvailable := slices.Contains(names, dbusService)
 	if !serviceAvailable {
 		conn.Close()
-		log.W("notification service not available, dunst may not be running")
+		slog.Warn("notification service not available, dunst may not be running")
 		return nil, fmt.Errorf("notification service %s not available", dbusService)
 	}
 
 	notifier := &DunstNotifier{
 		conn:           conn,
 		notificationID: 0, // 0 means create new notification
-		log:            log,
 	}
 
-	log.D("dunst notifier initialized successfully")
+	slog.Debug("dunst notifier initialized successfully")
 	return notifier, nil
 }
 
@@ -111,11 +107,11 @@ func (n *DunstNotifier) UpdateState(state ipc.DaemonState) error {
 
 	content, exists := stateNotifications[state]
 	if !exists {
-		n.log.E("unknown notification state: %d", state)
+		slog.Error("unknown notification state", "state", state)
 		return fmt.Errorf("unknown notification state: %d", state)
 	}
 
-	n.log.D("updating notification state to: %s", content.Title)
+	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
 	return n.updateNotification(content.Title, content.Body)
 }
 
@@ -126,20 +122,20 @@ func (n *DunstNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration 
 
 	content, exists := stateNotifications[state]
 	if !exists {
-		n.log.E("unknown notification state: %d", state)
+		slog.Error("unknown notification state", "state", state)
 		return fmt.Errorf("unknown notification state: %d", state)
 	}
 
 	// Format duration and update body for recording state
 	if state == ipc.StateRecording {
 		formattedDuration := formatDuration(duration)
-		updatedBody := fmt.Sprintf("Recording audio... %s", formattedDuration)
-		n.log.D("updating recording notification with duration: %s", formattedDuration)
+		updatedBody := fmt.Sprintf("Recording audio %s", formattedDuration)
+		slog.Debug("updating recording notification with duration", "duration", formattedDuration)
 		return n.updateNotification(content.Title, updatedBody)
 	}
 
 	// For non-recording states, use standard notification
-	n.log.D("updating notification state to: %s", content.Title)
+	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
 	return n.updateNotification(content.Title, content.Body)
 }
 
@@ -148,7 +144,7 @@ func (n *DunstNotifier) Update(title, body string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
-	n.log.D("sending custom notification: %s", title)
+	slog.Debug("sending custom notification", "title", title)
 	return n.updateNotification(title, body)
 }
 
@@ -158,27 +154,27 @@ func (n *DunstNotifier) Close() error {
 	defer n.mu.Unlock()
 
 	if n.conn == nil {
-		n.log.W("connection already closed")
+		slog.Warn("connection already closed")
 		return nil
 	}
 
 	if n.notificationID != 0 {
 		call := n.conn.Object(dbusService, dbusPath).Call(methodClose, 0, n.notificationID)
 		if call.Err != nil {
-			n.log.W("failed to close notification: %v", call.Err)
+			slog.Warn("failed to close notification", "err", call.Err)
 		} else {
-			n.log.D("notification %d closed", n.notificationID)
+			slog.Debug("notification closed", "id", n.notificationID)
 		}
 		n.notificationID = 0
 	}
 
 	if err := n.conn.Close(); err != nil {
-		n.log.E("failed to close D-Bus connection: %v", err)
+		slog.Error("failed to close D-Bus connection", "err", err)
 		return fmt.Errorf("failed to close D-Bus connection: %w", err)
 	}
 
 	n.conn = nil
-	n.log.D("dunst notifier closed")
+	slog.Debug("dunst notifier closed")
 	return nil
 }
 
@@ -211,18 +207,18 @@ func (n *DunstNotifier) updateNotification(title, body string) error {
 	)
 
 	if call.Err != nil {
-		n.log.E("failed to send notification: %v", call.Err)
+		slog.Error("failed to send notification", "err", call.Err)
 		return fmt.Errorf("failed to send notification: %w", call.Err)
 	}
 
 	// Get the notification ID from the response
 	var newID uint32
 	if err := call.Store(&newID); err != nil {
-		n.log.E("failed to get notification ID: %v", err)
+		slog.Error("failed to get notification ID", "err", err)
 		return fmt.Errorf("failed to get notification ID: %w", err)
 	}
 
 	n.notificationID = newID
-	n.log.D("notification sent successfully (ID: %d)", newID)
+	slog.Debug("notification sent successfully", "id", newID)
 	return nil
 }

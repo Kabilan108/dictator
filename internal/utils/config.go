@@ -52,9 +52,8 @@ type AudioConfig struct {
 }
 
 type AppConfig struct {
-	LogLevel        LogLevel `json:"log_level" mapstructure:"log_level"`
-	MaxRecordingMin int      `json:"max_recording_min" mapstructure:"max_recording_seconds"`
-	TypingDelayMS   int      `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
+	MaxRecordingMin int `json:"max_recording_min" mapstructure:"max_recording_seconds"`
+	TypingDelayMS   int `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
 }
 
 func DefaultConfig() *Config {
@@ -80,7 +79,6 @@ func DefaultConfig() *Config {
 		App: AppConfig{
 			TypingDelayMS:   10,
 			MaxRecordingMin: 5,
-			LogLevel:        LevelDebug,
 		},
 	}
 }
@@ -117,12 +115,12 @@ func Validate(config *Config) error {
 	if config.API.ActiveProvider == "" {
 		return fmt.Errorf("active provider is required")
 	}
-	
+
 	activeProvider, exists := config.API.Providers[config.API.ActiveProvider]
 	if !exists {
 		return fmt.Errorf("active provider '%s' not found in providers", config.API.ActiveProvider)
 	}
-	
+
 	if activeProvider.Endpoint == "" {
 		return fmt.Errorf("endpoint is required for active provider '%s'", config.API.ActiveProvider)
 	}

@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"sync"
 	"time"
-
-	"github.com/kabilan108/dictator/internal/utils"
 )
 
 // CommandHandler defines the interface for handling daemon commands
@@ -26,7 +25,6 @@ type Server struct {
 	socketPath string
 	listener   net.Listener
 	handler    CommandHandler
-	log        utils.Logger
 
 	mu      sync.RWMutex
 	running bool
@@ -35,13 +33,12 @@ type Server struct {
 	cancel context.CancelFunc
 }
 
-func NewServer(handler CommandHandler, logLevel utils.LogLevel) *Server {
+func NewServer(handler CommandHandler, logLevel string) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
 		socketPath: SocketPath,
 		handler:    handler,
-		log:        utils.NewLogger(logLevel, "ipc-server"),
 		running:    false,
 		ctx:        ctx,
 		cancel:     cancel,
@@ -52,28 +49,26 @@ func (s *Server) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	slog.Debug("starting ipc server", "path", s.socketPath)
+
 	if s.running {
 		return fmt.Errorf("server is already running")
 	}
 
 	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
-		s.log.W("failed to remove existing socket file: %v", err)
+		slog.Warn("failed to remove existing socket file", "err", err)
 	}
 
 	// create unix socket listener
 	listener, err := net.Listen("unix", s.socketPath)
 	if err != nil {
-		s.log.E("failed to create unix socket listener: %v", err)
-		return fmt.Errorf("failed to create unix socket listener: %w", err)
+		return err
 	}
 
 	s.listener = listener
 	s.running = true
 
-	s.log.I("ipc server started on %s", s.socketPath)
-
 	go s.acceptConnections()
-
 	return nil
 }
 
@@ -85,24 +80,22 @@ func (s *Server) Stop() error {
 		return nil
 	}
 
-	s.log.D("stopping ipc server...")
+	slog.Debug("stopping ipc server")
 
 	// cancel context to stop all operations
 	s.cancel()
 
 	if s.listener != nil {
 		if err := s.listener.Close(); err != nil {
-			s.log.E("failed to close listener: %v", err)
+			slog.Error("failed to close listener", "err", err)
 		}
 	}
 
 	if err := os.Remove(s.socketPath); err != nil && !os.IsNotExist(err) {
-		s.log.W("failed to remove socket file: %v", err)
+		slog.Warn("failed to remove socket file", "err", err)
 	}
 
 	s.running = false
-	s.log.I("ipc server stopped")
-
 	return nil
 }
 
@@ -110,7 +103,7 @@ func (s *Server) acceptConnections() {
 	for {
 		select {
 		case <-s.ctx.Done():
-			s.log.D("accept loop terminated due to context cancellation")
+			slog.Debug("accept loop terminated due to context cancellation")
 			return
 		default:
 		}
@@ -122,12 +115,12 @@ func (s *Server) acceptConnections() {
 				// Server is shutting down, this is expected
 				return
 			default:
-				s.log.E("failed to accept connection: %v", err)
+				slog.Warn("failed to accept connection", "err", err)
 				continue
 			}
 		}
 
-		s.log.D("new client connection accepted")
+		slog.Debug("new client connection accepted")
 
 		// Handle connection in goroutine
 		go s.handleConnection(conn)
@@ -137,26 +130,26 @@ func (s *Server) acceptConnections() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer func() {
 		if err := conn.Close(); err != nil {
-			s.log.W("failed to close connection: %v", err)
+			slog.Warn("failed to close connection", "err", err)
 		}
-		s.log.D("client connection closed")
+		slog.Debug("client connection closed")
 	}()
 
 	// set connection timeout
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
-		s.log.W("failed to set connection deadline: %v", err)
+		slog.Warn("failed to set connection deadline", "err", err)
 	}
 
 	// decode command from connection
 	var cmd Command
 	decoder := json.NewDecoder(conn)
 	if err := decoder.Decode(&cmd); err != nil {
-		s.log.E("failed to decode command: %v", err)
+		slog.Error("failed to decode command", "err", err)
 		s.sendErrorResponse(conn, "", ErrInvalidCommand, err)
 		return
 	}
 
-	s.log.D("received command: %s (ID: %s)", cmd.Action, cmd.ID)
+	slog.Debug("received command", "action", cmd.Action, "id", cmd.ID)
 
 	// process command and send response
 	response := s.processCommand(&cmd)
@@ -221,7 +214,7 @@ func (s *Server) processCommand(cmd *Command) *Response {
 
 	if err != nil && response.Error == "" {
 		response.Error = err.Error()
-		s.log.E("command failed: %v", err)
+		slog.Error("command failed", "err", err)
 	}
 
 	return response
@@ -230,14 +223,14 @@ func (s *Server) processCommand(cmd *Command) *Response {
 func (s *Server) sendResponse(conn net.Conn, response *Response) {
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(response); err != nil {
-		s.log.E("failed to encode response: %v", err)
+		slog.Error("failed to encode response", "err", err)
 		return
 	}
 
 	if response.Success {
-		s.log.D("sent success response for command ID: %s", response.ID)
+		slog.Debug("sent success response", "id", response.ID)
 	} else {
-		s.log.D("sent error response for command ID: %s, error: %s", response.ID, response.Error)
+		slog.Debug("sent error response", "id", response.ID, "error", response.Error)
 	}
 }
 
@@ -249,7 +242,7 @@ func (s *Server) sendErrorResponse(conn net.Conn, id, errorMsg string, originalE
 	}
 
 	if originalErr != nil {
-		s.log.E("sending error response: %v", originalErr)
+		slog.Error("sending error response", "err", originalErr)
 	}
 
 	s.sendResponse(conn, response)

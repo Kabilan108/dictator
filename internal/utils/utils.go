@@ -1,76 +1,94 @@
 package utils
 
 import (
+	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/fatih/color"
 )
 
 // logger
 
-type LogLevel int
-
-const (
-	LevelDebug LogLevel = iota
-	LevelInfo
-	LevelWarn
-	LevelError
-	LevelFatal
-)
-
-type Logger interface {
-	D(format string, args ...interface{})
-	I(format string, args ...interface{})
-	W(format string, args ...interface{})
-	E(format string, args ...interface{})
+type MultiHandler struct {
+	fileHandler   slog.Handler
+	stderrHandler slog.Handler
 }
 
-type logger struct {
-	level   LogLevel
-	appName string
+func (h *MultiHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.fileHandler.Enabled(ctx, level) || h.stderrHandler.Enabled(ctx, level)
 }
 
-func NewLogger(level LogLevel, appName string) Logger {
-	return &logger{
-		level:   level,
-		appName: appName,
+func (h *MultiHandler) Handle(ctx context.Context, record slog.Record) error {
+	var errs []error
+
+	if err := h.fileHandler.Handle(ctx, record); err != nil {
+		errs = append(errs, err)
+	}
+
+	if err := h.stderrHandler.Handle(ctx, record); err != nil {
+		errs = append(errs, err)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("handler errors: %v", errs)
+	}
+
+	return nil
+}
+
+func (h *MultiHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &MultiHandler{
+		fileHandler:   h.fileHandler.WithAttrs(attrs),
+		stderrHandler: h.stderrHandler.WithAttrs(attrs),
 	}
 }
 
-func (l *logger) logMessage(
-	level LogLevel, levelName string, colorFunc func(string, ...interface{}) string,
-	format string, args ...interface{},
-) {
-	if level < l.level {
-		return
+func (h *MultiHandler) WithGroup(name string) slog.Handler {
+	return &MultiHandler{
+		fileHandler:   h.fileHandler.WithGroup(name),
+		stderrHandler: h.stderrHandler.WithGroup(name),
+	}
+}
+
+type Logger struct {
+	logFile *os.File
+}
+
+var LevelMap = map[string]slog.Level{
+	"DEBUG": slog.LevelDebug,
+	"INFO":  slog.LevelInfo,
+	"WARN":  slog.LevelWarn,
+	"ERROR": slog.LevelError,
+}
+
+func SetupLogger(level string) *Logger {
+	logLevel, exists := LevelMap[level]
+	if !exists {
+		fmt.Fprintf(os.Stderr, "invalid log level: %s\n", level)
+		os.Exit(1)
 	}
 
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	coloredLevel := colorFunc(levelName)
-	logLine := fmt.Sprintf(
-		"%s | %s | %-10s | %s", timestamp, coloredLevel, l.appName,
-		fmt.Sprintf(format, args...),
+	logFile, err := os.OpenFile(
+		filepath.Join(CACHE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666,
 	)
-	fmt.Fprintln(os.Stderr, logLine)
+	if err != nil {
+		panic(fmt.Errorf("failed to open log file: %w", err))
+	}
+
+	fileHandler := slog.NewJSONHandler(logFile, &slog.HandlerOptions{AddSource: true, Level: logLevel})
+	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	logHandler := &MultiHandler{fileHandler, stderrHandler}
+
+	slog.SetDefault(slog.New(logHandler))
+	return &Logger{logFile}
 }
 
-func (l *logger) D(format string, args ...interface{}) {
-	l.logMessage(LevelDebug, "DEBUG", color.CyanString, format, args...)
-}
-
-func (l *logger) I(format string, args ...interface{}) {
-	l.logMessage(LevelInfo, "INFO ", color.BlueString, format, args...)
-}
-
-func (l *logger) W(format string, args ...interface{}) {
-	l.logMessage(LevelWarn, "WARN ", color.YellowString, format, args...)
-}
-
-func (l *logger) E(format string, args ...interface{}) {
-	l.logMessage(LevelError, "ERROR", color.MagentaString, format, args...)
+func (l *Logger) Close() {
+	if l.logFile != nil {
+		l.logFile.Close()
+	}
 }
 
 // files

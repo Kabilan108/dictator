@@ -3,6 +3,7 @@ package typing
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strings"
 	"time"
@@ -15,36 +16,26 @@ type Typer interface {
 	IsAvailable() bool
 }
 
-func New(logLevel utils.LogLevel) Typer {
-	log := utils.NewLogger(logLevel, "typing")
-
-	xdotoolTyper := &XdotoolTyper{
-		config: utils.AppConfig{},
-		log:    log,
-	}
+func New(logLevel string) (Typer, error) {
+	xdotoolTyper := &XdotoolTyper{config: utils.AppConfig{}}
 	if xdotoolTyper.IsAvailable() {
-		log.D("using xdotool for text input")
-		return xdotoolTyper
+		slog.Debug("using xdotool for text input")
+		return xdotoolTyper, nil
 	}
 
 	// Fallback to xclip
-	xclipTyper := &XclipTyper{
-		Config: utils.AppConfig{},
-		Log:    log,
-	}
+	xclipTyper := &XclipTyper{Config: utils.AppConfig{}}
 	if xclipTyper.IsAvailable() {
-		log.W("xdotool not available, falling back to xclip (clipboard)")
-		return xclipTyper
+		slog.Warn("xdotool not available, falling back to xclip (clipboard)")
+		return xclipTyper, nil
 	}
 
 	// Return xdotool typer even if not available - it will fail gracefully
-	log.W("neither xdotool nor xclip available - typing may fail")
-	return xdotoolTyper
+	return nil, fmt.Errorf("neither xdotool nor xclip available")
 }
 
 type XdotoolTyper struct {
 	config utils.AppConfig
-	log    utils.Logger
 }
 
 func (x *XdotoolTyper) IsAvailable() bool {
@@ -54,7 +45,7 @@ func (x *XdotoolTyper) IsAvailable() bool {
 
 func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 	if text == "" {
-		x.log.W("empty text provided, nothing to type")
+		slog.Debug("empty text provided, nothing to type")
 		return nil
 	}
 
@@ -62,28 +53,28 @@ func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			x.log.D("typing cancelled by context")
+			slog.Debug("typing cancelled by context")
 			return ctx.Err()
 		}
-		x.log.E("xdotool command failed: %v", err)
+		slog.Error("xdotool command failed", "err", err)
 		return fmt.Errorf("failed to type text with xdotool: %w", err)
 	}
 
 	// Apply typing delay if configured, but check for cancellation
 	if x.config.TypingDelayMS > 0 {
 		delay := time.Duration(x.config.TypingDelayMS) * time.Millisecond
-		x.log.D("applying typing delay: %v", delay)
+		slog.Debug("applying typing delay", "delay", delay)
 
 		select {
 		case <-time.After(delay):
 			// Normal delay completion
 		case <-ctx.Done():
-			x.log.I("typing cancelled during delay")
+			slog.Debug("typing cancelled during delay")
 			return ctx.Err()
 		}
 	}
 
-	x.log.I("successfully typed %d characters", len(text))
+	slog.Debug("successfully typed", "text", text)
 	return nil
 }
 
@@ -99,7 +90,7 @@ func (x *XclipTyper) IsAvailable() bool {
 
 func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 	if text == "" {
-		x.Log.W("empty text provided, nothing to copy")
+		slog.Debug("empty text provided, nothing to copy")
 		return nil
 	}
 
@@ -108,13 +99,13 @@ func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
 
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			x.Log.D("clipboard operation cancelled by context")
+			slog.Debug("clipboard operation cancelled by context")
 			return ctx.Err()
 		}
-		x.Log.E("xclip command failed: %v", err)
+		slog.Error("xclip command failed", "err", err)
 		return fmt.Errorf("failed to copy text to clipboard with xclip: %w", err)
 	}
 
-	x.Log.D("text copied to clipboard (%d characters) - paste with Ctrl+V", len(text))
+	slog.Debug("text copied to clipboard")
 	return nil
 }
