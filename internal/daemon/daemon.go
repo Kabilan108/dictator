@@ -57,7 +57,7 @@ func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to create typer: %w", err)
 	}
 
-	db, err := storage.NewDB(utils.CACHE_DIR)
+	db, err := storage.NewDB()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create database: %w", err)
 	}

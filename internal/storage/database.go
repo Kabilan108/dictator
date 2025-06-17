@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/kabilan108/dictator/internal/utils"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -29,12 +30,12 @@ type DB struct {
 	path string
 }
 
-func NewDB(parentDir string) (*DB, error) {
-	if err := os.MkdirAll(parentDir, 0o755); err != nil {
+func NewDB() (*DB, error) {
+	if err := os.MkdirAll(utils.CACHE_DIR, 0o755); err != nil {
 		return nil, err
 	}
 
-	dbPath := filepath.Join(parentDir, dbFilename)
+	dbPath := filepath.Join(utils.CACHE_DIR, dbFilename)
 
 	conn, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {
@@ -71,4 +72,3 @@ func (db *DB) Close() error {
 func (db *DB) Path() string {
 	return db.path
 }
-

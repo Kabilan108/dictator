@@ -207,7 +207,7 @@ var transcriptListCmd = &cobra.Command{
 	Short: "list all transcripts as JSON",
 	Long:  `outputs all stored transcripts as JSON, ordered by timestamp (newest first)`,
 	Run: func(cmd *cobra.Command, args []string) {
-		db, err := storage.NewDB(utils.CONFIG_DIR)
+		db, err := storage.NewDB()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
 			os.Exit(1)
@@ -237,7 +237,7 @@ var transcriptLastCmd = &cobra.Command{
 	Run: func(cmd *cobra.Command, args []string) {
 		clipFlag, _ := cmd.Flags().GetBool("clip")
 
-		db, err := storage.NewDB(utils.CONFIG_DIR)
+		db, err := storage.NewDB()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
 			os.Exit(1)
