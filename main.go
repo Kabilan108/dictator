@@ -25,7 +25,10 @@ import (
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
-var cfgFile, logLevel string
+var (
+	cfgFile, logLevel string
+	version           = "v1.1.0"
+)
 
 var rootCmd = &cobra.Command{
 	Use:   "dictator",
@@ -184,10 +187,12 @@ var statusCmd = &cobra.Command{
 	},
 }
 
-var testCmd = &cobra.Command{
-	Use: "test",
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "print the version number",
+	Long:  `prints the version number of the dictator daemon`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// logger := utils.SetupLogger(logLevel, "test")
+		fmt.Println(version)
 	},
 }
 
@@ -313,13 +318,12 @@ func init() {
 	rootCmd.AddCommand(toggleCmd)
 	rootCmd.AddCommand(cancelCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(versionCmd)
 
 	transcriptCmd.AddCommand(transcriptListCmd)
 	transcriptCmd.AddCommand(transcriptLastCmd)
 	transcriptLastCmd.Flags().Bool("clip", false, "copy transcript text to clipboard instead of printing")
 	rootCmd.AddCommand(transcriptCmd)
-
-	rootCmd.AddCommand(testCmd)
 }
 
 func main() {
