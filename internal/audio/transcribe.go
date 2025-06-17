@@ -37,7 +37,7 @@ type whisperClient struct {
 }
 
 func NewWhisperClient(c *utils.APIConfig, l utils.LogLevel) WhisperClient {
-	timeout := time.Duration(c.TimeoutSec) * time.Second
+	timeout := time.Duration(c.Timeout) * time.Second
 	return &whisperClient{
 		config:     c,
 		httpClient: &http.Client{Timeout: timeout},
@@ -48,8 +48,13 @@ func NewWhisperClient(c *utils.APIConfig, l utils.LogLevel) WhisperClient {
 func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionRequest) (*TranscriptionResponse, error) {
 	c.log.D("starting transcription request for file: %s", req.Filename)
 
-	if c.config.Key == "" {
-		return nil, fmt.Errorf("API key is required but not configured")
+	activeProvider, exists := c.config.Providers[c.config.ActiveProvider]
+	if !exists {
+		return nil, fmt.Errorf("active provider '%s' not found", c.config.ActiveProvider)
+	}
+
+	if activeProvider.Key == "" {
+		return nil, fmt.Errorf("API key is required but not configured for provider '%s'", c.config.ActiveProvider)
 	}
 
 	// create multipart form data
@@ -69,7 +74,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 
 	model := req.Model
 	if model == "" {
-		model = c.config.Model
+		model = activeProvider.Model
 	}
 	if model == "" {
 		model = "distil-large-v3" // Final fallback
@@ -88,7 +93,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	url := c.config.Endpoint
+	url := activeProvider.Endpoint
 	if !strings.HasSuffix(url, "/transcriptions") {
 		if strings.HasSuffix(url, "/v1/audio/transcriptions") {
 			// already complete
@@ -107,7 +112,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	httpReq.Header.Set("Authorization", "Bearer "+c.config.Key)
+	httpReq.Header.Set("Authorization", "Bearer "+activeProvider.Key)
 	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
 
 	c.log.D("sending request to: %s with model: %s", url, model)

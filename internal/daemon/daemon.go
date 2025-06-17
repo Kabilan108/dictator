@@ -301,10 +301,11 @@ func (d *Daemon) transcribeAndType() {
 
 	d.log.I("audio saved to %s", audioPath)
 
+	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
 	req := audio.TranscriptionRequest{
 		AudioData: audioData,
 		Filename:  audioFile.Name(),
-		Model:     d.config.API.Model,
+		Model:     activeProvider.Model,
 	}
 
 	d.mu.RLock()
@@ -345,7 +346,7 @@ func (d *Daemon) transcribeAndType() {
 	d.log.I("typing complete")
 
 	durationMs := int(recordingDuration.Milliseconds())
-	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, d.config.API.Model); err != nil {
+	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, activeProvider.Model); err != nil {
 		d.log.W("failed to save transcript to database: %v", err)
 	} else {
 		d.log.D("transcript saved to database")

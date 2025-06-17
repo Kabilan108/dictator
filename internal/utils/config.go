@@ -31,11 +31,16 @@ type Config struct {
 	Audio AudioConfig `json:"audio" mapstructure:"audio"`
 }
 
+type Provider struct {
+	Endpoint string `json:"endpoint" mapstructure:"endpoint"`
+	Key      string `json:"key" mapstructure:"key"`
+	Model    string `json:"model" mapstructure:"model"`
+}
+
 type APIConfig struct {
-	Endpoint   string `json:"endpoint" mapstructure:"endpoint"`
-	Key        string `json:"key" mapstructure:"key"`
-	Model      string `json:"model" mapstructure:"model"`
-	TimeoutSec int    `json:"timeout" mapstructure:"timeout"`
+	ActiveProvider string              `json:"active_provider" mapstructure:"active_provider"`
+	Timeout        int                 `json:"timeout" mapstructure:"timeout"`
+	Providers      map[string]Provider `json:"providers" mapstructure:"providers"`
 }
 
 type AudioConfig struct {
@@ -55,10 +60,15 @@ type AppConfig struct {
 func DefaultConfig() *Config {
 	return &Config{
 		API: APIConfig{
-			Endpoint:   "https://sietch.sole-pierce.ts.net/siren/v1/audio/transcriptions",
-			Key:        "",
-			Model:      "distil-large-v3",
-			TimeoutSec: 60,
+			ActiveProvider: "openai",
+			Timeout:        60,
+			Providers: map[string]Provider{
+				"openai": {
+					Endpoint: "https://api.openai.com/v1/audio/transcriptions",
+					Key:      "",
+					Model:    "gpt-4o-transcribe",
+				},
+			},
 		},
 		Audio: AudioConfig{
 			SampleRate:     16000,
@@ -104,13 +114,22 @@ func Load() (*Config, error) {
 }
 
 func Validate(config *Config) error {
-	if config.API.Endpoint == "" {
-		return fmt.Errorf("API endpoint is required")
+	if config.API.ActiveProvider == "" {
+		return fmt.Errorf("active provider is required")
 	}
-	if config.API.Key == "" {
-		return fmt.Errorf("API key is required")
+	
+	activeProvider, exists := config.API.Providers[config.API.ActiveProvider]
+	if !exists {
+		return fmt.Errorf("active provider '%s' not found in providers", config.API.ActiveProvider)
 	}
-	if config.API.TimeoutSec <= 0 {
+	
+	if activeProvider.Endpoint == "" {
+		return fmt.Errorf("endpoint is required for active provider '%s'", config.API.ActiveProvider)
+	}
+	if activeProvider.Key == "" {
+		return fmt.Errorf("API key is required for active provider '%s'", config.API.ActiveProvider)
+	}
+	if config.API.Timeout <= 0 {
 		return fmt.Errorf("API timeout must be > 0")
 	}
 
