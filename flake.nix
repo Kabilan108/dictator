@@ -12,7 +12,7 @@
       version = "latest";
       src = ./.;
 
-      vendorHash = "sha256-vf1OueAvFH79fh7VQCllU5G8iuMZHfucaWZmAPk32l4=";
+      vendorHash = "sha256-zov48TzHqfWahe4HkekCtqFlgK+jxTwKzG+/h1UbVaI=";
 
       nativeBuildInputs = with pkgs; [ pkg-config ];
       buildInputs = with pkgs; [ portaudio ];

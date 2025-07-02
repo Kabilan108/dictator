@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sync"
@@ -25,7 +26,6 @@ type Daemon struct {
 	typer       typing.Typer
 	ipcServer   *ipc.Server
 	db          *storage.DB
-	log         utils.Logger
 
 	mu        sync.RWMutex
 	state     ipc.DaemonState
@@ -39,24 +39,25 @@ type Daemon struct {
 	notificationTimer *time.Timer
 }
 
-func NewDaemon(cfg *utils.Config) (*Daemon, error) {
-	log := utils.NewLogger(cfg.App.LogLevel, "daemon")
-
-	recorder, err := audio.NewRecorder(cfg.Audio, cfg.App.LogLevel)
+func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
+	recorder, err := audio.NewRecorder(cfg.Audio, logLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recorder: %w", err)
 	}
 
-	transcriber := audio.NewWhisperClient(&cfg.API, cfg.App.LogLevel)
+	transcriber := audio.NewWhisperClient(&cfg.API, logLevel)
 
-	notifier, err := notifier.New(cfg.App.LogLevel)
+	notifier, err := notifier.New(logLevel)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create notifier: %w", err)
 	}
 
-	typer := typing.New(cfg.App.LogLevel)
+	typer, err := typing.New(logLevel)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create typer: %w", err)
+	}
 
-	db, err := storage.NewDB(utils.CONFIG_DIR)
+	db, err := storage.NewDB()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create database: %w", err)
 	}
@@ -68,46 +69,45 @@ func NewDaemon(cfg *utils.Config) (*Daemon, error) {
 		notifier:    notifier,
 		typer:       typer,
 		db:          db,
-		log:         log,
 		state:       ipc.StateIdle,
 		startTime:   time.Now(),
 		stopChan:    make(chan struct{}),
 	}
 
-	daemon.ipcServer = ipc.NewServer(daemon, cfg.App.LogLevel)
+	daemon.ipcServer = ipc.NewServer(daemon, logLevel)
 
 	return daemon, nil
 }
 
 func (d *Daemon) Run() error {
-	d.log.D("starting dictator daemon...")
+	slog.Debug("starting dictator daemon")
 
 	if err := d.ipcServer.Start(); err != nil {
 		return fmt.Errorf("failed to start IPC server: %w", err)
 	}
 	defer func() {
 		if err := d.ipcServer.Stop(); err != nil {
-			d.log.E("failed to stop IPC server: %v", err)
+			slog.Error("failed to stop IPC server", "err", err)
 		}
 	}()
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to show initial notification: %v", err)
+		return fmt.Errorf("failed to show initial notification: %w", err)
 	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	d.log.I("dictator daemon started successfully")
+	slog.Info("dictator daemon started successfully")
 
 	for {
 		select {
 		case sig := <-sigChan:
-			d.log.D("received signal %v, shutting down", sig)
+			slog.Debug("received signal", "signal", sig)
 			return d.shutdown()
 
 		case <-d.stopChan:
-			d.log.D("daemon stop requested")
+			slog.Debug("daemon stop requested")
 			return d.shutdown()
 		}
 	}
@@ -122,7 +122,7 @@ func (d *Daemon) Stop() {
 }
 
 func (d *Daemon) shutdown() error {
-	d.log.D("shutting down daemon...")
+	slog.Debug("shutting down daemon")
 
 	d.mu.Lock()
 	d.stopNotificationTimer()
@@ -135,27 +135,27 @@ func (d *Daemon) shutdown() error {
 
 	if d.recorder != nil {
 		if err := d.recorder.Close(); err != nil {
-			d.log.E("failed to close recorder: %v", err)
+			slog.Error("failed to close recorder", "err", err)
 			lastErr = err
 		}
 	}
 
 	if d.notifier != nil {
 		if err := d.notifier.Close(); err != nil {
-			d.log.E("failed to close notifier: %v", err)
+			slog.Error("failed to close notifier", "err", err)
 			lastErr = err
 		}
 	}
 
 	if d.db != nil {
 		if err := d.db.Close(); err != nil {
-			d.log.E("failed to close database: %v", err)
+			slog.Error("failed to close database", "err", err)
 			lastErr = err
 		}
 	}
 
 	close(d.stopChan)
-	d.log.I("daemon shutdown complete")
+	slog.Info("daemon shutdown complete")
 
 	return lastErr
 }
@@ -170,12 +170,12 @@ func (d *Daemon) HandleStart() error {
 		return fmt.Errorf(ipc.ErrAlreadyRecording)
 	}
 
-	d.log.D("starting recording...")
+	slog.Debug("starting recording")
 
 	d.operationCtx, d.operationCancel = context.WithCancel(context.Background())
 
 	if err := d.recorder.Start(); err != nil {
-		d.log.E("failed to start recording: %v", err)
+		slog.Error("failed to start recording", "err", err)
 		msg := err.Error()
 		d.lastError = &msg
 		return fmt.Errorf("%s: %w", ipc.ErrRecordingFailed, err)
@@ -185,12 +185,12 @@ func (d *Daemon) HandleStart() error {
 	d.lastError = nil
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update notification: %v", err)
+		slog.Warn("failed to update notification", "err", err)
 	}
 
 	d.startNotificationTimer()
 
-	d.log.I("recording started")
+	slog.Info("recording started")
 	return nil
 }
 
@@ -202,13 +202,13 @@ func (d *Daemon) HandleStop() error {
 		return fmt.Errorf(ipc.ErrNotRecording)
 	}
 
-	d.log.I("stopping recording and starting transcription...")
+	slog.Info("stopping recording and starting transcription")
 
 	d.stopNotificationTimer()
 
 	d.state = ipc.StateTranscribing
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update notification: %v", err)
+		slog.Warn("failed to update notification", "err", err)
 	}
 
 	go d.transcribeAndType()
@@ -235,7 +235,7 @@ func (d *Daemon) HandleCancel() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.log.D("canceling current operation...")
+	slog.Debug("canceling current operation")
 
 	d.stopNotificationTimer()
 
@@ -245,7 +245,7 @@ func (d *Daemon) HandleCancel() error {
 
 	if d.state == ipc.StateRecording {
 		if _, _, err := d.recorder.Stop(); err != nil {
-			d.log.E("failed to stop recording during cancel: %v", err)
+			slog.Error("failed to stop recording during cancel", "err", err)
 		}
 	}
 
@@ -253,10 +253,10 @@ func (d *Daemon) HandleCancel() error {
 	d.lastError = nil
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update notification: %v", err)
+		slog.Warn("failed to update notification", "err", err)
 	}
 
-	d.log.I("operation canceled")
+	slog.Info("operation canceled")
 	return nil
 }
 
@@ -283,28 +283,29 @@ func (d *Daemon) GetStatus() ipc.StatusData {
 
 func (d *Daemon) transcribeAndType() {
 	recordingDuration := d.recorder.GetRecordingDuration()
-	
+
 	audioData, audioPath, err := d.recorder.Stop()
 	if err != nil {
-		d.log.E("failed to stop recording: %v", err)
+		slog.Error("failed to stop recording", "err", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrRecordingFailed, err))
 		return
 	}
 
 	audioFile, err := audio.WriteAudioData(audioPath, audioData)
 	if err != nil {
-		d.log.E("failed to write audio file: %v", err)
+		slog.Error("failed to write audio file", "err", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrRecordingFailed, err))
 		return
 	}
 	defer audioFile.Close()
 
-	d.log.I("audio saved to %s", audioPath)
+	slog.Info("audio saved to %s", audioPath)
 
+	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
 	req := audio.TranscriptionRequest{
 		AudioData: audioData,
 		Filename:  audioFile.Name(),
-		Model:     d.config.API.Model,
+		Model:     activeProvider.Model,
 	}
 
 	d.mu.RLock()
@@ -313,42 +314,42 @@ func (d *Daemon) transcribeAndType() {
 
 	resp, err := d.transcriber.Transcribe(ctx, &req)
 	if err != nil {
-		d.log.E("transcription failed: %v", err)
+		slog.Error("transcription failed", "err", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTranscriptionFailed, err))
 		return
 	}
 
-	d.log.I("transcription complete")
+	slog.Info("transcription complete")
 
 	d.mu.Lock()
 	d.state = ipc.StateTyping
 	d.mu.Unlock()
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update notification: %v", err)
+		slog.Warn("failed to update notification", "err", err)
 	}
 
 	if err := d.typer.TypeText(ctx, resp.Text); err != nil {
 		if ctx.Err() != nil {
-			d.log.I("typing cancelled")
+			slog.Debug("typing cancelled")
 			d.mu.Lock()
 			d.state = ipc.StateIdle
 			d.lastError = nil
 			d.mu.Unlock()
 		} else {
-			d.log.E("typing failed: %v", err)
+			slog.Error("typing failed", "err", err)
 			d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
 			return
 		}
 	}
 
-	d.log.I("typing complete")
+	slog.Info("typing complete")
 
 	durationMs := int(recordingDuration.Milliseconds())
-	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, d.config.API.Model); err != nil {
-		d.log.W("failed to save transcript to database: %v", err)
+	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, activeProvider.Model); err != nil {
+		slog.Warn("failed to save transcript to database", "err", err)
 	} else {
-		d.log.D("transcript saved to database")
+		slog.Debug("transcript saved to database")
 	}
 
 	d.mu.Lock()
@@ -357,7 +358,7 @@ func (d *Daemon) transcribeAndType() {
 	d.mu.Unlock()
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update notification: %v", err)
+		slog.Warn("failed to update notification", "err", err)
 	}
 }
 
@@ -383,7 +384,7 @@ func (d *Daemon) updateRecordingNotification() {
 	if state == ipc.StateRecording {
 		duration := d.recorder.GetRecordingDuration()
 		if err := d.notifier.UpdateStateWithDuration(state, duration); err != nil {
-			d.log.W("failed to update recording notification: %v", err)
+			slog.Warn("failed to update recording notification", "err", err)
 		}
 
 		// Schedule next update
@@ -407,7 +408,7 @@ func (d *Daemon) handleError(errorMsg string) {
 	d.lastError = &errorMsg
 
 	if err := d.notifier.UpdateState(d.state); err != nil {
-		d.log.W("failed to update error notification: %v", err)
+		slog.Warn("failed to update error notification", "err", err)
 	}
 
 	// auto-return to idle after error display
@@ -417,7 +418,7 @@ func (d *Daemon) handleError(errorMsg string) {
 		d.mu.Unlock()
 
 		if err := d.notifier.UpdateState(d.state); err != nil {
-			d.log.W("failed to update notification after error: %v", err)
+			slog.Warn("failed to update notification after error", "err", err)
 		}
 	})
 }

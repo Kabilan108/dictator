@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -33,23 +34,26 @@ type WhisperClient interface {
 type whisperClient struct {
 	config     *utils.APIConfig
 	httpClient *http.Client
-	log        utils.Logger
 }
 
-func NewWhisperClient(c *utils.APIConfig, l utils.LogLevel) WhisperClient {
-	timeout := time.Duration(c.TimeoutSec) * time.Second
+func NewWhisperClient(c *utils.APIConfig, logLevel string) WhisperClient {
+	timeout := time.Duration(c.Timeout) * time.Second
 	return &whisperClient{
 		config:     c,
 		httpClient: &http.Client{Timeout: timeout},
-		log:        utils.NewLogger(l, "whisper"),
 	}
 }
 
 func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionRequest) (*TranscriptionResponse, error) {
-	c.log.D("starting transcription request for file: %s", req.Filename)
+	slog.Debug("starting transcription request", "filename", req.Filename)
 
-	if c.config.Key == "" {
-		return nil, fmt.Errorf("API key is required but not configured")
+	activeProvider, exists := c.config.Providers[c.config.ActiveProvider]
+	if !exists {
+		return nil, fmt.Errorf("active provider '%s' not found", c.config.ActiveProvider)
+	}
+
+	if activeProvider.Key == "" {
+		return nil, fmt.Errorf("API key is required but not configured for provider '%s'", c.config.ActiveProvider)
 	}
 
 	// create multipart form data
@@ -58,18 +62,18 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 
 	fileWriter, err := writer.CreateFormFile("file", req.Filename)
 	if err != nil {
-		c.log.E("failed to create form file: %v", err)
+		slog.Error("failed to create form file", "err", err)
 		return nil, fmt.Errorf("failed to create form file: %w", err)
 	}
 
 	if _, err := fileWriter.Write(req.AudioData); err != nil {
-		c.log.E(fmt.Sprintf("failed to write audio data: %v", err))
+		slog.Error("failed to write audio data", "err", err)
 		return nil, fmt.Errorf("failed to write audio data: %w", err)
 	}
 
 	model := req.Model
 	if model == "" {
-		model = c.config.Model
+		model = activeProvider.Model
 	}
 	if model == "" {
 		model = "distil-large-v3" // Final fallback
@@ -88,7 +92,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
 	}
 
-	url := c.config.Endpoint
+	url := activeProvider.Endpoint
 	if !strings.HasSuffix(url, "/transcriptions") {
 		if strings.HasSuffix(url, "/v1/audio/transcriptions") {
 			// already complete
@@ -103,14 +107,14 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 
 	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, body)
 	if err != nil {
-		c.log.E("failed to create http request: %v", err)
+		slog.Error("failed to create http request", "err", err)
 		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
 	}
 
-	httpReq.Header.Set("Authorization", "Bearer "+c.config.Key)
+	httpReq.Header.Set("Authorization", "Bearer "+activeProvider.Key)
 	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
 
-	c.log.D("sending request to: %s with model: %s", url, model)
+	slog.Debug("sending request", "url", url, "model", model)
 
 	var resp *http.Response
 	var lastErr error
@@ -120,7 +124,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		if err != nil {
 			lastErr = err
 			if attempt == 0 {
-				c.log.W("request attempt %d failed, retrying: %v", attempt+1, err)
+				slog.Warn("request attempt failed, retrying", "attempt", attempt+1, "err", err)
 				time.Sleep(1 * time.Second)
 				continue
 			}
@@ -130,7 +134,7 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 	}
 
 	if resp == nil {
-		c.log.E("all request attempts failed: %v", lastErr)
+		slog.Error("all request attempts failed", "err", lastErr)
 		return nil, fmt.Errorf("request failed after 2 attempts: %w", lastErr)
 	}
 	defer resp.Body.Close()
@@ -138,18 +142,17 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		errorMsg := fmt.Sprintf("API request failed with status %d: %s", resp.StatusCode, string(bodyBytes))
-		c.log.E(errorMsg)
+		slog.Error("api request failed", "err", errorMsg)
 		return nil, errors.New(errorMsg)
 	}
 
 	// Parse JSON response
 	var transcriptionResp TranscriptionResponse
 	if err := json.NewDecoder(resp.Body).Decode(&transcriptionResp); err != nil {
-		c.log.E(fmt.Sprintf("Failed to decode JSON response: %v", err))
+		slog.Error("failed to decode response", "err", err)
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	c.log.D("transcription completed successfully, text length: %d characters", len(transcriptionResp.Text))
-
+	slog.Debug("transcription completed successfully", "length", len(transcriptionResp.Text))
 	return &transcriptionResp, nil
 }

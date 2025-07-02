@@ -4,25 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/kabilan108/dictator/internal/utils"
 )
 
 // client represents an ipc client for communicating with the daemon
 type Client struct {
 	socketPath string
 	timeout    time.Duration
-	log        utils.Logger
 }
 
-func NewClient(logLevel utils.LogLevel) *Client {
+func NewClient(logLevel string) *Client {
 	return &Client{
 		socketPath: SocketPath,
 		timeout:    10 * time.Second,
-		log:        utils.NewLogger(logLevel, "ipc-client"),
 	}
 }
 
@@ -34,7 +32,7 @@ func (c *Client) SendCommand(ctx context.Context, action string, args ...string)
 		Timestamp: time.Now(),
 	}
 
-	c.log.D("sending command: %s (ID: %s)", cmd.Action, cmd.ID)
+	slog.Debug("sending command", "action", cmd.Action, "id", cmd.ID)
 
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
@@ -46,7 +44,7 @@ func (c *Client) SendCommand(ctx context.Context, action string, args ...string)
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
-			c.log.W("failed to close connection: %v", closeErr)
+			slog.Warn("failed to close connection", "err", closeErr)
 		}
 	}()
 
@@ -54,14 +52,14 @@ func (c *Client) SendCommand(ctx context.Context, action string, args ...string)
 	deadline, ok := timeoutCtx.Deadline()
 	if ok {
 		if err := conn.SetDeadline(deadline); err != nil {
-			c.log.W("failed to set connection deadline: %v", err)
+			slog.Warn("failed to set connection deadline", "err", err)
 		}
 	}
 
 	// Send command
 	encoder := json.NewEncoder(conn)
 	if err := encoder.Encode(&cmd); err != nil {
-		c.log.E("failed to encode command: %v", err)
+		slog.Error("failed to encode command", "err", err)
 		return nil, fmt.Errorf("failed to send command: %w", err)
 	}
 
@@ -69,18 +67,17 @@ func (c *Client) SendCommand(ctx context.Context, action string, args ...string)
 	var response Response
 	decoder := json.NewDecoder(conn)
 	if err := decoder.Decode(&response); err != nil {
-		c.log.E("failed to decode response: %v", err)
+		slog.Error("failed to decode response", "err", err)
 		return nil, fmt.Errorf("failed to receive response: %w", err)
 	}
 
 	// Validate response ID matches command ID
 	if response.ID != cmd.ID {
-		c.log.E("response ID mismatch: expected %s, got %s", cmd.ID, response.ID)
+		slog.Error("response ID mismatch", "expected", cmd.ID, "got", response.ID)
 		return nil, fmt.Errorf("response ID mismatch")
 	}
 
-	c.log.D("received response for command %s: success=%v", cmd.Action, response.Success)
-
+	slog.Debug("received response", "action", cmd.Action, "success", response.Success)
 	return &response, nil
 }
 
@@ -89,11 +86,11 @@ func (c *Client) connect(ctx context.Context) (net.Conn, error) {
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "unix", c.socketPath)
 	if err != nil {
-		c.log.E("failed to dial unix socket: %v", err)
+		slog.Error("failed to dial unix socket", "err", err)
 		return nil, err
 	}
 
-	c.log.D("connected to daemon at %s", c.socketPath)
+	slog.Debug("connected to daemon", "path", c.socketPath)
 	return conn, nil
 }
 
@@ -128,7 +125,7 @@ func (c *Client) IsConnected(ctx context.Context) bool {
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
-			c.log.W("failed to close test connection: %v", closeErr)
+			slog.Warn("failed to close test connection", "err", closeErr)
 		}
 	}()
 
@@ -137,7 +134,7 @@ func (c *Client) IsConnected(ctx context.Context) bool {
 
 // WaitForDaemon waits for the daemon to become available
 func (c *Client) WaitForDaemon(ctx context.Context, checkInterval time.Duration) error {
-	c.log.D("waiting for daemon to become available...")
+	slog.Debug("waiting for daemon to become available")
 
 	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
@@ -148,7 +145,7 @@ func (c *Client) WaitForDaemon(ctx context.Context, checkInterval time.Duration)
 			return ctx.Err()
 		case <-ticker.C:
 			if c.IsConnected(ctx) {
-				c.log.D("daemon is now available")
+				slog.Debug("daemon is now available")
 				return nil
 			}
 		}
