@@ -27,7 +27,7 @@ import (
 
 var (
 	cfgFile, logLevel string
-	version           = "v1.1.0"
+	version           = "dev"
 )
 
 var rootCmd = &cobra.Command{

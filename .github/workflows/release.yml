@@ -38,7 +38,9 @@ jobs:
         run: mkdir -p build
 
       - name: Build and package release
-        run: make release
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          make release VERSION=${VERSION}
         env:
           GOOS: linux
           GOARCH: amd64

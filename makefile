@@ -1,8 +1,11 @@
+VERSION ?= $(shell git describe --tags --always --dirty)
+LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
+
 build/dictator: $(shell find . -name '*.go')
-	go build -ldflags="-s -w" -o build/dictator .
+	go build $(LDFLAGS) -o build/dictator .
 
 build/dictator-linux-amd64: $(shell find . -name '*.go')
-	GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o build/dictator-linux-amd64 .
+	GOOS=linux GOARCH=amd64 go build $(LDFLAGS) -o build/dictator-linux-amd64 .
 
 build: build/dictator
 
