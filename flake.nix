@@ -19,9 +19,9 @@
         {
           default = pkgs.buildGoModule rec {
             pname = "dictator";
-            version = "1.2.2";
+            version = "1.2.3";
             src = ./.;
-            vendorHash = "sha256-zov48TzHqfWahe4HkekCtqFlgK+jxTwKzG+/h1UbVaI=";
+            vendorHash = "sha256-5x920a+jLyjndwIstLW7lGUDgF92QNe1hMMot7O9Uoc=";
 
             buildPhase = ''
               runHook preBuild
