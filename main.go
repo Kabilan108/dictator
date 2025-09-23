@@ -47,10 +47,10 @@ var daemonCmd = &cobra.Command{
 		utils.ExitIfError(err, 1)
 
 		d, err := daemon.NewDaemon(c, logLevel)
-		utils.ExitIfError(fmt.Errorf("failed to create daemon: %w", err), 1)
+		utils.ExitIfError(err, 1)
 
 		err = d.Run()
-		utils.ExitIfError(fmt.Errorf("daemon exited with error: %w", err), 1)
+		utils.ExitIfError(err, 1)
 	},
 }
 

@@ -424,5 +424,8 @@ func (d *Daemon) handleError(errorMsg string) {
 }
 
 func NotRunning(e error) error {
-	return fmt.Errorf("can't connect to daemon: %v", e)
+	if e != nil {
+		return fmt.Errorf("can't connect to daemon: %v", e)
+	}
+	return nil
 }
