@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 
 	"github.com/kabilan108/dictator/internal/daemon"
 	"github.com/kabilan108/dictator/internal/ipc"
@@ -26,8 +25,8 @@ import (
 )
 
 var (
-	cfgFile, logLevel string
-	version           = "dev"
+	logLevel string
+	version  = "dev"
 )
 
 var rootCmd = &cobra.Command{
@@ -39,23 +38,20 @@ start the daemon with 'dictator daemon' then use commands like 'start', 'stop',
 'toggle', 'cancel', and 'status' to control voice recording and transcription.`,
 }
 
-var createDaemonCmd = func(c *utils.Config) *cobra.Command {
-	return &cobra.Command{
-		Use:   "daemon",
-		Short: "run the dictator daemon",
-		Long:  `starts the dictator daemon in the foreground, listening for voice commands via ipc`,
-		Run: func(cmd *cobra.Command, args []string) {
-			d, err := daemon.NewDaemon(c, logLevel)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to create daemon: %v\n", err)
-				os.Exit(1)
-			}
-			if err := d.Run(); err != nil {
-				fmt.Fprintf(os.Stderr, "daemon exited with error: %v\n", err)
-				os.Exit(1)
-			}
-		},
-	}
+var daemonCmd = &cobra.Command{
+	Use:   "daemon",
+	Short: "run the dictator daemon",
+	Long:  `starts the dictator daemon in the foreground, listening for voice commands via ipc`,
+	Run: func(cmd *cobra.Command, args []string) {
+		c, err := utils.GetConfig()
+		utils.ExitIfError(err, 1)
+
+		d, err := daemon.NewDaemon(c, logLevel)
+		utils.ExitIfError(fmt.Errorf("failed to create daemon: %w", err), 1)
+
+		err = d.Run()
+		utils.ExitIfError(fmt.Errorf("daemon exited with error: %w", err), 1)
+	},
 }
 
 var startCmd = &cobra.Command{
@@ -67,11 +63,7 @@ var startCmd = &cobra.Command{
 		ctx := context.Background()
 
 		response, err := client.Start(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: Cannot connect to daemon. Is it running?\n")
-			fmt.Fprintf(os.Stderr, "Try starting the daemon with: dictator daemon\n")
-			os.Exit(1)
-		}
+		utils.ExitIfError(daemon.NotRunning(err), 1)
 
 		if response.Success {
 			fmt.Println("Recording started")
@@ -91,11 +83,7 @@ var stopCmd = &cobra.Command{
 		ctx := context.Background()
 
 		response, err := client.Stop(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: Cannot connect to daemon. Is it running?\n")
-			fmt.Fprintf(os.Stderr, "Try starting the daemon with: dictator daemon\n")
-			os.Exit(1)
-		}
+		utils.ExitIfError(daemon.NotRunning(err), 1)
 
 		if response.Success {
 			fmt.Println("Recording stopped, transcribing")
@@ -115,11 +103,7 @@ var toggleCmd = &cobra.Command{
 		ctx := context.Background()
 
 		response, err := client.Toggle(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot connect to daemon. is it running?\n")
-			fmt.Fprintf(os.Stderr, "try starting the daemon with: dictator daemon\n")
-			os.Exit(1)
-		}
+		utils.ExitIfError(daemon.NotRunning(err), 1)
 
 		if response.Success {
 			fmt.Fprintf(os.Stderr, "toggled daemon")
@@ -139,11 +123,7 @@ var cancelCmd = &cobra.Command{
 		ctx := context.Background()
 
 		response, err := client.Cancel(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot connect to daemon. is it running?\n")
-			fmt.Fprintf(os.Stderr, "try starting the daemon with: dictator daemon\n")
-			os.Exit(1)
-		}
+		utils.ExitIfError(daemon.NotRunning(err), 1)
 
 		if response.Success {
 			fmt.Println("operation canceled")
@@ -163,11 +143,7 @@ var statusCmd = &cobra.Command{
 		ctx := context.Background()
 
 		response, err := client.Status(ctx)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "cannot connect to daemon. is it running?\n")
-			fmt.Fprintf(os.Stderr, "try starting the daemon with: dictator daemon\n")
-			os.Exit(1)
-		}
+		utils.ExitIfError(daemon.NotRunning(err), 1)
 
 		if response.Success {
 			fmt.Printf("daemon status:\n")
@@ -193,6 +169,43 @@ var versionCmd = &cobra.Command{
 	Long:  `prints the version number of the dictator daemon`,
 	Run: func(cmd *cobra.Command, args []string) {
 		fmt.Println(version)
+	},
+}
+
+var initCmd = &cobra.Command{
+	Use:   "init",
+	Short: "initialize the dictator config",
+	Long:  `initializes the dictator config with default values`,
+	Run: func(cmd *cobra.Command, args []string) {
+		configDir := utils.CONFIG_DIR
+		if err := os.MkdirAll(configDir, 0o755); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to create config dir: %v\n", err)
+			os.Exit(1)
+		}
+
+		configPath := filepath.Join(configDir, "config.json")
+		if _, err := os.Stat(configPath); err == nil {
+			fmt.Fprintf(os.Stderr, "Config already exists at %s\n", configPath)
+			return
+		} else if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "failed to check config: %v\n", err)
+			os.Exit(1)
+		}
+
+		cfg := utils.DefaultConfig()
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to serialize default config: %v\n", err)
+			os.Exit(1)
+		}
+
+		if err := os.WriteFile(configPath, data, 0o600); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to write config file: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Fprintf(os.Stderr, "Config written to %s\n", configPath)
+		fmt.Fprintf(os.Stderr, "Update api.providers.openai.key with your API key, then run 'dictator daemon'.\n")
 	},
 }
 
@@ -280,45 +293,16 @@ var transcriptLastCmd = &cobra.Command{
 	},
 }
 
-func initConfig() {
-	if cfgFile != "" {
-		viper.SetConfigFile(cfgFile)
-	} else {
-		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
-
-		viper.AddConfigPath(filepath.Join(home, ".config", "dictator"))
-		viper.SetConfigName("config")
-		viper.SetConfigType("json")
-	}
-	viper.AutomaticEnv() // read in environment variables that match
-	if err := utils.InitConfigFile(); err != nil {
-		cobra.CheckErr(err)
-	}
-	if err := viper.ReadInConfig(); err != nil {
-		cobra.CheckErr(err)
-	}
-}
-
 func init() {
-	cobra.OnInitialize(initConfig)
-
-	config, err := utils.GetConfig()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to load config: %v", err)
-		os.Exit(1)
-	}
-
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.config/dictator/utils.json)")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
-
-	rootCmd.AddCommand(createDaemonCmd(config))
+	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(stopCmd)
 	rootCmd.AddCommand(toggleCmd)
 	rootCmd.AddCommand(cancelCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(versionCmd)
+	rootCmd.AddCommand(initCmd)
 
 	transcriptCmd.AddCommand(transcriptListCmd)
 	transcriptCmd.AddCommand(transcriptLastCmd)

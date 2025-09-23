@@ -7,12 +7,12 @@ import (
 )
 
 type Transcript struct {
-	ID          int       `json:"id"`
-	Timestamp   time.Time `json:"timestamp"`
-	DurationMs  int       `json:"duration_ms"`
-	Text        string    `json:"text"`
-	AudioPath   string    `json:"audio_path"`
-	Model       string    `json:"model"`
+	ID         int       `json:"id"`
+	Timestamp  time.Time `json:"timestamp"`
+	DurationMs int       `json:"duration_ms"`
+	Text       string    `json:"text"`
+	AudioPath  string    `json:"audio_path"`
+	Model      string    `json:"model"`
 }
 
 func (db *DB) SaveTranscript(durationMs int, text, audioPath, model string) error {

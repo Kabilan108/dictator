@@ -1,10 +1,10 @@
 package utils
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/spf13/viper"
 )
@@ -52,7 +52,7 @@ type AudioConfig struct {
 }
 
 type AppConfig struct {
-	MaxRecordingMin int `json:"max_recording_min" mapstructure:"max_recording_seconds"`
+	MaxRecordingMin int `json:"max_recording_min" mapstructure:"max_recording_min"`
 	TypingDelayMS   int `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
 }
 
@@ -81,34 +81,6 @@ func DefaultConfig() *Config {
 			MaxRecordingMin: 5,
 		},
 	}
-}
-
-func Load() (*Config, error) {
-	config := DefaultConfig()
-
-	viper.SetConfigName("config")
-	viper.SetConfigType("json")
-	viper.AddConfigPath(CONFIG_DIR)
-
-	viper.SetEnvPrefix("DICTATOR")
-	viper.AutomaticEnv()
-
-	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			return config, nil
-		}
-		return nil, fmt.Errorf("failed to read config file: %w", err)
-	}
-
-	if err := viper.Unmarshal(config); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
-	}
-
-	if err := Validate(config); err != nil {
-		return nil, fmt.Errorf("config validation failed: %w", err)
-	}
-
-	return config, nil
 }
 
 func Validate(config *Config) error {
@@ -157,40 +129,43 @@ func Validate(config *Config) error {
 	return nil
 }
 
-func InitConfigFile() error {
-	configPath := filepath.Join(CONFIG_DIR, "config.json")
-
-	if _, err := os.Stat(configPath); err == nil {
-		return nil
-	}
-
-	if err := os.MkdirAll(CONFIG_DIR, 0o755); err != nil {
-		return fmt.Errorf("failed to create config directory: %w", err)
-	}
-
-	defaultConfig := DefaultConfig()
-
-	configData, err := json.MarshalIndent(defaultConfig, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal default config: %w", err)
-	}
-
-	if err := os.WriteFile(configPath, configData, 0o644); err != nil {
-		return fmt.Errorf("failed to write config file: %w", err)
-	}
-
-	return nil
-}
-
 var globalConfig *Config
 
 func GetConfig() (*Config, error) {
-	if globalConfig == nil {
-		config, err := Load()
-		if err != nil {
-			return nil, err
+	viper.SetConfigName("config")
+	viper.SetConfigType("json")
+	viper.AddConfigPath(CONFIG_DIR)
+
+	viper.SetEnvPrefix("DICTATOR")
+	viper.AutomaticEnv()
+
+	var once sync.Once
+	var loadErr error
+
+	once.Do(func() {
+		// seed with defaults so partial configs/env vars merge correctly
+		config := DefaultConfig()
+
+		if err := viper.ReadInConfig(); err != nil {
+			// if config file is missing, continue so env vars can still apply
+			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+				loadErr = fmt.Errorf("config: %v", err)
+				return
+			}
 		}
+
+		if err := viper.Unmarshal(config); err != nil {
+			loadErr = fmt.Errorf("config: failed to parse: %v", err)
+			return
+		}
+
+		if err := Validate(config); err != nil {
+			loadErr = fmt.Errorf("config: failed to validate: %v", err)
+			return
+		}
+
 		globalConfig = config
-	}
-	return globalConfig, nil
+	})
+
+	return globalConfig, loadErr
 }

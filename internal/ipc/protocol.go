@@ -4,7 +4,7 @@ import (
 	"time"
 )
 
-// command represents a request from cli to daemon
+// Command represents a request from cli to daemon
 type Command struct {
 	ID        string    `json:"id"`             // unique identifier for request correlation
 	Action    string    `json:"action"`         // command action: start, stop, toggle, cancel, status
@@ -12,7 +12,7 @@ type Command struct {
 	Timestamp time.Time `json:"timestamp"`      // request timestamp
 }
 
-// response represents daemon's reply to cli command
+// Response represents daemon's reply to cli command
 type Response struct {
 	ID      string            `json:"id"`              // matches request id
 	Success bool              `json:"success"`         // whether command succeeded

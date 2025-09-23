@@ -299,7 +299,7 @@ func (d *Daemon) transcribeAndType() {
 	}
 	defer audioFile.Close()
 
-	slog.Info("audio saved to %s", audioPath)
+	slog.Info("audio saved", "filepath", audioPath)
 
 	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
 	req := audio.TranscriptionRequest{
@@ -421,4 +421,8 @@ func (d *Daemon) handleError(errorMsg string) {
 			slog.Warn("failed to update notification after error", "err", err)
 		}
 	})
+}
+
+func NotRunning(e error) error {
+	return fmt.Errorf("can't connect to daemon: %v", e)
 }

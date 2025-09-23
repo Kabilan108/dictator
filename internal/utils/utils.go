@@ -73,13 +73,16 @@ func SetupLogger(level string) *Logger {
 	logFile, err := os.OpenFile(
 		filepath.Join(CACHE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666,
 	)
-	if err != nil {
-		panic(fmt.Errorf("failed to open log file: %w", err))
-	}
 
-	fileHandler := slog.NewJSONHandler(logFile, &slog.HandlerOptions{AddSource: true, Level: logLevel})
-	stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
-	logHandler := &MultiHandler{fileHandler, stderrHandler}
+	var logHandler slog.Handler
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to open log file: %v\n", err)
+		logHandler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+	} else {
+		fileHandler := slog.NewJSONHandler(logFile, &slog.HandlerOptions{AddSource: true, Level: logLevel})
+		stderrHandler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: logLevel})
+		logHandler = &MultiHandler{fileHandler, stderrHandler}
+	}
 
 	slog.SetDefault(slog.New(logHandler))
 	return &Logger{logFile}
@@ -135,4 +138,11 @@ func GetPathToRecording(startTime time.Time) (string, error) {
 	now := startTime.Format("01022006-150405")
 	fp := filepath.Join(d, fmt.Sprintf("%v.wav", now))
 	return fp, nil
+}
+
+func ExitIfError(err error, exitCode int) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(exitCode)
+	}
 }
