@@ -60,14 +60,20 @@ LIMIT 1
 	return &t, nil
 }
 
-func (db *DB) GetAllTranscripts() ([]Transcript, error) {
+func (db *DB) GetTranscripts(limit int) ([]Transcript, error) {
 	query := `
 SELECT id, timestamp, duration_ms, text, audio_path, model
 FROM transcripts
 ORDER BY timestamp DESC
 `
+	var args []any
 
-	rows, err := db.conn.Query(query)
+	if limit > 0 {
+		query += " LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := db.conn.Query(query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query transcripts: %w", err)
 	}

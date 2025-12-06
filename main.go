@@ -16,7 +16,6 @@ import (
 	"github.com/kabilan108/dictator/internal/daemon"
 	"github.com/kabilan108/dictator/internal/ipc"
 	"github.com/kabilan108/dictator/internal/storage"
-	"github.com/kabilan108/dictator/internal/typing"
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
@@ -208,17 +207,19 @@ var initCmd = &cobra.Command{
 	},
 }
 
-var transcriptCmd = &cobra.Command{
-	Use:   "transcript",
-	Short: "manage transcript history",
-	Long:  `commands to view and manage stored transcript history`,
-}
-
-var transcriptListCmd = &cobra.Command{
-	Use:   "list",
-	Short: "list all transcripts as JSON",
-	Long:  `outputs all stored transcripts as JSON, ordered by timestamp (newest first)`,
+var transcriptsCmd = &cobra.Command{
+	Use:   "transcripts",
+	Short: "list recent transcripts",
+	Long:  `lists out the N most recent transcripts, where N is set based on the -n flag. default value is 10.`,
 	Run: func(cmd *cobra.Command, args []string) {
+		n, _ := cmd.Flags().GetInt("n")
+		textOnly, _ := cmd.Flags().GetBool("text")
+
+		if n <= 0 && n != -1 {
+			fmt.Fprintf(os.Stderr, "invalid value for -n: must be > 0 or -1\n")
+			os.Exit(1)
+		}
+
 		db, err := storage.NewDB()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
@@ -226,62 +227,30 @@ var transcriptListCmd = &cobra.Command{
 		}
 		defer db.Close()
 
-		transcripts, err := db.GetAllTranscripts()
+		var transcripts []storage.Transcript
+
+		if n == -1 {
+			transcripts, err = db.GetTranscripts(-1)
+		} else {
+			transcripts, err = db.GetTranscripts(n)
+		}
+
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to get transcripts: %v\n", err)
 			os.Exit(1)
 		}
 
-		jsonData, err := json.MarshalIndent(transcripts, "", "  ")
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to marshal JSON: %v\n", err)
-			os.Exit(1)
-		}
-
-		fmt.Println(string(jsonData))
-	},
-}
-
-var transcriptLastCmd = &cobra.Command{
-	Use:   "last",
-	Short: "get the most recent transcript",
-	Long:  `prints the text of the most recent transcript, or copies it to clipboard with --clip`,
-	Run: func(cmd *cobra.Command, args []string) {
-		clipFlag, _ := cmd.Flags().GetBool("clip")
-
-		db, err := storage.NewDB()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to open database: %v\n", err)
-			os.Exit(1)
-		}
-		defer db.Close()
-
-		transcript, err := db.GetLastTranscript()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "failed to get last transcript: %v\n", err)
-			os.Exit(1)
-		}
-
-		if transcript == nil {
-			fmt.Fprintf(os.Stderr, "no transcripts found\n")
-			os.Exit(1)
-		}
-
-		if clipFlag {
-			typer, err := typing.New()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to initialize typer: %v\n", err)
-				os.Exit(1)
+		if textOnly {
+			for _, t := range transcripts {
+				fmt.Println(t.Text)
 			}
-
-			ctx := context.Background()
-			if err := typer.Type(ctx, transcript.Text); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to copy to clipboard: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Println("Text copied to clipboard")
 		} else {
-			fmt.Print(transcript.Text)
+			jsonData, err := json.MarshalIndent(transcripts, "", "  ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to marshal JSON: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Println(string(jsonData))
 		}
 	},
 }
@@ -297,10 +266,9 @@ func init() {
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(initCmd)
 
-	transcriptCmd.AddCommand(transcriptListCmd)
-	transcriptCmd.AddCommand(transcriptLastCmd)
-	transcriptLastCmd.Flags().Bool("clip", false, "copy transcript text to clipboard instead of printing")
-	rootCmd.AddCommand(transcriptCmd)
+	transcriptsCmd.Flags().IntP("num", "n", 10, "number of recent transcripts to list (set to -1 for all)")
+	transcriptsCmd.Flags().BoolP("text", "t", false, "print only the text of the transcripts")
+	rootCmd.AddCommand(transcriptsCmd)
 }
 
 func main() {
