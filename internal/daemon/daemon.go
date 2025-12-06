@@ -47,7 +47,7 @@ func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
 
 	transcriber := audio.NewWhisperClient(&cfg.API, logLevel)
 
-	notifier, err := notifier.New(logLevel)
+	notifier, err := notifier.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create notifier: %w", err)
 	}

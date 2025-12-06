@@ -23,7 +23,7 @@ type Notifier interface {
 	Close() error
 }
 
-type DunstNotifier struct {
+type DBusNotifier struct {
 	conn           *dbus.Conn
 	notificationID uint32
 	mu             sync.Mutex
@@ -35,7 +35,7 @@ var stateNotifications = map[ipc.DaemonState]NotificationContent{
 		Body:  "ready for voice input",
 	},
 	ipc.StateRecording: {
-		Title: " dictator",
+		Title: " dictator",
 		Body:  "Recording audio",
 	},
 	ipc.StateTranscribing: {
@@ -43,11 +43,11 @@ var stateNotifications = map[ipc.DaemonState]NotificationContent{
 		Body:  "transcribing audio",
 	},
 	ipc.StateTyping: {
-		Title: " dictator",
+		Title: " dictator",
 		Body:  "typing text",
 	},
 	ipc.StateError: {
-		Title: " dictator",
+		Title: " dictator",
 		Body:  "an error occurred",
 	},
 }
@@ -68,7 +68,7 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%d:%02d", minutes, seconds)
 }
 
-func New(logLevel string) (Notifier, error) {
+func New() (Notifier, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
 		slog.Error("failed to connect to session D-Bus", "err", err)
@@ -87,21 +87,21 @@ func New(logLevel string) (Notifier, error) {
 	serviceAvailable := slices.Contains(names, dbusService)
 	if !serviceAvailable {
 		conn.Close()
-		slog.Warn("notification service not available, dunst may not be running")
+		slog.Warn("notification service not available, D-Bus notification service may not be running")
 		return nil, fmt.Errorf("notification service %s not available", dbusService)
 	}
 
-	notifier := &DunstNotifier{
+	notifier := &DBusNotifier{
 		conn:           conn,
 		notificationID: 0, // 0 means create new notification
 	}
 
-	slog.Debug("dunst notifier initialized successfully")
+	slog.Debug("dbus notifier initialized successfully")
 	return notifier, nil
 }
 
 // updatestate updates the notification based on the current daemon state
-func (n *DunstNotifier) UpdateState(state ipc.DaemonState) error {
+func (n *DBusNotifier) UpdateState(state ipc.DaemonState) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -116,7 +116,7 @@ func (n *DunstNotifier) UpdateState(state ipc.DaemonState) error {
 }
 
 // UpdateStateWithDuration updates the notification with current recording duration
-func (n *DunstNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error {
+func (n *DBusNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -140,7 +140,7 @@ func (n *DunstNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration 
 }
 
 // update sends a custom notification with specified title, and body
-func (n *DunstNotifier) Update(title, body string) error {
+func (n *DBusNotifier) Update(title, body string) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -149,7 +149,7 @@ func (n *DunstNotifier) Update(title, body string) error {
 }
 
 // Close dismisses the current notification
-func (n *DunstNotifier) Close() error {
+func (n *DBusNotifier) Close() error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
@@ -174,12 +174,12 @@ func (n *DunstNotifier) Close() error {
 	}
 
 	n.conn = nil
-	slog.Debug("dunst notifier closed")
+	slog.Debug("dbus notifier closed")
 	return nil
 }
 
 // updateNotification sends notification via D-Bus
-func (n *DunstNotifier) updateNotification(title, body string) error {
+func (n *DBusNotifier) updateNotification(title, body string) error {
 	if n.conn == nil {
 		return fmt.Errorf("D-Bus connection is closed")
 	}
