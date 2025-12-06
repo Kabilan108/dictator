@@ -9,18 +9,33 @@ import (
 	"github.com/spf13/viper"
 )
 
+func init() {
+	if err := os.MkdirAll(DATA_DIR, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create data dir: %v\n", err)
+	}
+	if err := os.MkdirAll(STATE_DIR, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create data dir: %v\n", err)
+	}
+}
+
+func getAppDir(env, fallback string) string {
+	if xdg := os.Getenv(env); xdg != "" {
+		return filepath.Join(xdg, "dictator")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join(os.Getenv("HOME"), ".local", fallback, "dictator")
+	}
+	return filepath.Join(home, ".local", fallback, "dictator")
+}
+
+var DATA_DIR = getAppDir("XDG_DATA_HOME", "share")
+var STATE_DIR = getAppDir("XDG_STATE_HOME", "state")
+
 var CONFIG_DIR = func() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
 		return filepath.Join(os.Getenv("HOME"), ".config", "dictator")
-	}
-	return filepath.Join(dir, "dictator")
-}()
-
-var CACHE_DIR = func() string {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		return filepath.Join(os.Getenv("HOME"), ".cache", "dictator")
 	}
 	return filepath.Join(dir, "dictator")
 }()

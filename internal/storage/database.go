@@ -31,11 +31,11 @@ type DB struct {
 }
 
 func NewDB() (*DB, error) {
-	if err := os.MkdirAll(utils.CACHE_DIR, 0o755); err != nil {
+	if err := os.MkdirAll(utils.DATA_DIR, 0o755); err != nil {
 		return nil, err
 	}
 
-	dbPath := filepath.Join(utils.CACHE_DIR, dbFilename)
+	dbPath := filepath.Join(utils.DATA_DIR, dbFilename)
 
 	conn, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_busy_timeout=5000")
 	if err != nil {

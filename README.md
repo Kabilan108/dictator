@@ -297,7 +297,9 @@ Enable debug logging in your config:
 ### Log Files
 
 - Daemon logs to stderr (capture with `dictator daemon 2> daemon.log`)
-- Audio recordings cached in `~/.cache/dictator/recordings/`
+- Application logs stored in `~/.local/state/dictator/app.log`
+- Audio recordings stored in `~/.local/share/dictator/recordings/`
+- Database stored in `~/.local/share/dictator/transcripts.db`
 - Config stored in `~/.config/dictator/config.json`
 
 ## 🙏 Acknowledgments

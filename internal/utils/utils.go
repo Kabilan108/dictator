@@ -71,7 +71,7 @@ func SetupLogger(level string) *Logger {
 	}
 
 	logFile, err := os.OpenFile(
-		filepath.Join(CACHE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666,
+		filepath.Join(STATE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666,
 	)
 
 	var logHandler slog.Handler
@@ -96,42 +96,18 @@ func (l *Logger) Close() {
 
 // files
 
-type AppDir int
-
-const (
-	CacheDir AppDir = iota
-	ConfigDir
-)
-
-func createDir(path string) error {
+func createDir(path string) (string, error) {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
 		err = os.MkdirAll(path, 0o755)
 		if err != nil {
-			return fmt.Errorf("unable to create directory: %w", err)
+			return path, fmt.Errorf("unable to create directory: %w", err)
 		}
 	}
-	return nil
-}
-
-func CreateAppDir(ad AppDir) func(name string) (string, error) {
-	var d string
-	switch ad {
-	case CacheDir:
-		d = CACHE_DIR
-	case ConfigDir:
-		d = CONFIG_DIR
-	}
-	return func(name string) (string, error) {
-		fp := filepath.Join(d, name)
-		if err := createDir(fp); err != nil {
-			return "", fmt.Errorf("failed to create directory: %w", err)
-		}
-		return fp, nil
-	}
+	return path, nil
 }
 
 func GetPathToRecording(startTime time.Time) (string, error) {
-	d, err := CreateAppDir(CacheDir)("recordings")
+	d, err := createDir(filepath.Join(DATA_DIR, "recordings"))
 	if err != nil {
 		return "", fmt.Errorf("failed to create recording directory: %w", err)
 	}
