@@ -53,7 +53,6 @@ type AudioConfig struct {
 
 type AppConfig struct {
 	MaxRecordingMin int `json:"max_recording_min" mapstructure:"max_recording_min"`
-	TypingDelayMS   int `json:"typing_delay_ms" mapstructure:"typing_delay_ms"`
 }
 
 func DefaultConfig() *Config {
@@ -77,7 +76,6 @@ func DefaultConfig() *Config {
 			MaxDurationMin: 5,
 		},
 		App: AppConfig{
-			TypingDelayMS:   10,
 			MaxRecordingMin: 5,
 		},
 	}
@@ -121,9 +119,6 @@ func Validate(config *Config) error {
 
 	if config.App.MaxRecordingMin <= 0 {
 		return fmt.Errorf("max recording minutes must be positive")
-	}
-	if config.App.TypingDelayMS < 0 {
-		return fmt.Errorf("typing delay cannot be negative")
 	}
 
 	return nil

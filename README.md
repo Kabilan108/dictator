@@ -12,15 +12,28 @@ A voice typing daemon for Linux that enables voice typing anywhere the cursor is
 
 Make sure you have the following system dependencies installed:
 
+**For X11:**
 ```bash
 # Ubuntu/Debian
-sudo apt install xdotool xclip pulseaudio-utils
+sudo apt install xdotool xclip portaudio19-dev
 
 # Arch Linux
-sudo pacman -S xdotool xclip pulseaudio
+sudo pacman -S xdotool xclip portaudio
 
 # Fedora
-sudo dnf install xdotool xclip pulseaudio-utils
+sudo dnf install xdotool xclip portaudio-devel
+```
+
+**For Wayland:**
+```bash
+# Ubuntu/Debian
+sudo apt install wl-clipboard wtype portaudio19-dev
+
+# Arch Linux
+sudo pacman -S wl-clipboard wtype portaudio
+
+# Fedora
+sudo dnf install wl-clipboard wtype portaudio-devel
 ```
 
 ### Installation
@@ -156,9 +169,7 @@ Configuration file location: `~/.config/dictator/config.json`
     "max_duration_min": 5
   },
   "app": {
-    "log_level": 1,
-    "max_recording_min": 5,
-    "typing_delay_ms": 10
+    "max_recording_min": 5
   }
 }
 ```
@@ -179,9 +190,7 @@ Configuration file location: `~/.config/dictator/config.json`
 - `max_duration_min`: Maximum recording duration in minutes
 
 #### App Settings
-- `log_level`: Log verbosity (0=debug, 1=info, 2=warn, 3=error)
 - `max_recording_min`: Recording limit in minutes
-- `typing_delay_ms`: Delay between keystrokes when typing
 
 ## 🏗️ Architecture
 
@@ -196,15 +205,17 @@ Dictator uses a client-server architecture with these key components:
                 ┌──────────────────────────┼──────────────────────────┐
                 │                          │                          │
         ┌───────▼────────┐     ┌──────────▼──────────┐     ┌─────────▼────────┐
-        │  Audio         │     │   Transcription     │     │    Typing        │
-        │  Recording     │     │   (Whisper API)     │     │   (xdotool)      │
+        │  Audio         │     │   Transcription     │     │   Clipboard +    │
+        │  Recording     │     │   (Whisper API)     │     │   Paste          │
         │  (PortAudio)   │     │                     │     │                  │
         └────────────────┘     └─────────────────────┘     └──────────────────┘
                 │                          │                          │
         ┌───────▼────────┐     ┌──────────▼──────────┐     ┌─────────▼────────┐
-        │ Notifications  │     │    File Storage     │     │   Clipboard      │
-        │    (dunst)     │     │    (cache dir)      │     │   (fallback)     │
-        └────────────────┘     └─────────────────────┘     └──────────────────┘
+        │ Notifications  │     │    File Storage     │     │ X11: xclip +     │
+        │    (dbus)      │     │    (cache dir)      │     │      xdotool     │
+        └────────────────┘     └─────────────────────┘     │ Wayland: wl-copy │
+                                                          │      + wtype     │
+                                                          └──────────────────┘
 ```
 
 ### State Machine
@@ -256,10 +267,11 @@ make deps
 - Check microphone access: `arecord -l`
 - Verify PulseAudio is running: `pulseaudio --check`
 
-**Text isn't being typed:**
-- Install xdotool: `sudo apt install xdotool`
-- Check X11 session: `echo $DISPLAY`
-- Try clipboard fallback: `dictator` will automatically use xclip if xdotool fails
+**Text isn't being pasted:**
+- For X11: Install xdotool and xclip: `sudo apt install xdotool xclip`
+- For Wayland: Install wtype and wl-clipboard: `sudo apt install wtype wl-clipboard`
+- Check your session type: `echo $XDG_SESSION_TYPE`
+- Note: wtype only works on wlroots-based compositors (Sway, Hyprland, etc.)
 
 **API errors:**
 - Verify API key in config: `~/.config/dictator/config.json`
@@ -267,8 +279,7 @@ make deps
 - Ensure API quota/billing is sufficient
 
 **Notifications not showing:**
-- Install dunst: `sudo apt install dunst`
-- Start notification daemon: `dunst &`
+- Ensure a notification daemon is running (e.g., dunst, mako, fnott)
 - Check D-Bus session: `dbus-launch --sh-syntax`
 
 ### Debug Mode

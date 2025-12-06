@@ -269,20 +269,14 @@ var transcriptLastCmd = &cobra.Command{
 		}
 
 		if clipFlag {
-			// Check if xclip is available
-			xclipTyper := typing.XclipTyper{}
-			if !xclipTyper.IsAvailable() {
-				fmt.Fprintf(os.Stderr, "xclip not available - cannot copy to clipboard\n")
+			typer, err := typing.New()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "failed to initialize typer: %v\n", err)
 				os.Exit(1)
 			}
 
-			// Use xclip to copy to clipboard
-			xclipTyper = typing.XclipTyper{
-				Config: utils.AppConfig{},
-			}
-
 			ctx := context.Background()
-			if err := xclipTyper.TypeText(ctx, transcript.Text); err != nil {
+			if err := typer.Type(ctx, transcript.Text); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to copy to clipboard: %v\n", err)
 				os.Exit(1)
 			}
@@ -294,7 +288,7 @@ var transcriptLastCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "DEBUG", "log level (DEBUG, INFO, WARN, ERROR)")
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(stopCmd)

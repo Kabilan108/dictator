@@ -4,108 +4,112 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"strings"
-	"time"
-
-	"github.com/kabilan108/dictator/internal/utils"
 )
 
 type Typer interface {
-	TypeText(ctx context.Context, text string) error
+	Type(ctx context.Context, text string) error
 	IsAvailable() bool
 }
 
-func New(logLevel string) (Typer, error) {
-	xdotoolTyper := &XdotoolTyper{config: utils.AppConfig{}}
-	if xdotoolTyper.IsAvailable() {
-		slog.Debug("using xdotool for text input")
-		return xdotoolTyper, nil
+// detects if the current session is running Wayland
+func isWayland() bool {
+	if sessionType := os.Getenv("XDG_SESSION_TYPE"); sessionType == "wayland" {
+		return true
+	}
+	if waylandDisplay := os.Getenv("WAYLAND_DISPLAY"); waylandDisplay != "" {
+		return true
+	}
+	return false
+}
+
+// creates a Typer implementation based on the current display server
+func New() (Typer, error) {
+	if isWayland() {
+		typer := &WaylandTyper{}
+		if typer.IsAvailable() {
+			slog.Debug("using wtype for text input (wayland)")
+			return typer, nil
+		}
+		return nil, fmt.Errorf("wayland detected but wtype not available")
 	}
 
-	// Fallback to xclip
-	xclipTyper := &XclipTyper{Config: utils.AppConfig{}}
-	if xclipTyper.IsAvailable() {
-		slog.Warn("xdotool not available, falling back to xclip (clipboard)")
-		return xclipTyper, nil
+	typer := &X11Typer{}
+	if typer.IsAvailable() {
+		slog.Debug("using xclip/xdotool for text input (x11)")
+		return typer, nil
 	}
-
-	// Return xdotool typer even if not available - it will fail gracefully
-	return nil, fmt.Errorf("neither xdotool nor xclip available")
+	return nil, fmt.Errorf("x11 detected but xclip/xdotool not available")
 }
 
-type XdotoolTyper struct {
-	config utils.AppConfig
+// checks if the required commands are installed
+func areInstalled(cmds ...string) bool {
+	for _, cmd := range cmds {
+		if _, err := exec.LookPath(cmd); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
-func (x *XdotoolTyper) IsAvailable() bool {
-	_, err := exec.LookPath("xdotool")
-	return err == nil
-}
+// returns a closure that can be used to type text
+func typeFunc(
+	ctx context.Context, copyCmd []string, pasteCmd []string,
+) func(text string) error {
+	return func(text string) error {
+		if text == "" {
+			slog.Debug("empty text provided, nothing to type")
+			return nil
+		}
 
-func (x *XdotoolTyper) TypeText(ctx context.Context, text string) error {
-	if text == "" {
-		slog.Debug("empty text provided, nothing to type")
+		cmd := exec.CommandContext(ctx, copyCmd[0], copyCmd[1:]...)
+		cmd.Stdin = strings.NewReader(text)
+
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				slog.Debug("clipboard operation cancelled by context")
+				return ctx.Err()
+			}
+			return fmt.Errorf("failed to copy text to clipboard: %w", err)
+		}
+
+		slog.Debug("text copied to clipboard")
+
+		cmd = exec.CommandContext(ctx, pasteCmd[0], pasteCmd[1:]...)
+
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				slog.Debug("paste operation cancelled by context")
+				return ctx.Err()
+			}
+			return fmt.Errorf("failed to paste: %w", err)
+		}
+
+		slog.Debug("typing successful")
 		return nil
 	}
-
-	cmd := exec.CommandContext(ctx, "xdotool", "type", "--clearmodifiers", "--", text)
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			slog.Debug("typing cancelled by context")
-			return ctx.Err()
-		}
-		slog.Error("xdotool command failed", "err", err)
-		return fmt.Errorf("failed to type text with xdotool: %w", err)
-	}
-
-	// Apply typing delay if configured, but check for cancellation
-	if x.config.TypingDelayMS > 0 {
-		delay := time.Duration(x.config.TypingDelayMS) * time.Millisecond
-		slog.Debug("applying typing delay", "delay", delay)
-
-		select {
-		case <-time.After(delay):
-			// Normal delay completion
-		case <-ctx.Done():
-			slog.Debug("typing cancelled during delay")
-			return ctx.Err()
-		}
-	}
-
-	slog.Debug("successfully typed", "text", text)
-	return nil
 }
 
-type XclipTyper struct {
-	Config utils.AppConfig
-	Log    utils.Logger
+// uses xclip to copy to clipboard and xdotool to paste
+type X11Typer struct{}
+
+func (x *X11Typer) IsAvailable() bool { return areInstalled("xclip", "xdotool") }
+func (x *X11Typer) Type(ctx context.Context, text string) error {
+	copyCmd := []string{"xclip", "-selection", "clipboard"}
+	pasteCmd := []string{"xdotool", "key", "ctrl+shift+v"}
+	return typeFunc(ctx, copyCmd, pasteCmd)(text)
 }
 
-func (x *XclipTyper) IsAvailable() bool {
-	_, err := exec.LookPath("xclip")
-	return err == nil
-}
+// uses wl-copy to copy to clipboard and wtype to paste
+type WaylandTyper struct{}
 
-func (x *XclipTyper) TypeText(ctx context.Context, text string) error {
-	if text == "" {
-		slog.Debug("empty text provided, nothing to copy")
-		return nil
+func (w *WaylandTyper) IsAvailable() bool { return areInstalled("wl-copy", "wtype") }
+func (w *WaylandTyper) Type(ctx context.Context, text string) error {
+	copyCmd := []string{"wl-copy"}
+	pasteCmd := []string{
+		"wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "ctrl", "-m", "shift",
 	}
-
-	cmd := exec.CommandContext(ctx, "xclip", "-selection", "clipboard")
-	cmd.Stdin = strings.NewReader(text)
-
-	if err := cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			slog.Debug("clipboard operation cancelled by context")
-			return ctx.Err()
-		}
-		slog.Error("xclip command failed", "err", err)
-		return fmt.Errorf("failed to copy text to clipboard with xclip: %w", err)
-	}
-
-	slog.Debug("text copied to clipboard")
-	return nil
+	return typeFunc(ctx, copyCmd, pasteCmd)(text)
 }

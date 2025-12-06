@@ -1,5 +1,5 @@
 {
-  description = "native speech to text daemon for x11";
+  description = "native speech to text daemon for linux";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -52,7 +52,7 @@
             # checkPhase = "make test";
 
             meta = with lib; {
-              description = "native speech to text daemon for x11";
+              description = "native speech to text daemon for linux";
               homepage = "https://github.com/kabilan108/dictator";
               license = licenses.asl20;
               platforms = [ system ];
@@ -68,17 +68,31 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+          commonPackages = with pkgs; [
+            go
+            gopls
+            ffmpeg
+            pkg-config
+            portaudio
+          ];
+          x11Packages = with pkgs; [
+            xclip
+            xdotool
+          ];
+          waylandPackages = with pkgs; [
+            wl-clipboard
+            wtype
+          ];
         in
         {
           default = pkgs.mkShell {
-            buildInputs = with pkgs; [
-              go
-              gopls
-              xorg.xrandr
-              ffmpeg
-              pkg-config
-              portaudio
-            ];
+            buildInputs = commonPackages ++ waylandPackages;
+          };
+          wayland = pkgs.mkShell {
+            buildInputs = commonPackages ++ waylandPackages;
+          };
+          x11 = pkgs.mkShell {
+            buildInputs = commonPackages ++ x11Packages;
           };
         }
       );

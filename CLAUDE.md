@@ -29,8 +29,8 @@ Dictator is a voice typing daemon for Linux using a client-server architecture:
 - **Daemon** (`internal/daemon/`): Background service managing state transitions and orchestrating audio/transcription/typing
 - **IPC** (`internal/ipc/`): Unix socket protocol for client-daemon communication
 - **Audio** (`internal/audio/`): PortAudio recording and Whisper API transcription
-- **Typing** (`internal/typing/`): xdotool-based keyboard input simulation
-- **Notifier** (`internal/notifier/`): dunst desktop notifications for state changes
+- **Typing** (`internal/typing/`): Clipboard + paste simulation (X11: xclip/xdotool, Wayland: wl-copy/wtype)
+- **Notifier** (`internal/notifier/`): D-Bus desktop notifications for state changes
 
 ### State Flow
 
@@ -38,7 +38,7 @@ The daemon implements a linear state machine:
 1. **Idle**: Waiting for commands
 2. **Recording**: Audio capture active
 3. **Transcribing**: Sending audio to Whisper API
-4. **Typing**: Simulating keyboard input
+4. **Typing**: Pasting text via clipboard
 5. **Error**: Temporary error state (auto-returns to idle)
 
 ### Key Dependencies
@@ -46,8 +46,8 @@ The daemon implements a linear state machine:
 - **Cobra/Viper**: CLI framework and configuration
 - **PortAudio**: Cross-platform audio I/O
 - **Whisper API**: Speech-to-text transcription
-- **xdotool**: X11 keyboard simulation
-- **dunst**: Linux desktop notifications
+- **X11**: xclip (clipboard) + xdotool (paste keystroke)
+- **Wayland**: wl-clipboard (clipboard) + wtype (paste keystroke)
 
 ### Project Structure
 

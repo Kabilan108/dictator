@@ -52,7 +52,7 @@ func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
 		return nil, fmt.Errorf("failed to create notifier: %w", err)
 	}
 
-	typer, err := typing.New(logLevel)
+	typer, err := typing.New()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create typer: %w", err)
 	}
@@ -329,7 +329,7 @@ func (d *Daemon) transcribeAndType() {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
-	if err := d.typer.TypeText(ctx, resp.Text); err != nil {
+	if err := d.typer.Type(ctx, resp.Text); err != nil {
 		if ctx.Err() != nil {
 			slog.Debug("typing cancelled")
 			d.mu.Lock()
