@@ -212,7 +212,7 @@ var transcriptsCmd = &cobra.Command{
 	Short: "list recent transcripts",
 	Long:  `lists out the N most recent transcripts, where N is set based on the -n flag. default value is 10.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		n, _ := cmd.Flags().GetInt("n")
+		n, _ := cmd.Flags().GetInt("num")
 		textOnly, _ := cmd.Flags().GetBool("text")
 
 		if n <= 0 && n != -1 {
