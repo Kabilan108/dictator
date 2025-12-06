@@ -14,6 +14,7 @@ import (
 type NotificationContent struct {
 	Title string
 	Body  string
+	Icon  string
 }
 
 type Notifier interface {
@@ -33,22 +34,27 @@ var stateNotifications = map[ipc.DaemonState]NotificationContent{
 	ipc.StateIdle: {
 		Title: "dictator",
 		Body:  "ready for voice input",
+		Icon:  "audio-input-microphone",
 	},
 	ipc.StateRecording: {
-		Title: " dictator",
+		Title: "dictator",
 		Body:  "Recording audio",
+		Icon:  "media-record",
 	},
 	ipc.StateTranscribing: {
 		Title: "dictator",
 		Body:  "transcribing audio",
+		Icon:  "process-working-symbolic",
 	},
 	ipc.StateTyping: {
-		Title: " dictator",
+		Title: "dictator",
 		Body:  "typing text",
+		Icon:  "input-keyboard",
 	},
 	ipc.StateError: {
-		Title: " dictator",
+		Title: "dictator",
 		Body:  "an error occurred",
+		Icon:  "dialog-error",
 	},
 }
 
@@ -112,7 +118,7 @@ func (n *DBusNotifier) UpdateState(state ipc.DaemonState) error {
 	}
 
 	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
-	return n.updateNotification(content.Title, content.Body)
+	return n.updateNotification(content.Title, content.Body, content.Icon)
 }
 
 // UpdateStateWithDuration updates the notification with current recording duration
@@ -131,12 +137,12 @@ func (n *DBusNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration t
 		formattedDuration := formatDuration(duration)
 		updatedBody := fmt.Sprintf("Recording audio %s", formattedDuration)
 		slog.Debug("updating recording notification with duration", "duration", formattedDuration)
-		return n.updateNotification(content.Title, updatedBody)
+		return n.updateNotification(content.Title, updatedBody, content.Icon)
 	}
 
 	// For non-recording states, use standard notification
 	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
-	return n.updateNotification(content.Title, content.Body)
+	return n.updateNotification(content.Title, content.Body, content.Icon)
 }
 
 // update sends a custom notification with specified title, and body
@@ -145,7 +151,7 @@ func (n *DBusNotifier) Update(title, body string) error {
 	defer n.mu.Unlock()
 
 	slog.Debug("sending custom notification", "title", title)
-	return n.updateNotification(title, body)
+	return n.updateNotification(title, body, "")
 }
 
 // Close dismisses the current notification
@@ -179,7 +185,7 @@ func (n *DBusNotifier) Close() error {
 }
 
 // updateNotification sends notification via D-Bus
-func (n *DBusNotifier) updateNotification(title, body string) error {
+func (n *DBusNotifier) updateNotification(title, body, icon string) error {
 	if n.conn == nil {
 		return fmt.Errorf("D-Bus connection is closed")
 	}
@@ -198,7 +204,7 @@ func (n *DBusNotifier) updateNotification(title, body string) error {
 		methodNotify, 0,
 		appName,   // app_name
 		replaceID, // replaces_id (0 for new, or existing ID to update)
-		"",        // app_icon
+		icon,      // app_icon
 		title,     // summary
 		body,      // body
 		actions,   // actions
