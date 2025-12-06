@@ -33,7 +33,7 @@ type Server struct {
 	cancel context.CancelFunc
 }
 
-func NewServer(handler CommandHandler, logLevel string) *Server {
+func NewServer(handler CommandHandler) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{

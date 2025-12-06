@@ -17,7 +17,7 @@ type Client struct {
 	timeout    time.Duration
 }
 
-func NewClient(logLevel string) *Client {
+func NewClient() *Client {
 	return &Client{
 		socketPath: SocketPath,
 		timeout:    10 * time.Second,

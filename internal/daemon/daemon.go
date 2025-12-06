@@ -39,13 +39,13 @@ type Daemon struct {
 	notificationTimer *time.Timer
 }
 
-func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
-	recorder, err := audio.NewRecorder(cfg.Audio, logLevel)
+func NewDaemon(cfg *utils.Config) (*Daemon, error) {
+	recorder, err := audio.NewRecorder(cfg.Audio)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create recorder: %w", err)
 	}
 
-	transcriber := audio.NewWhisperClient(&cfg.API, logLevel)
+	transcriber := audio.NewWhisperClient(&cfg.API)
 
 	notifier, err := notifier.New()
 	if err != nil {
@@ -74,7 +74,7 @@ func NewDaemon(cfg *utils.Config, logLevel string) (*Daemon, error) {
 		stopChan:    make(chan struct{}),
 	}
 
-	daemon.ipcServer = ipc.NewServer(daemon, logLevel)
+	daemon.ipcServer = ipc.NewServer(daemon)
 
 	return daemon, nil
 }

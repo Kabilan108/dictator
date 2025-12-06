@@ -2,10 +2,6 @@
 Copyright © 2025 kabilan108 tonykabilanokeke@gmail.com
 */
 
-// BUG: need to separate xdotool input from real keyboard input
-//      right now dictator is typing and the user hits the fn key to, for example pause music,
-//      that will trigger `fn+ [key]` and similarly with other modifiers
-
 package main
 
 import (
@@ -36,6 +32,9 @@ var rootCmd = &cobra.Command{
 
 start the daemon with 'dictator daemon' then use commands like 'start', 'stop',
 'toggle', 'cancel', and 'status' to control voice recording and transcription.`,
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+		utils.SetupLogger(logLevel)
+	},
 }
 
 var daemonCmd = &cobra.Command{
@@ -46,7 +45,7 @@ var daemonCmd = &cobra.Command{
 		c, err := utils.GetConfig()
 		utils.ExitIfError(err, 1)
 
-		d, err := daemon.NewDaemon(c, logLevel)
+		d, err := daemon.NewDaemon(c)
 		utils.ExitIfError(err, 1)
 
 		err = d.Run()
@@ -59,7 +58,7 @@ var startCmd = &cobra.Command{
 	Short: "start voice recording",
 	Long:  `tells the daemon to start recording voice input`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient(logLevel)
+		client := ipc.NewClient()
 		ctx := context.Background()
 
 		response, err := client.Start(ctx)
@@ -79,7 +78,7 @@ var stopCmd = &cobra.Command{
 	Short: "stop voice recording and transcribe",
 	Long:  `tells the daemon to stop recording and start transcription`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient(logLevel)
+		client := ipc.NewClient()
 		ctx := context.Background()
 
 		response, err := client.Stop(ctx)
@@ -99,7 +98,7 @@ var toggleCmd = &cobra.Command{
 	Short: "toggle voice recording",
 	Long:  `toggles between starting and stopping voice recording`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient(logLevel)
+		client := ipc.NewClient()
 		ctx := context.Background()
 
 		response, err := client.Toggle(ctx)
@@ -119,7 +118,7 @@ var cancelCmd = &cobra.Command{
 	Short: "cancel current operation",
 	Long:  `cancels any current recording or transcription operation`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient(logLevel)
+		client := ipc.NewClient()
 		ctx := context.Background()
 
 		response, err := client.Cancel(ctx)
@@ -139,7 +138,7 @@ var statusCmd = &cobra.Command{
 	Short: "get daemon status",
 	Long:  `shows the current status of the dictator daemon`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient(logLevel)
+		client := ipc.NewClient()
 		ctx := context.Background()
 
 		response, err := client.Status(ctx)
@@ -288,7 +287,7 @@ var transcriptLastCmd = &cobra.Command{
 }
 
 func init() {
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "DEBUG", "log level (DEBUG, INFO, WARN, ERROR)")
+	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "INFO", "log level (DEBUG, INFO, WARN, ERROR)")
 	rootCmd.AddCommand(daemonCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(stopCmd)
@@ -305,7 +304,6 @@ func init() {
 }
 
 func main() {
-	utils.SetupLogger(logLevel)
 	err := rootCmd.Execute()
 	if err != nil {
 		os.Exit(1)

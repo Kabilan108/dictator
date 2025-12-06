@@ -42,7 +42,7 @@ type Recorder struct {
 	wg sync.WaitGroup
 }
 
-func NewRecorder(c utils.AudioConfig, logLevel string) (*Recorder, error) {
+func NewRecorder(c utils.AudioConfig) (*Recorder, error) {
 	recorder := &Recorder{
 		config:        c,
 		state:         StateIdle,

@@ -36,7 +36,7 @@ type whisperClient struct {
 	httpClient *http.Client
 }
 
-func NewWhisperClient(c *utils.APIConfig, logLevel string) WhisperClient {
+func NewWhisperClient(c *utils.APIConfig) WhisperClient {
 	timeout := time.Duration(c.Timeout) * time.Second
 	return &whisperClient{
 		config:     c,
