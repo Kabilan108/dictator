@@ -178,9 +178,6 @@ Configuration file location: `~/.config/dictator/config.json`
     "bit_depth": 16,
     "frames_per_block": 1024,
     "max_duration_min": 5
-  },
-  "app": {
-    "max_recording_min": 5
   }
 }
 ```
@@ -208,15 +205,7 @@ make deps
 
 ### Debug Mode
 
-Enable debug logging in your config:
 
-```json
-{
-  "app": {
-    "log_level": 0
-  }
-}
-```
 
 ### Log Files
 

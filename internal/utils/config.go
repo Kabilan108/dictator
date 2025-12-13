@@ -42,7 +42,6 @@ var CONFIG_DIR = func() string {
 
 type Config struct {
 	API   APIConfig   `json:"api" mapstructure:"api"`
-	App   AppConfig   `json:"app" mapstructure:"app"`
 	Audio AudioConfig `json:"audio" mapstructure:"audio"`
 }
 
@@ -66,10 +65,6 @@ type AudioConfig struct {
 	MaxDurationMin int `json:"max_duration_min" mapstructure:"max_duration_min"`
 }
 
-type AppConfig struct {
-	MaxRecordingMin int `json:"max_recording_min" mapstructure:"max_recording_min"`
-}
-
 func DefaultConfig() *Config {
 	return &Config{
 		API: APIConfig{
@@ -89,9 +84,6 @@ func DefaultConfig() *Config {
 			BitDepth:       16,
 			FramesPerBlock: 1024,
 			MaxDurationMin: 5,
-		},
-		App: AppConfig{
-			MaxRecordingMin: 5,
 		},
 	}
 }
@@ -130,10 +122,6 @@ func Validate(config *Config) error {
 	}
 	if config.Audio.MaxDurationMin <= 0 {
 		return fmt.Errorf("audio max duration min must be positive")
-	}
-
-	if config.App.MaxRecordingMin <= 0 {
-		return fmt.Errorf("max recording minutes must be positive")
 	}
 
 	return nil
