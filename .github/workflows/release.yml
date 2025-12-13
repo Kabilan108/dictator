@@ -2,7 +2,7 @@ name: Release on Version Change
 
 on:
   push:
-    branches: [ master ]
+    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -12,6 +12,9 @@ concurrency:
 permissions:
   contents: write
   packages: write
+
+env:
+  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
 jobs:
   check-version:
@@ -23,6 +26,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Notify Workflow Started
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "Release Workflow Started",
+                "description": "Checking for version changes in ${{ github.repository }}",
+                "color": 3447003,
+                "fields": [
+                  {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                  {"name": "Commit", "value": "${{ github.sha }}", "inline": true},
+                  {"name": "Workflow", "value": "${{ github.workflow }}", "inline": true}
+                ],
+                "footer": {"text": "GitHub Actions"},
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"
+              }]
+            }' \
+            ${{ env.DISCORD_WEBHOOK }}
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v4
@@ -58,6 +81,36 @@ jobs:
             echo "No version change detected"
           fi
 
+      - name: Notify Version Check Complete
+        run: |
+          if [ "${{ steps.check.outputs.should_release }}" == "true" ]; then
+            COLOR=10181038
+            TITLE="Version Change Detected - Release Starting"
+            DESCRIPTION="New version ${{ steps.get_version.outputs.version }} will be released"
+          else
+            COLOR=16776960
+            TITLE="No Release Needed"
+            DESCRIPTION="Version ${{ steps.get_version.outputs.version }} matches latest tag"
+          fi
+
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "'"$TITLE"'",
+                "description": "'"$DESCRIPTION"'",
+                "color": '$COLOR',
+                "fields": [
+                  {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Current Version", "value": "${{ steps.get_version.outputs.version }}", "inline": true},
+                  {"name": "Latest Tag", "value": "${{ steps.get_tag.outputs.latest_tag }}", "inline": true},
+                  {"name": "Release Needed", "value": "${{ steps.check.outputs.should_release }}", "inline": true}
+                ],
+                "footer": {"text": "GitHub Actions"},
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"
+              }]
+            }' \
+            ${{ env.DISCORD_WEBHOOK }}
+
   build-and-release:
     needs: check-version
     if: needs.check-version.outputs.should_release == 'true'
@@ -67,6 +120,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Notify Release Started
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "Building Release v${{ needs.check-version.outputs.current_version }}",
+                "description": "Starting build process for ${{ github.repository }}",
+                "color": 10181038,
+                "fields": [
+                  {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Version", "value": "v${{ needs.check-version.outputs.current_version }}", "inline": true},
+                  {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true},
+                  {"name": "Commit", "value": "${{ github.sha }}", "inline": true}
+                ],
+                "footer": {"text": "GitHub Actions"},
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"
+              }]
+            }' \
+            ${{ env.DISCORD_WEBHOOK }}
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v4
@@ -107,3 +180,23 @@ jobs:
             release-assets/dictator-x86_64-linux
           draft: false
           prerelease: false
+
+      - name: Notify Release Complete
+        run: |
+          curl -H "Content-Type: application/json" \
+            -d '{
+              "embeds": [{
+                "title": "Release v${{ needs.check-version.outputs.current_version }} Complete",
+                "description": "Successfully released ${{ github.repository }}",
+                "color": 65280,
+                "fields": [
+                  {"name": "Repository", "value": "${{ github.repository }}", "inline": true},
+                  {"name": "Version", "value": "v${{ needs.check-version.outputs.current_version }}", "inline": true},
+                  {"name": "Release URL", "value": "[Download Here](https://github.com/${{ github.repository }}/releases/tag/v${{ needs.check-version.outputs.current_version }})", "inline": true},
+                  {"name": "Branch", "value": "${{ github.ref_name }}", "inline": true}
+                ],
+                "footer": {"text": "GitHub Actions"},
+                "timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ)'"
+              }]
+            }' \
+            ${{ env.DISCORD_WEBHOOK }}
