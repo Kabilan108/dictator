@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"sync"
 
 	"github.com/spf13/viper"
@@ -64,6 +66,8 @@ type AudioConfig struct {
 	FramesPerBlock int `json:"frames_per_block" mapstructure:"frames_per_block"`
 	MaxDurationMin int `json:"max_duration_min" mapstructure:"max_duration_min"`
 }
+
+var envKeyPattern = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func DefaultConfig() *Config {
 	return &Config{
@@ -127,6 +131,75 @@ func Validate(config *Config) error {
 	return nil
 }
 
+func expandEnvSubstitutions(value string) (string, []string) {
+	if !strings.Contains(value, "${env:") {
+		return value, nil
+	}
+
+	matches := envKeyPattern.FindAllStringSubmatchIndex(value, -1)
+	if len(matches) == 0 {
+		return value, nil
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(value))
+
+	var missing []string
+	last := 0
+
+	for _, match := range matches {
+		builder.WriteString(value[last:match[0]])
+		varName := value[match[2]:match[3]]
+
+		if envValue, ok := os.LookupEnv(varName); ok {
+			builder.WriteString(envValue)
+		} else {
+			missing = append(missing, varName)
+			builder.WriteString(value[match[0]:match[1]])
+		}
+
+		last = match[1]
+	}
+
+	builder.WriteString(value[last:])
+
+	return builder.String(), missing
+}
+
+func resolveProviderKeys(config *Config) error {
+	if config == nil {
+		return nil
+	}
+
+	activeProvider := config.API.ActiveProvider
+	var missingForActive []string
+
+	for name, provider := range config.API.Providers {
+		expandedKey, missing := expandEnvSubstitutions(provider.Key)
+		provider.Key = expandedKey
+		config.API.Providers[name] = provider
+
+		if name == activeProvider && len(missing) > 0 {
+			missingForActive = append(missingForActive, missing...)
+		}
+	}
+
+	if len(missingForActive) > 0 {
+		unique := make(map[string]struct{}, len(missingForActive))
+		ordered := make([]string, 0, len(missingForActive))
+		for _, name := range missingForActive {
+			if _, ok := unique[name]; ok {
+				continue
+			}
+			unique[name] = struct{}{}
+			ordered = append(ordered, name)
+		}
+		return fmt.Errorf("missing env vars for active provider key: %s", strings.Join(ordered, ", "))
+	}
+
+	return nil
+}
+
 var globalConfig *Config
 
 func GetConfig() (*Config, error) {
@@ -154,6 +227,11 @@ func GetConfig() (*Config, error) {
 
 		if err := viper.Unmarshal(config); err != nil {
 			loadErr = fmt.Errorf("config: failed to parse: %v", err)
+			return
+		}
+
+		if err := resolveProviderKeys(config); err != nil {
+			loadErr = fmt.Errorf("config: %v", err)
 			return
 		}
 
