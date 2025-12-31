@@ -167,10 +167,15 @@ Configuration file location: `~/.config/dictator/config.json`
 ```json
 {
   "api": {
-    "endpoint": "https://api.openai.com/v1/audio/transcriptions",
-    "key": "sk-your-api-key",
-    "model": "whisper-1",
-    "timeout": 60
+    "active_provider": "openai",
+    "timeout": 60,
+    "providers": {
+      "openai": {
+        "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+        "key": "${env:OPENAI_API_KEY}",
+        "model": "gpt-4o-transcribe"
+      }
+    }
   },
   "audio": {
     "sample_rate": 16000,
@@ -181,6 +186,8 @@ Configuration file location: `~/.config/dictator/config.json`
   }
 }
 ```
+
+The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails.
 
 ## Development
 
