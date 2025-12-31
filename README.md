@@ -84,6 +84,65 @@ sudo dnf install wl-clipboard wtype portaudio-devel
    }
    ```
 
+### Home Manager (Nix)
+
+You can enable Dictator as a Home Manager service via this flake.
+
+Example `flake.nix` usage:
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    home-manager.inputs.nixpkgs.follows = "nixpkgs";
+    dictator.url = "github:kabilan108/dictator";
+  };
+
+  outputs = { self, nixpkgs, home-manager, dictator, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs { inherit system; };
+    in
+    {
+      homeConfigurations."your-user" = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [
+          dictator.homeManagerModules.dictator
+          {
+            services.dictator = {
+              enable = true;
+              displayServer = "wayland"; # or "x11" / "auto"
+              logLevel = "INFO";
+              settings = {
+                api = {
+                  active_provider = "openai";
+                  timeout = 60;
+                  providers = {
+                    openai = {
+                      endpoint = "https://api.openai.com/v1/audio/transcriptions";
+                      key = "\${env:OPENAI_API_KEY}";
+                      model = "gpt-4o-transcribe";
+                    };
+                  };
+                };
+                audio = {
+                  max_duration_min = 20;
+                };
+              };
+            };
+          }
+        ];
+      };
+    };
+}
+```
+
+Notes:
+- `services.dictator.settings` or `services.dictator.configFile` is required when enabling the module.
+- `displayServer` controls the default runtime dependencies and environment (Wayland vs X11).
+- If you already manage a config file, set `services.dictator.configFile = /path/to/config.json;`.
+- To use `${env:VAR}` in the config, set `services.dictator.environmentFile` (supports strings like `${XDG_RUNTIME_DIR}/...`) or `services.dictator.environment`.
+
 ### Basic Usage
 
 ```bash

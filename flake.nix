@@ -19,7 +19,7 @@
         {
           default = pkgs.buildGoModule rec {
             pname = "dictator";
-            version = "2.1.0";
+            version = "2.2.0";
             src = ./.;
             vendorHash = "sha256-5x920a+jLyjndwIstLW7lGUDgF92QNe1hMMot7O9Uoc=";
 
@@ -96,5 +96,9 @@
           };
         }
       );
+      homeManagerModules = {
+        dictator = import ./nix/home-manager.nix { inherit self; };
+        default = self.homeManagerModules.dictator;
+      };
     };
 }
