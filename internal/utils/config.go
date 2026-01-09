@@ -11,13 +11,14 @@ import (
 	"github.com/spf13/viper"
 )
 
-func init() {
+func EnsureDirectories() error {
 	if err := os.MkdirAll(DATA_DIR, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create data dir: %v\n", err)
+		return fmt.Errorf("failed to create data dir: %w", err)
 	}
 	if err := os.MkdirAll(STATE_DIR, 0o755); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to create data dir: %v\n", err)
+		return fmt.Errorf("failed to create state dir: %w", err)
 	}
+	return nil
 }
 
 func getAppDir(env, fallback string) string {
@@ -200,48 +201,47 @@ func resolveProviderKeys(config *Config) error {
 	return nil
 }
 
-var globalConfig *Config
+var (
+	globalConfig *Config
+	configOnce   sync.Once
+	configErr    error
+)
 
 func GetConfig() (*Config, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("json")
-	viper.AddConfigPath(CONFIG_DIR)
+	configOnce.Do(func() {
+		viper.SetConfigName("config")
+		viper.SetConfigType("json")
+		viper.AddConfigPath(CONFIG_DIR)
 
-	viper.SetEnvPrefix("DICTATOR")
-	viper.AutomaticEnv()
+		viper.SetEnvPrefix("DICTATOR")
+		viper.AutomaticEnv()
 
-	var once sync.Once
-	var loadErr error
-
-	once.Do(func() {
-		// seed with defaults so partial configs/env vars merge correctly
 		config := DefaultConfig()
 
 		if err := viper.ReadInConfig(); err != nil {
-			// if config file is missing, continue so env vars can still apply
 			if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
-				loadErr = fmt.Errorf("config: %v", err)
+				configErr = fmt.Errorf("config: %v", err)
 				return
 			}
 		}
 
 		if err := viper.Unmarshal(config); err != nil {
-			loadErr = fmt.Errorf("config: failed to parse: %v", err)
+			configErr = fmt.Errorf("config: failed to parse: %v", err)
 			return
 		}
 
 		if err := resolveProviderKeys(config); err != nil {
-			loadErr = fmt.Errorf("config: %v", err)
+			configErr = fmt.Errorf("config: %v", err)
 			return
 		}
 
 		if err := Validate(config); err != nil {
-			loadErr = fmt.Errorf("config: failed to validate: %v", err)
+			configErr = fmt.Errorf("config: failed to validate: %v", err)
 			return
 		}
 
 		globalConfig = config
 	})
 
-	return globalConfig, loadErr
+	return globalConfig, configErr
 }

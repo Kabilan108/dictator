@@ -44,7 +44,6 @@ func New() (Typer, error) {
 	return nil, fmt.Errorf("x11 detected but xclip/xdotool not available")
 }
 
-// checks if the required commands are installed
 func areInstalled(cmds ...string) bool {
 	for _, cmd := range cmds {
 		if _, err := exec.LookPath(cmd); err != nil {
@@ -54,62 +53,57 @@ func areInstalled(cmds ...string) bool {
 	return true
 }
 
-// returns a closure that can be used to type text
-func typeFunc(
-	ctx context.Context, copyCmd []string, pasteCmd []string,
-) func(text string) error {
-	return func(text string) error {
-		if text == "" {
-			slog.Debug("empty text provided, nothing to type")
-			return nil
-		}
-
-		cmd := exec.CommandContext(ctx, copyCmd[0], copyCmd[1:]...)
-		cmd.Stdin = strings.NewReader(text)
-
-		if err := cmd.Run(); err != nil {
-			if ctx.Err() != nil {
-				slog.Debug("clipboard operation cancelled by context")
-				return ctx.Err()
-			}
-			return fmt.Errorf("failed to copy text to clipboard: %w", err)
-		}
-
-		slog.Debug("text copied to clipboard")
-
-		cmd = exec.CommandContext(ctx, pasteCmd[0], pasteCmd[1:]...)
-
-		if err := cmd.Run(); err != nil {
-			if ctx.Err() != nil {
-				slog.Debug("paste operation cancelled by context")
-				return ctx.Err()
-			}
-			return fmt.Errorf("failed to paste: %w", err)
-		}
-
-		slog.Debug("typing successful")
+func copyAndPaste(ctx context.Context, text string, copyCmd, pasteCmd []string) error {
+	if text == "" {
+		slog.Debug("empty text provided, nothing to type")
 		return nil
 	}
+
+	cmd := exec.CommandContext(ctx, copyCmd[0], copyCmd[1:]...)
+	cmd.Stdin = strings.NewReader(text)
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			slog.Debug("clipboard operation cancelled by context")
+			return ctx.Err()
+		}
+		return fmt.Errorf("failed to copy text to clipboard: %w", err)
+	}
+
+	slog.Debug("text copied to clipboard")
+
+	cmd = exec.CommandContext(ctx, pasteCmd[0], pasteCmd[1:]...)
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			slog.Debug("paste operation cancelled by context")
+			return ctx.Err()
+		}
+		return fmt.Errorf("failed to paste: %w", err)
+	}
+
+	slog.Debug("typing successful")
+	return nil
 }
 
-// uses xclip to copy to clipboard and xdotool to paste
 type X11Typer struct{}
 
 func (x *X11Typer) IsAvailable() bool { return areInstalled("xclip", "xdotool") }
+
 func (x *X11Typer) Type(ctx context.Context, text string) error {
-	copyCmd := []string{"xclip", "-selection", "clipboard"}
-	pasteCmd := []string{"xdotool", "key", "ctrl+shift+v"}
-	return typeFunc(ctx, copyCmd, pasteCmd)(text)
+	return copyAndPaste(ctx, text,
+		[]string{"xclip", "-selection", "clipboard"},
+		[]string{"xdotool", "key", "ctrl+shift+v"},
+	)
 }
 
-// uses wl-copy to copy to clipboard and wtype to paste
 type WaylandTyper struct{}
 
 func (w *WaylandTyper) IsAvailable() bool { return areInstalled("wl-copy", "wtype") }
+
 func (w *WaylandTyper) Type(ctx context.Context, text string) error {
-	copyCmd := []string{"wl-copy"}
-	pasteCmd := []string{
-		"wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "ctrl", "-m", "shift",
-	}
-	return typeFunc(ctx, copyCmd, pasteCmd)(text)
+	return copyAndPaste(ctx, text,
+		[]string{"wl-copy"},
+		[]string{"wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "ctrl", "-m", "shift"},
+	)
 }

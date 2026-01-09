@@ -16,6 +16,8 @@ import (
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
+const RetryDelay = 1 * time.Second
+
 type TranscriptionRequest struct {
 	AudioData []byte
 	Filename  string
@@ -56,76 +58,35 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 		return nil, fmt.Errorf("API key is required but not configured for provider '%s'", c.config.ActiveProvider)
 	}
 
-	// create multipart form data
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	fileWriter, err := writer.CreateFormFile("file", req.Filename)
-	if err != nil {
-		slog.Error("failed to create form file", "err", err)
-		return nil, fmt.Errorf("failed to create form file: %w", err)
-	}
-
-	if _, err := fileWriter.Write(req.AudioData); err != nil {
-		slog.Error("failed to write audio data", "err", err)
-		return nil, fmt.Errorf("failed to write audio data: %w", err)
-	}
-
 	model := req.Model
 	if model == "" {
 		model = activeProvider.Model
 	}
 	if model == "" {
-		model = "distil-large-v3" // Final fallback
-	}
-	if err := writer.WriteField("model", model); err != nil {
-		return nil, fmt.Errorf("failed to write model field: %w", err)
+		model = "distil-large-v3"
 	}
 
-	if req.Language != "" {
-		if err := writer.WriteField("language", req.Language); err != nil {
-			return nil, fmt.Errorf("failed to write language field: %w", err)
-		}
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, fmt.Errorf("failed to close multipart writer: %w", err)
-	}
-
-	url := activeProvider.Endpoint
-	if !strings.HasSuffix(url, "/transcriptions") {
-		if strings.HasSuffix(url, "/v1/audio/transcriptions") {
-			// already complete
-		} else if strings.HasSuffix(url, "/v1/audio") {
-			url += "/transcriptions"
-		} else if strings.HasSuffix(url, "/v1") {
-			url += "/audio/transcriptions"
-		} else {
-			url += "/v1/audio/transcriptions"
-		}
-	}
-
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, body)
-	if err != nil {
-		slog.Error("failed to create http request", "err", err)
-		return nil, fmt.Errorf("failed to create HTTP request: %w", err)
-	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+activeProvider.Key)
-	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
-
-	slog.Debug("sending request", "url", url, "model", model)
+	url := normalizeEndpoint(activeProvider.Endpoint)
 
 	var resp *http.Response
 	var lastErr error
 
 	for attempt := range 2 {
+		httpReq, contentType, err := c.buildRequest(ctx, url, req, model)
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+activeProvider.Key)
+		httpReq.Header.Set("Content-Type", contentType)
+
+		slog.Debug("sending request", "url", url, "model", model, "attempt", attempt+1)
+
 		resp, err = c.httpClient.Do(httpReq)
 		if err != nil {
 			lastErr = err
 			if attempt == 0 {
 				slog.Warn("request attempt failed, retrying", "attempt", attempt+1, "err", err)
-				time.Sleep(1 * time.Second)
+				time.Sleep(RetryDelay)
 				continue
 			}
 		} else {
@@ -155,4 +116,58 @@ func (c *whisperClient) Transcribe(ctx context.Context, req *TranscriptionReques
 
 	slog.Debug("transcription completed successfully", "length", len(transcriptionResp.Text))
 	return &transcriptionResp, nil
+}
+
+func (c *whisperClient) buildRequest(ctx context.Context, url string, req *TranscriptionRequest, model string) (*http.Request, string, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	fileWriter, err := writer.CreateFormFile("file", req.Filename)
+	if err != nil {
+		slog.Error("failed to create form file", "err", err)
+		return nil, "", fmt.Errorf("failed to create form file: %w", err)
+	}
+
+	if _, err := fileWriter.Write(req.AudioData); err != nil {
+		slog.Error("failed to write audio data", "err", err)
+		return nil, "", fmt.Errorf("failed to write audio data: %w", err)
+	}
+
+	if err := writer.WriteField("model", model); err != nil {
+		return nil, "", fmt.Errorf("failed to write model field: %w", err)
+	}
+
+	if req.Language != "" {
+		if err := writer.WriteField("language", req.Language); err != nil {
+			return nil, "", fmt.Errorf("failed to write language field: %w", err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", fmt.Errorf("failed to close multipart writer: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, body)
+	if err != nil {
+		slog.Error("failed to create http request", "err", err)
+		return nil, "", fmt.Errorf("failed to create HTTP request: %w", err)
+	}
+
+	return httpReq, writer.FormDataContentType(), nil
+}
+
+func normalizeEndpoint(endpoint string) string {
+	if strings.HasSuffix(endpoint, "/transcriptions") {
+		return endpoint
+	}
+	if strings.HasSuffix(endpoint, "/v1/audio/transcriptions") {
+		return endpoint
+	}
+	if strings.HasSuffix(endpoint, "/v1/audio") {
+		return endpoint + "/transcriptions"
+	}
+	if strings.HasSuffix(endpoint, "/v1") {
+		return endpoint + "/audio/transcriptions"
+	}
+	return endpoint + "/v1/audio/transcriptions"
 }

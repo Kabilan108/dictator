@@ -11,7 +11,11 @@ import (
 	"github.com/google/uuid"
 )
 
-// client represents an ipc client for communicating with the daemon
+const (
+	ClientTimeout     = 10 * time.Second
+	ConnectionTimeout = 2 * time.Second
+)
+
 type Client struct {
 	socketPath string
 	timeout    time.Duration
@@ -20,7 +24,7 @@ type Client struct {
 func NewClient() *Client {
 	return &Client{
 		socketPath: SocketPath,
-		timeout:    10 * time.Second,
+		timeout:    ClientTimeout,
 	}
 }
 
@@ -115,8 +119,7 @@ func (c *Client) Status(ctx context.Context) (*Response, error) {
 }
 
 func (c *Client) IsConnected(ctx context.Context) bool {
-	// Create a short timeout context for the connection test
-	testCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	testCtx, cancel := context.WithTimeout(ctx, ConnectionTimeout)
 	defer cancel()
 
 	conn, err := c.connect(testCtx)

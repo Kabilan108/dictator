@@ -18,6 +18,11 @@ import (
 	"github.com/kabilan108/dictator/internal/utils"
 )
 
+const (
+	NotificationUpdateInterval = 1 * time.Second
+	ErrorDisplayDuration       = 5 * time.Second
+)
+
 type Daemon struct {
 	config      *utils.Config
 	recorder    *audio.Recorder
@@ -284,72 +289,24 @@ func (d *Daemon) GetStatus() ipc.StatusData {
 func (d *Daemon) transcribeAndType() {
 	recordingDuration := d.recorder.GetRecordingDuration()
 
-	audioData, audioPath, err := d.recorder.Stop()
+	audioData, audioPath, err := d.saveRecording()
 	if err != nil {
-		slog.Error("failed to stop recording", "err", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrRecordingFailed, err))
 		return
-	}
-
-	audioFile, err := audio.WriteAudioData(audioPath, audioData)
-	if err != nil {
-		slog.Error("failed to write audio file", "err", err)
-		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrRecordingFailed, err))
-		return
-	}
-	defer audioFile.Close()
-
-	slog.Info("audio saved", "filepath", audioPath)
-
-	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
-	req := audio.TranscriptionRequest{
-		AudioData: audioData,
-		Filename:  audioFile.Name(),
-		Model:     activeProvider.Model,
 	}
 
 	d.mu.RLock()
 	ctx := d.operationCtx
 	d.mu.RUnlock()
 
-	resp, err := d.transcriber.Transcribe(ctx, &req)
+	text, err := d.transcribe(ctx, audioData, audioPath)
 	if err != nil {
-		slog.Error("transcription failed", "err", err)
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTranscriptionFailed, err))
 		return
 	}
 
-	slog.Info("transcription complete")
-
-	d.mu.Lock()
-	d.state = ipc.StateTyping
-	d.mu.Unlock()
-
-	if err := d.notifier.UpdateState(d.state); err != nil {
-		slog.Warn("failed to update notification", "err", err)
-	}
-
-	if err := d.typer.Type(ctx, resp.Text); err != nil {
-		if ctx.Err() != nil {
-			slog.Debug("typing cancelled")
-			d.mu.Lock()
-			d.state = ipc.StateIdle
-			d.lastError = nil
-			d.mu.Unlock()
-		} else {
-			slog.Error("typing failed", "err", err)
-			d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
-			return
-		}
-	}
-
-	slog.Info("typing complete")
-
-	durationMs := int(recordingDuration.Milliseconds())
-	if err := d.db.SaveTranscript(durationMs, resp.Text, audioPath, activeProvider.Model); err != nil {
-		slog.Warn("failed to save transcript to database", "err", err)
-	} else {
-		slog.Debug("transcript saved to database")
+	if err := d.typeAndSave(ctx, text, recordingDuration, audioPath); err != nil {
+		return
 	}
 
 	d.mu.Lock()
@@ -362,9 +319,81 @@ func (d *Daemon) transcribeAndType() {
 	}
 }
 
+func (d *Daemon) saveRecording() ([]byte, string, error) {
+	audioData, audioPath, err := d.recorder.Stop()
+	if err != nil {
+		slog.Error("failed to stop recording", "err", err)
+		return nil, "", err
+	}
+
+	audioFile, err := audio.WriteAudioData(audioPath, audioData)
+	if err != nil {
+		slog.Error("failed to write audio file", "err", err)
+		return nil, "", err
+	}
+	audioFile.Close()
+
+	slog.Info("audio saved", "filepath", audioPath)
+	return audioData, audioPath, nil
+}
+
+func (d *Daemon) transcribe(ctx context.Context, audioData []byte, audioPath string) (string, error) {
+	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
+	req := audio.TranscriptionRequest{
+		AudioData: audioData,
+		Filename:  audioPath,
+		Model:     activeProvider.Model,
+	}
+
+	resp, err := d.transcriber.Transcribe(ctx, &req)
+	if err != nil {
+		slog.Error("transcription failed", "err", err)
+		return "", err
+	}
+
+	slog.Info("transcription complete")
+	return resp.Text, nil
+}
+
+func (d *Daemon) typeAndSave(ctx context.Context, text string, duration time.Duration, audioPath string) error {
+	d.mu.Lock()
+	d.state = ipc.StateTyping
+	d.mu.Unlock()
+
+	if err := d.notifier.UpdateState(d.state); err != nil {
+		slog.Warn("failed to update notification", "err", err)
+	}
+
+	if err := d.typer.Type(ctx, text); err != nil {
+		if ctx.Err() != nil {
+			slog.Debug("typing cancelled")
+			d.mu.Lock()
+			d.state = ipc.StateIdle
+			d.lastError = nil
+			d.mu.Unlock()
+			return nil
+		}
+		slog.Error("typing failed", "err", err)
+		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTypingFailed, err))
+		return err
+	}
+
+	slog.Info("typing complete")
+
+	activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
+	durationMs := int(duration.Milliseconds())
+	if err := d.db.SaveTranscript(durationMs, text, audioPath, activeProvider.Model); err != nil {
+		slog.Warn("failed to save transcript to database", "err", err)
+	} else {
+		slog.Debug("transcript saved to database")
+	}
+
+	return nil
+}
+
 func (d *Daemon) startNotificationTimer() {
 	d.stopNotificationTimer()
-	d.notificationTimer = time.AfterFunc(1*time.Second, func() {
+	d.notificationTimer = time.AfterFunc(NotificationUpdateInterval, func() {
 		d.updateRecordingNotification()
 	})
 }
@@ -390,7 +419,7 @@ func (d *Daemon) updateRecordingNotification() {
 		// Schedule next update
 		d.mu.Lock()
 		if d.state == ipc.StateRecording {
-			d.notificationTimer = time.AfterFunc(1*time.Second, func() {
+			d.notificationTimer = time.AfterFunc(NotificationUpdateInterval, func() {
 				d.updateRecordingNotification()
 			})
 		}
@@ -412,7 +441,7 @@ func (d *Daemon) handleError(errorMsg string) {
 	}
 
 	// auto-return to idle after error display
-	time.AfterFunc(5*time.Second, func() {
+	time.AfterFunc(ErrorDisplayDuration, func() {
 		d.mu.Lock()
 		d.state = ipc.StateIdle
 		d.mu.Unlock()

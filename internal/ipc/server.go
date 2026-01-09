@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const ServerConnectionDeadline = 30 * time.Second
+
 // CommandHandler defines the interface for handling daemon commands
 type CommandHandler interface {
 	HandleStart() error
@@ -136,7 +138,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	}()
 
 	// set connection timeout
-	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(ServerConnectionDeadline)); err != nil {
 		slog.Warn("failed to set connection deadline", "err", err)
 	}
 

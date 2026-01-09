@@ -24,6 +24,19 @@ var (
 	version  = "dev"
 )
 
+func runCommand(action string, successMsg string) {
+	client := ipc.NewClient()
+	response, err := client.SendCommand(context.Background(), action)
+	utils.ExitIfError(daemon.NotRunning(err), 1)
+
+	if response.Success {
+		fmt.Println(successMsg)
+	} else {
+		fmt.Fprintf(os.Stderr, "%s command failed: %s\n", action, response.Error)
+		os.Exit(1)
+	}
+}
+
 var rootCmd = &cobra.Command{
 	Use:   "dictator",
 	Short: "whisper typing daemon for linux",
@@ -41,6 +54,8 @@ var daemonCmd = &cobra.Command{
 	Short: "run the dictator daemon",
 	Long:  `starts the dictator daemon in the foreground, listening for voice commands via ipc`,
 	Run: func(cmd *cobra.Command, args []string) {
+		utils.ExitIfError(utils.EnsureDirectories(), 1)
+
 		c, err := utils.GetConfig()
 		utils.ExitIfError(err, 1)
 
@@ -57,18 +72,7 @@ var startCmd = &cobra.Command{
 	Short: "start voice recording",
 	Long:  `tells the daemon to start recording voice input`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient()
-		ctx := context.Background()
-
-		response, err := client.Start(ctx)
-		utils.ExitIfError(daemon.NotRunning(err), 1)
-
-		if response.Success {
-			fmt.Println("Recording started")
-		} else {
-			fmt.Fprintf(os.Stderr, "start command failed: %s\n", response.Error)
-			os.Exit(1)
-		}
+		runCommand(ipc.ActionStart, "Recording started")
 	},
 }
 
@@ -77,18 +81,7 @@ var stopCmd = &cobra.Command{
 	Short: "stop voice recording and transcribe",
 	Long:  `tells the daemon to stop recording and start transcription`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient()
-		ctx := context.Background()
-
-		response, err := client.Stop(ctx)
-		utils.ExitIfError(daemon.NotRunning(err), 1)
-
-		if response.Success {
-			fmt.Println("Recording stopped, transcribing")
-		} else {
-			fmt.Fprintf(os.Stderr, "stop command failed: %s\n", response.Error)
-			os.Exit(1)
-		}
+		runCommand(ipc.ActionStop, "Recording stopped, transcribing")
 	},
 }
 
@@ -97,18 +90,7 @@ var toggleCmd = &cobra.Command{
 	Short: "toggle voice recording",
 	Long:  `toggles between starting and stopping voice recording`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient()
-		ctx := context.Background()
-
-		response, err := client.Toggle(ctx)
-		utils.ExitIfError(daemon.NotRunning(err), 1)
-
-		if response.Success {
-			fmt.Fprintf(os.Stderr, "toggled daemon")
-		} else {
-			fmt.Fprintf(os.Stderr, "toggle command failed: %s\n", response.Error)
-			os.Exit(1)
-		}
+		runCommand(ipc.ActionToggle, "toggled daemon")
 	},
 }
 
@@ -117,18 +99,7 @@ var cancelCmd = &cobra.Command{
 	Short: "cancel current operation",
 	Long:  `cancels any current recording or transcription operation`,
 	Run: func(cmd *cobra.Command, args []string) {
-		client := ipc.NewClient()
-		ctx := context.Background()
-
-		response, err := client.Cancel(ctx)
-		utils.ExitIfError(daemon.NotRunning(err), 1)
-
-		if response.Success {
-			fmt.Println("operation canceled")
-		} else {
-			fmt.Fprintf(os.Stderr, "cancel command failed: %s", response.Error)
-			os.Exit(1)
-		}
+		runCommand(ipc.ActionCancel, "operation canceled")
 	},
 }
 
@@ -155,7 +126,7 @@ var statusCmd = &cobra.Command{
 				fmt.Printf("  last error: %s\n", lastError)
 			}
 		} else {
-			fmt.Fprintf(os.Stderr, "status command failed: %s", response.Error)
+			fmt.Fprintf(os.Stderr, "status command failed: %s\n", response.Error)
 			os.Exit(1)
 		}
 	},

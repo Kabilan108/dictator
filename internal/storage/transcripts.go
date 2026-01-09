@@ -16,23 +16,10 @@ type Transcript struct {
 }
 
 func (db *DB) SaveTranscript(durationMs int, text, audioPath, model string) error {
-	query := `
-INSERT INTO transcripts (duration_ms, text, audio_path, model)
-VALUES (?, ?, ?, ?)
-`
+	query := `INSERT INTO transcripts (duration_ms, text, audio_path, model) VALUES (?, ?, ?, ?)`
 
-	tx, err := db.conn.Begin()
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.Exec(query, durationMs, text, audioPath, model); err != nil {
+	if _, err := db.conn.Exec(query, durationMs, text, audioPath, model); err != nil {
 		return fmt.Errorf("failed to save transcript: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
 	return nil

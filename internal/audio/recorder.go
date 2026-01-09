@@ -34,8 +34,7 @@ type Recorder struct {
 	audioData []byte
 	startTime time.Time
 
-	doneChan  chan struct{}
-	errorChan chan error
+	doneChan chan struct{}
 
 	durationTimer *time.Timer
 
@@ -49,7 +48,6 @@ func NewRecorder(c utils.AudioConfig) (*Recorder, error) {
 		buffer:        make([]float32, 0),
 		audioData:     make([]byte, 0),
 		doneChan:      make(chan struct{}),
-		errorChan:     make(chan error, 1),
 		isInitialized: false,
 	}
 
@@ -70,25 +68,13 @@ func (r *Recorder) Close() error {
 
 	if r.state == StateRecording {
 		slog.Warn("recorder still active during close, stopping recording")
-		_, err := r.stopRecordingUnsafe()
-		if err != nil {
+		if _, err := r.stopRecordingUnsafe(); err != nil {
 			slog.Error("error stopping recording during close", "err", err)
 			lastErr = err
 		}
 	}
 
-	if r.durationTimer != nil {
-		r.durationTimer.Stop()
-		r.durationTimer = nil
-	}
-
 	if r.isInitialized {
-		if r.state == StateRecording {
-			if _, err := r.stopRecordingUnsafe(); err != nil {
-				slog.Error("failed to stop recording before termination", "err", err)
-				lastErr = err
-			}
-		}
 		if err := portaudio.Terminate(); err != nil {
 			slog.Error("failed to terminate PortAudio", "err", err)
 			lastErr = err
@@ -96,7 +82,6 @@ func (r *Recorder) Close() error {
 		r.isInitialized = false
 	}
 
-	// close channels safely
 	select {
 	case <-r.doneChan:
 	default:
@@ -201,24 +186,8 @@ func (r *Recorder) Start() error {
 }
 
 func (r *Recorder) Stop() ([]byte, string, error) {
-	r.mu.Lock()
-	if r.stream != nil {
-		r.state = StateStopped
-	}
-	r.mu.Unlock()
-
-	if r.stream == nil {
-		return nil, "", fmt.Errorf("recorder is not recording")
-	}
-
-	r.wg.Wait()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	data, err := r.stopRecordingUnsafe()
+	data, err := r.stopAndWait()
 	if err != nil {
-		slog.Error("error stopping recording", "err", err)
 		return nil, "", err
 	}
 
@@ -234,6 +203,25 @@ func (r *Recorder) Stop() ([]byte, string, error) {
 
 	slog.Info("recording stopped", "bytes_captured", len(data))
 	return wavData, rp, nil
+}
+
+func (r *Recorder) stopAndWait() ([]byte, error) {
+	r.mu.Lock()
+	if r.stream != nil {
+		r.state = StateStopped
+	}
+	r.mu.Unlock()
+
+	if r.stream == nil {
+		return nil, fmt.Errorf("recorder is not recording")
+	}
+
+	r.wg.Wait()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.stopRecordingUnsafe()
 }
 
 // stopRecordingUnsafe stops recording without acquiring the mutex (internal use)
@@ -375,35 +363,13 @@ func WriteAudioData(filePath string, audioData []byte) (*os.File, error) {
 }
 
 func (r *Recorder) stopRecordingDueToTimeout() {
-	r.mu.Lock()
-	if r.stream != nil {
-		r.state = StateStopped
-	}
-	r.mu.Unlock()
-
-	if r.stream == nil {
-		return
-	}
-
 	slog.Warn("recording stopped due to timeout", "max_duration_min", r.config.MaxDurationMin)
 
-	r.wg.Wait()
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	data, err := r.stopRecordingUnsafe()
+	data, err := r.stopAndWait()
 	if err != nil {
 		slog.Error("error during timeout stop", "err", err)
 	} else {
 		slog.Info("timeout stop completed", "bytes_captured", len(data))
-	}
-
-	timeoutErr := fmt.Errorf("recording stopped: maximum duration of %v min exceeded", r.config.MaxDurationMin)
-	select {
-	case r.errorChan <- timeoutErr:
-	default:
-		slog.Warn("error channel full, timeout error not sent")
 	}
 }
 

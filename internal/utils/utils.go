@@ -52,26 +52,22 @@ func (h *MultiHandler) WithGroup(name string) slog.Handler {
 	}
 }
 
-type Logger struct {
-	logFile *os.File
-}
-
-var LevelMap = map[string]slog.Level{
+var levelMap = map[string]slog.Level{
 	"DEBUG": slog.LevelDebug,
 	"INFO":  slog.LevelInfo,
 	"WARN":  slog.LevelWarn,
 	"ERROR": slog.LevelError,
 }
 
-func SetupLogger(level string) *Logger {
-	logLevel, exists := LevelMap[level]
+func SetupLogger(level string) {
+	logLevel, exists := levelMap[level]
 	if !exists {
 		fmt.Fprintf(os.Stderr, "invalid log level: %s\n", level)
 		os.Exit(1)
 	}
 
 	logFile, err := os.OpenFile(
-		filepath.Join(STATE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o666,
+		filepath.Join(STATE_DIR, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644,
 	)
 
 	var logHandler slog.Handler
@@ -85,13 +81,6 @@ func SetupLogger(level string) *Logger {
 	}
 
 	slog.SetDefault(slog.New(logHandler))
-	return &Logger{logFile}
-}
-
-func (l *Logger) Close() {
-	if l.logFile != nil {
-		l.logFile.Close()
-	}
 }
 
 // files
