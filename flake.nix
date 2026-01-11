@@ -82,17 +82,45 @@
           waylandPackages = with pkgs; [
             wl-clipboard
             wtype
+            ydotool
+          ];
+          overlayPackages = with pkgs; [
+            # Python overlay dependencies
+            cairo
+            gobject-introspection
+            gtk4
+            gtk4-layer-shell
+            glib
+            pango
+            gdk-pixbuf
+            # Python build tools
+            python312
+            python312Packages.pygobject3
           ];
         in
         {
           default = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
+            buildInputs = commonPackages ++ waylandPackages ++ overlayPackages;
+            shellHook = ''
+              export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 pkgs.gtk4-layer-shell ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"
+            '';
           };
           wayland = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
+            buildInputs = commonPackages ++ waylandPackages ++ overlayPackages;
+            shellHook = ''
+              export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 pkgs.gtk4-layer-shell ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"
+            '';
           };
           x11 = pkgs.mkShell {
-            buildInputs = commonPackages ++ x11Packages;
+            buildInputs = commonPackages ++ x11Packages ++ overlayPackages;
+            shellHook = ''
+              export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+              export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+            '';
           };
         }
       );
