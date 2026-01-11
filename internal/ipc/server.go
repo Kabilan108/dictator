@@ -19,6 +19,7 @@ type CommandHandler interface {
 	HandleStop() error
 	HandleToggle() error
 	HandleCancel() error
+	HandleStream() error
 	GetStatus() StatusData
 }
 
@@ -207,6 +208,13 @@ func (s *Server) processCommand(cmd *Command) *Response {
 		}
 		if status.LastError != nil {
 			response.Data[DataKeyLastError] = *status.LastError
+		}
+
+	case ActionStream:
+		err = s.handler.HandleStream()
+		if err == nil {
+			response.Success = true
+			response.Data[DataKeyState] = StateStreaming.String()
 		}
 
 	default:

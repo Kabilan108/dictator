@@ -14,6 +14,7 @@ import (
 	"github.com/kabilan108/dictator/internal/ipc"
 	"github.com/kabilan108/dictator/internal/notifier"
 	"github.com/kabilan108/dictator/internal/storage"
+	"github.com/kabilan108/dictator/internal/streaming"
 	"github.com/kabilan108/dictator/internal/typing"
 	"github.com/kabilan108/dictator/internal/utils"
 )
@@ -42,6 +43,8 @@ type Daemon struct {
 	operationCancel context.CancelFunc
 
 	notificationTimer *time.Timer
+
+	streamHandler *streaming.Handler
 }
 
 func NewDaemon(cfg *utils.Config) (*Daemon, error) {
@@ -224,13 +227,20 @@ func (d *Daemon) HandleStop() error {
 func (d *Daemon) HandleToggle() error {
 	d.mu.RLock()
 	currentState := d.state
+	mode := d.config.Mode
 	d.mu.RUnlock()
 
 	switch currentState {
 	case ipc.StateIdle:
+		if mode == "streaming" {
+			return d.HandleStream()
+		}
 		return d.HandleStart()
 	case ipc.StateRecording:
 		return d.HandleStop()
+	case ipc.StateStreaming:
+		_, err := d.HandleStreamStop()
+		return err
 	default:
 		return fmt.Errorf("cannot toggle in current state: %s", currentState.String())
 	}
@@ -263,6 +273,91 @@ func (d *Daemon) HandleCancel() error {
 
 	slog.Info("operation canceled")
 	return nil
+}
+
+func (d *Daemon) HandleStream() error {
+	d.mu.Lock()
+	if d.state != ipc.StateIdle {
+		d.mu.Unlock()
+		return fmt.Errorf("cannot start streaming: not idle (state=%s)", d.state.String())
+	}
+
+	cfg := d.config.Streaming
+	provider := d.config.API.Providers[d.config.API.ActiveProvider]
+	d.mu.Unlock()
+
+	client := streaming.NewClient(cfg.Endpoint, provider.Key, cfg.ChunkFrames)
+
+	typer, ok := d.typer.(typing.StreamingTyper)
+	if !ok {
+		return fmt.Errorf("typer does not support streaming")
+	}
+
+	overlayMode := cfg.Output == "overlay"
+	handler := streaming.NewHandler(client, typer, overlayMode)
+	handler.SetStateCallback(func(state string) {
+		switch state {
+		case "streaming":
+			d.setState(ipc.StateStreaming)
+		case "idle":
+			d.setState(ipc.StateIdle)
+		case "error":
+			d.handleError("streaming error")
+		}
+	})
+
+	d.mu.Lock()
+	d.streamHandler = handler
+	d.operationCtx, d.operationCancel = context.WithCancel(context.Background())
+	d.mu.Unlock()
+
+	if err := handler.Start(d.operationCtx); err != nil {
+		return err
+	}
+
+	if err := d.recorder.StartStreaming(d.operationCtx, func(pcmData []byte) {
+		handler.SendAudio(pcmData)
+	}); err != nil {
+		handler.Cancel()
+		return err
+	}
+
+	slog.Info("streaming started")
+	return nil
+}
+
+func (d *Daemon) HandleStreamStop() (string, error) {
+	d.mu.Lock()
+	handler := d.streamHandler
+	d.mu.Unlock()
+
+	if handler == nil {
+		return "", fmt.Errorf("no active streaming session")
+	}
+
+	d.recorder.Stop()
+
+	text, err := handler.Stop(context.Background())
+	if err != nil {
+		return "", err
+	}
+
+	d.mu.Lock()
+	d.streamHandler = nil
+	d.mu.Unlock()
+
+	slog.Info("streaming stopped", "text_length", len(text))
+	return text, nil
+}
+
+func (d *Daemon) setState(state ipc.DaemonState) {
+	d.mu.Lock()
+	d.state = state
+	d.mu.Unlock()
+
+	if err := d.notifier.UpdateState(state); err != nil {
+		slog.Warn("failed to update notification", "err", err)
+	}
 }
 
 func (d *Daemon) GetStatus() ipc.StatusData {

@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"log/slog"
@@ -383,4 +384,110 @@ func (r *Recorder) HasTimedOut() bool {
 	}
 
 	return time.Since(r.startTime) >= time.Duration(r.config.MaxDurationMin)*time.Minute
+}
+
+type AudioCallback func(pcmData []byte)
+
+func (r *Recorder) StartStreaming(ctx context.Context, callback AudioCallback) error {
+	r.mu.Lock()
+	if !r.isInitialized {
+		r.mu.Unlock()
+		return fmt.Errorf("audio recorder not initialized")
+	}
+	if r.state == StateRecording {
+		r.mu.Unlock()
+		return fmt.Errorf("recorder is already recording")
+	}
+
+	r.buffer = make([]float32, 0)
+	r.audioData = make([]byte, 0)
+	r.startTime = time.Now()
+
+	r.durationTimer = time.AfterFunc(
+		time.Duration(r.config.MaxDurationMin)*time.Minute,
+		func() {
+			r.stopRecordingDueToTimeout()
+		},
+	)
+
+	framesPerBuffer := make([]float32, r.config.FramesPerBlock)
+
+	stream, err := portaudio.OpenDefaultStream(
+		1,
+		0,
+		float64(r.config.SampleRate),
+		r.config.FramesPerBlock,
+		framesPerBuffer,
+	)
+	if err != nil {
+		if r.durationTimer != nil {
+			r.durationTimer.Stop()
+			r.durationTimer = nil
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("failed to open audio stream: %w", err)
+	}
+
+	if err := stream.Start(); err != nil {
+		stream.Close()
+		if r.durationTimer != nil {
+			r.durationTimer.Stop()
+			r.durationTimer = nil
+		}
+		r.mu.Unlock()
+		return fmt.Errorf("failed to start audio stream: %w", err)
+	}
+
+	r.stream = stream
+	r.state = StateRecording
+	r.mu.Unlock()
+
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			if !r.IsRecording() {
+				return
+			}
+
+			if err := r.stream.Read(); err != nil {
+				if !r.IsRecording() {
+					break
+				}
+				continue
+			}
+
+			pcmData := floatToPCM(framesPerBuffer)
+
+			r.mu.Lock()
+			r.buffer = append(r.buffer, framesPerBuffer...)
+			r.mu.Unlock()
+
+			callback(pcmData)
+		}
+	}()
+
+	slog.Info("streaming recording started", "max_duration_min", r.config.MaxDurationMin)
+	return nil
+}
+
+func floatToPCM(samples []float32) []byte {
+	buf := make([]byte, len(samples)*2)
+	for i, sample := range samples {
+		if sample > 1.0 {
+			sample = 1.0
+		} else if sample < -1.0 {
+			sample = -1.0
+		}
+		int16Val := int16(sample * 32767)
+		buf[i*2] = byte(int16Val)
+		buf[i*2+1] = byte(int16Val >> 8)
+	}
+	return buf
 }

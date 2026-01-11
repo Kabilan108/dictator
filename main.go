@@ -103,6 +103,15 @@ var cancelCmd = &cobra.Command{
 	},
 }
 
+var streamCmd = &cobra.Command{
+	Use:   "stream",
+	Short: "start streaming transcription",
+	Long:  `starts real-time streaming transcription (alternative to start/stop)`,
+	Run: func(cmd *cobra.Command, args []string) {
+		runCommand(ipc.ActionStream, "streaming started")
+	},
+}
+
 var statusCmd = &cobra.Command{
 	Use:   "status",
 	Short: "get daemon status",
@@ -234,6 +243,7 @@ func init() {
 	rootCmd.AddCommand(toggleCmd)
 	rootCmd.AddCommand(cancelCmd)
 	rootCmd.AddCommand(statusCmd)
+	rootCmd.AddCommand(streamCmd)
 	rootCmd.AddCommand(versionCmd)
 	rootCmd.AddCommand(initCmd)
 

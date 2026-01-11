@@ -43,9 +43,17 @@ var CONFIG_DIR = func() string {
 	return filepath.Join(dir, "dictator")
 }()
 
+type StreamingConfig struct {
+	Endpoint    string `json:"endpoint" mapstructure:"endpoint"`
+	ChunkFrames int    `json:"chunk_frames" mapstructure:"chunk_frames"`
+	Output      string `json:"output" mapstructure:"output"`
+}
+
 type Config struct {
-	API   APIConfig   `json:"api" mapstructure:"api"`
-	Audio AudioConfig `json:"audio" mapstructure:"audio"`
+	API       APIConfig       `json:"api" mapstructure:"api"`
+	Audio     AudioConfig     `json:"audio" mapstructure:"audio"`
+	Mode      string          `json:"mode" mapstructure:"mode"`
+	Streaming StreamingConfig `json:"streaming" mapstructure:"streaming"`
 }
 
 type Provider struct {
@@ -90,6 +98,12 @@ func DefaultConfig() *Config {
 			FramesPerBlock: 1024,
 			MaxDurationMin: 5,
 		},
+		Mode: "batch",
+		Streaming: StreamingConfig{
+			Endpoint:    "ws://localhost:8000/ws/transcribe",
+			ChunkFrames: 7,
+			Output:      "direct",
+		},
 	}
 }
 
@@ -127,6 +141,22 @@ func Validate(config *Config) error {
 	}
 	if config.Audio.MaxDurationMin <= 0 {
 		return fmt.Errorf("audio max duration min must be positive")
+	}
+
+	if config.Mode != "streaming" && config.Mode != "batch" {
+		return fmt.Errorf("mode must be 'streaming' or 'batch', got: %s", config.Mode)
+	}
+
+	if config.Mode == "streaming" {
+		if config.Streaming.Endpoint == "" {
+			return fmt.Errorf("streaming endpoint is required")
+		}
+		if config.Streaming.ChunkFrames < 1 || config.Streaming.ChunkFrames > 20 {
+			return fmt.Errorf("chunk_frames must be between 1 and 20")
+		}
+		if config.Streaming.Output != "direct" && config.Streaming.Output != "overlay" {
+			return fmt.Errorf("streaming output must be 'direct' or 'overlay'")
+		}
 	}
 
 	return nil

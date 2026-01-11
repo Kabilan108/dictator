@@ -14,6 +14,12 @@ type Typer interface {
 	IsAvailable() bool
 }
 
+type StreamingTyper interface {
+	Typer
+	TypeIncremental(ctx context.Context, newChars string) error
+	Backspace(ctx context.Context, count int) error
+}
+
 // detects if the current session is running Wayland
 func isWayland() bool {
 	if sessionType := os.Getenv("XDG_SESSION_TYPE"); sessionType == "wayland" {
@@ -28,12 +34,12 @@ func isWayland() bool {
 // creates a Typer implementation based on the current display server
 func New() (Typer, error) {
 	if isWayland() {
-		typer := &WaylandTyper{}
-		if typer.IsAvailable() {
+		wtype := &WaylandTyper{}
+		if wtype.IsAvailable() {
 			slog.Debug("using wtype for text input (wayland)")
-			return typer, nil
+			return wtype, nil
 		}
-		return nil, fmt.Errorf("wayland detected but wtype not available")
+		return nil, fmt.Errorf("wayland detected but wtype not available (install wtype and wl-copy)")
 	}
 
 	typer := &X11Typer{}
@@ -106,4 +112,84 @@ func (w *WaylandTyper) Type(ctx context.Context, text string) error {
 		[]string{"wl-copy"},
 		[]string{"wtype", "-M", "ctrl", "-M", "shift", "-k", "v", "-m", "ctrl", "-m", "shift"},
 	)
+}
+
+func (w *WaylandTyper) TypeIncremental(ctx context.Context, newChars string) error {
+	return w.Type(ctx, newChars)
+}
+
+func (w *WaylandTyper) Backspace(ctx context.Context, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	for i := 0; i < count; i++ {
+		cmd := exec.CommandContext(ctx, "wtype", "-k", "BackSpace")
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("wtype backspace failed: %w", err)
+		}
+	}
+	return nil
+}
+
+type YdotoolTyper struct{}
+
+func (y *YdotoolTyper) IsAvailable() bool { return areInstalled("ydotool") }
+
+func (y *YdotoolTyper) Type(ctx context.Context, text string) error {
+	if text == "" {
+		return nil
+	}
+	cmd := exec.CommandContext(ctx, "ydotool", "type", "--", text)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("ydotool type failed: %w", err)
+	}
+	return nil
+}
+
+func (y *YdotoolTyper) TypeIncremental(ctx context.Context, newChars string) error {
+	return y.Type(ctx, newChars)
+}
+
+func (y *YdotoolTyper) Backspace(ctx context.Context, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	for i := 0; i < count; i++ {
+		cmd := exec.CommandContext(ctx, "ydotool", "key", "14:1", "14:0")
+		if err := cmd.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("ydotool backspace failed: %w", err)
+		}
+	}
+	return nil
+}
+
+func (x *X11Typer) TypeIncremental(ctx context.Context, newChars string) error {
+	return x.Type(ctx, newChars)
+}
+
+func (x *X11Typer) Backspace(ctx context.Context, count int) error {
+	if count <= 0 {
+		return nil
+	}
+	keys := make([]string, count)
+	for i := range keys {
+		keys[i] = "BackSpace"
+	}
+	cmd := exec.CommandContext(ctx, "xdotool", append([]string{"key", "--clearmodifiers"}, keys...)...)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("xdotool backspace failed: %w", err)
+	}
+	return nil
 }

@@ -28,6 +28,7 @@ const (
 	StateTranscribing
 	StateTyping
 	StateError
+	StateStreaming
 )
 
 func (s DaemonState) String() string {
@@ -42,6 +43,8 @@ func (s DaemonState) String() string {
 		return "typing"
 	case StateError:
 		return "error"
+	case StateStreaming:
+		return "streaming"
 	default:
 		return "unknown"
 	}
@@ -62,6 +65,7 @@ const (
 	ActionToggle = "toggle"
 	ActionCancel = "cancel"
 	ActionStatus = "status"
+	ActionStream = "stream"
 )
 
 // Socket configuration
