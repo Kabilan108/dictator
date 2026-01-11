@@ -102,7 +102,7 @@ func DefaultConfig() *Config {
 		Streaming: StreamingConfig{
 			Endpoint:    "ws://localhost:8000/ws/transcribe",
 			ChunkFrames: 7,
-			Output:      "direct",
+			Output:      "overlay",
 		},
 	}
 }

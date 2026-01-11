@@ -335,8 +335,16 @@ func (d *Daemon) HandleStreamStop() (string, error) {
 		return "", fmt.Errorf("no active streaming session")
 	}
 
-	d.recorder.Stop()
+	// Get recording duration before stopping
+	recordingDuration := d.recorder.GetRecordingDuration()
 
+	// Stop recording and get audio data
+	audioData, audioPath, err := d.recorder.Stop()
+	if err != nil {
+		slog.Warn("failed to stop recorder", "err", err)
+	}
+
+	// Stop the streaming handler and get final text
 	text, err := handler.Stop(context.Background())
 	if err != nil {
 		return "", err
@@ -345,6 +353,27 @@ func (d *Daemon) HandleStreamStop() (string, error) {
 	d.mu.Lock()
 	d.streamHandler = nil
 	d.mu.Unlock()
+
+	// Save audio file if we have data
+	if len(audioData) > 0 && audioPath != "" {
+		if audioFile, err := audio.WriteAudioData(audioPath, audioData); err != nil {
+			slog.Warn("failed to save audio file", "err", err)
+		} else {
+			audioFile.Close()
+			slog.Info("streaming audio saved", "filepath", audioPath)
+		}
+	}
+
+	// Save transcript to database
+	if text != "" {
+		activeProvider := d.config.API.Providers[d.config.API.ActiveProvider]
+		durationMs := int(recordingDuration.Milliseconds())
+		if err := d.db.SaveTranscript(durationMs, text, audioPath, activeProvider.Model); err != nil {
+			slog.Warn("failed to save streaming transcript to database", "err", err)
+		} else {
+			slog.Debug("streaming transcript saved to database")
+		}
+	}
 
 	slog.Info("streaming stopped", "text_length", len(text))
 	return text, nil

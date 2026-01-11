@@ -105,6 +105,9 @@
               export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
               export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 pkgs.gtk4-layer-shell ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"
+              if [ -f "$PWD/overlay/.venv/bin/activate" ]; then
+                source "$PWD/overlay/.venv/bin/activate"
+              fi
             '';
           };
           wayland = pkgs.mkShell {
@@ -113,6 +116,9 @@
               export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.gtk4-layer-shell}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
               export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 pkgs.gtk4-layer-shell ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
               export LD_PRELOAD="${pkgs.gtk4-layer-shell}/lib/libgtk4-layer-shell.so''${LD_PRELOAD:+:$LD_PRELOAD}"
+              if [ -f "$PWD/.venv/bin/activate" ]; then
+                source "$PWD/.venv/bin/activate"
+              fi
             '';
           };
           x11 = pkgs.mkShell {
@@ -120,6 +126,9 @@
             shellHook = ''
               export GI_TYPELIB_PATH="${pkgs.gtk4}/lib/girepository-1.0:${pkgs.glib}/lib/girepository-1.0:${pkgs.pango}/lib/girepository-1.0:${pkgs.gdk-pixbuf}/lib/girepository-1.0''${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
               export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.cairo pkgs.glib pkgs.gtk4 ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+              if [ -f "$PWD/.venv/bin/activate" ]; then
+                source "$PWD/.venv/bin/activate"
+              fi
             '';
           };
         }

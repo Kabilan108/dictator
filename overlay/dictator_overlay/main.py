@@ -114,28 +114,61 @@ class DictatorOverlay(Gtk.Application):
             return
 
         try:
-            result = subprocess.run(
+            # Get active window info
+            win_result = subprocess.run(
                 ["hyprctl", "activewindow", "-j"],
                 capture_output=True,
                 text=True,
                 timeout=1,
                 check=False,
             )
-            if result.returncode == 0 and result.stdout:
-                data = json.loads(result.stdout)
-                x = data.get("at", [0, 0])[0]
-                y = data.get("at", [0, 0])[1]
-                h = data.get("size", [0, 0])[1]
+            # Get monitor info for the active window
+            mon_result = subprocess.run(
+                ["hyprctl", "monitors", "-j"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+                check=False,
+            )
 
-                Gtk4LayerShell.set_anchor(
-                    self.window, Gtk4LayerShell.Edge.BOTTOM, False
-                )
-                Gtk4LayerShell.set_anchor(self.window, Gtk4LayerShell.Edge.TOP, True)
-                Gtk4LayerShell.set_anchor(self.window, Gtk4LayerShell.Edge.LEFT, True)
-                Gtk4LayerShell.set_margin(
-                    self.window, Gtk4LayerShell.Edge.TOP, y + h + 10
-                )
-                Gtk4LayerShell.set_margin(self.window, Gtk4LayerShell.Edge.LEFT, x)
+            if win_result.returncode != 0 or not win_result.stdout:
+                return
+
+            win_data = json.loads(win_result.stdout)
+            win_x = win_data.get("at", [0, 0])[0]
+            win_y = win_data.get("at", [0, 0])[1]
+            win_h = win_data.get("size", [0, 0])[1]
+            win_monitor = win_data.get("monitor", 0)
+
+            # Find the monitor dimensions
+            mon_height = 1080  # fallback
+            mon_y_offset = 0
+            if mon_result.returncode == 0 and mon_result.stdout:
+                monitors = json.loads(mon_result.stdout)
+                for mon in monitors:
+                    if mon.get("id") == win_monitor or mon.get("name") == win_monitor:
+                        mon_height = mon.get("height", 1080)
+                        mon_y_offset = mon.get("y", 0)
+                        break
+
+            # Calculate desired position (below active window)
+            desired_top = win_y + win_h + 10
+            overlay_height = 100  # approximate
+
+            # Check if overlay would go off-screen
+            if desired_top + overlay_height > mon_y_offset + mon_height:
+                # Fall back to bottom-anchored position (default from do_activate)
+                return
+
+            Gtk4LayerShell.set_anchor(
+                self.window, Gtk4LayerShell.Edge.BOTTOM, False
+            )
+            Gtk4LayerShell.set_anchor(self.window, Gtk4LayerShell.Edge.TOP, True)
+            Gtk4LayerShell.set_anchor(self.window, Gtk4LayerShell.Edge.LEFT, True)
+            Gtk4LayerShell.set_margin(
+                self.window, Gtk4LayerShell.Edge.TOP, desired_top
+            )
+            Gtk4LayerShell.set_margin(self.window, Gtk4LayerShell.Edge.LEFT, win_x)
         except (subprocess.SubprocessError, json.JSONDecodeError, KeyError):
             pass
 

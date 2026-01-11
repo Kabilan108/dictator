@@ -50,17 +50,20 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("failed to start overlay: %w", err)
 	}
 
+	var conn net.Conn
 	for i := 0; i < 50; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if _, err := os.Stat(socketPath); err == nil {
+		if _, err := os.Stat(socketPath); err != nil {
+			continue
+		}
+		conn, err = net.Dial("unix", socketPath)
+		if err == nil {
 			break
 		}
 	}
-
-	conn, err := net.Dial("unix", socketPath)
-	if err != nil {
+	if conn == nil {
 		m.cmd.Process.Kill()
-		return fmt.Errorf("failed to connect to overlay: %w", err)
+		return fmt.Errorf("failed to connect to overlay after timeout")
 	}
 
 	m.connMu.Lock()
