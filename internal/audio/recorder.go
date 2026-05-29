@@ -3,6 +3,7 @@ package audio
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -60,6 +61,21 @@ func NewRecorder(c utils.AudioConfig) (*Recorder, error) {
 	return recorder, nil
 }
 
+func (r *Recorder) refreshPortAudio() error {
+	if r.isInitialized {
+		if err := portaudio.Terminate(); err != nil {
+			return fmt.Errorf("failed to terminate PortAudio: %w", err)
+		}
+		r.isInitialized = false
+	}
+
+	if err := portaudio.Initialize(); err != nil {
+		return fmt.Errorf("failed to initialize PortAudio: %w", err)
+	}
+	r.isInitialized = true
+	return nil
+}
+
 func (r *Recorder) Close() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -102,6 +118,16 @@ func (r *Recorder) IsRecording() bool {
 	return r.GetState() == StateRecording
 }
 
+func (r *Recorder) openDefaultInputStream(framesPerBuffer []float32) (*portaudio.Stream, error) {
+	return portaudio.OpenDefaultStream(
+		1,
+		0,
+		float64(r.config.SampleRate),
+		r.config.FramesPerBlock,
+		framesPerBuffer,
+	)
+}
+
 func (r *Recorder) Start() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -130,14 +156,15 @@ func (r *Recorder) Start() error {
 	// create input buffer for portaudio
 	framesPerBuffer := make([]float32, r.config.FramesPerBlock)
 
-	// open audio stream
-	stream, err := portaudio.OpenDefaultStream(
-		1,                            // inputChannels
-		0,                            // outputChannels
-		float64(r.config.SampleRate), // sampleRate
-		r.config.FramesPerBlock,      // framesPerBuffer
-		framesPerBuffer,              // buffer
-	)
+	stream, err := r.openDefaultInputStream(framesPerBuffer)
+	if errors.Is(err, portaudio.NoDefaultInputDevice) || errors.Is(err, portaudio.DeviceUnavailable) {
+		slog.Warn("refreshing PortAudio after input device failure", "err", err)
+		if refreshErr := r.refreshPortAudio(); refreshErr != nil {
+			slog.Error("failed to refresh PortAudio", "err", refreshErr)
+		} else {
+			stream, err = r.openDefaultInputStream(framesPerBuffer)
+		}
+	}
 	if err != nil {
 		slog.Error("failed to open audio stream", "err", err)
 		if r.durationTimer != nil {
