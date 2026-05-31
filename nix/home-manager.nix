@@ -34,6 +34,7 @@ let
     "XAUTHORITY"
     "DBUS_SESSION_BUS_ADDRESS"
     "WAYLAND_DISPLAY"
+    "XDG_RUNTIME_DIR"
   ];
   configSource =
     if cfg.configFile != null then
@@ -56,7 +57,11 @@ in
     };
 
     displayServer = lib.mkOption {
-      type = lib.types.enum [ "x11" "wayland" "auto" ];
+      type = lib.types.enum [
+        "x11"
+        "wayland"
+        "auto"
+      ];
       default = "auto";
       description = "Clipboard/typing backend selection used to set default runtime deps and environment.";
     };
@@ -78,6 +83,7 @@ in
       default = null;
       description = "Configuration for Dictator written to config.json.";
       example = {
+        enable_osd = true;
         api = {
           active_provider = "openai";
           timeout = 60;
@@ -164,19 +170,18 @@ in
         ];
       };
       Service = {
-        ExecStart = "${lib.getExe cfg.package} daemon --log-level ${lib.escapeShellArg cfg.logLevel}"
+        ExecStart =
+          "${lib.getExe cfg.package} daemon --log-level ${lib.escapeShellArg cfg.logLevel}"
           + lib.optionalString (cfg.extraArgs != [ ]) " ${extraArgs}";
         Restart = "on-failure";
         RestartSec = 5;
         Environment = [
           "PATH=${lib.makeBinPath pathPackages}"
-        ] ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
+        ]
+        ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
         EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
         PassEnvironment =
-          if cfg.passEnvironment != null then
-            cfg.passEnvironment
-          else
-            defaultPassEnvironment;
+          if cfg.passEnvironment != null then cfg.passEnvironment else defaultPassEnvironment;
       };
       Install = {
         WantedBy = [ "default.target" ];

@@ -44,8 +44,9 @@ var CONFIG_DIR = func() string {
 }()
 
 type Config struct {
-	API   APIConfig   `json:"api" mapstructure:"api"`
-	Audio AudioConfig `json:"audio" mapstructure:"audio"`
+	EnableOSD bool        `json:"enable_osd" mapstructure:"enable_osd"`
+	API       APIConfig   `json:"api" mapstructure:"api"`
+	Audio     AudioConfig `json:"audio" mapstructure:"audio"`
 }
 
 type Provider struct {
@@ -72,6 +73,7 @@ var envKeyPattern = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func DefaultConfig() *Config {
 	return &Config{
+		EnableOSD: true,
 		API: APIConfig{
 			ActiveProvider: "openai",
 			Timeout:        60,

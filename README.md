@@ -75,6 +75,7 @@ sudo dnf install wl-clipboard wtype portaudio-devel
    Add your Whisper API endpoint and key:
    ```json
    {
+     "enable_osd": true,
      "api": {
        "endpoint": "https://api.openai.com/v1/audio/transcriptions",
        "key": "your-api-key-here",
@@ -125,6 +126,7 @@ Example `flake.nix` usage:
                     };
                   };
                 };
+                enable_osd = true;
                 audio = {
                   max_duration_min = 20;
                 };
@@ -225,6 +227,7 @@ Configuration file location: `~/.config/dictator/config.json`
 
 ```json
 {
+  "enable_osd": true,
   "api": {
     "active_provider": "openai",
     "timeout": 60,
@@ -247,6 +250,25 @@ Configuration file location: `~/.config/dictator/config.json`
 ```
 
 The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails.
+
+When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_DIR/dictator/osd.sock`, falling back to `/tmp/dictator-osd-$USER/osd.sock` when `XDG_RUNTIME_DIR` is unavailable.
+
+### Visual OSD Events
+
+The OSD socket emits newline-delimited JSON. A new client receives a current state snapshot immediately after connecting.
+
+```json
+{"type":"state","value":"recording","recording_duration_ms":0}
+{"type":"meter","rms":0.03,"peak":0.2}
+{"type":"state","value":"transcribing","recording_duration_ms":4820}
+{"type":"state","value":"typing"}
+{"type":"state","value":"error","message":"transcription failed"}
+{"type":"state","value":"idle"}
+```
+
+State events are delivered in order to healthy connected clients. Meter events are best effort: if the OSD falls behind, Dictator keeps only the latest pending meter sample.
+
+A production-ready QuickShell reference client is available in `examples/quickshell-osd`.
 
 ## Development
 

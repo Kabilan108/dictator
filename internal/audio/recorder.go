@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,6 +31,10 @@ type Recorder struct {
 
 	config utils.AudioConfig
 
+	levelObserver LevelObserver
+	levelInterval time.Duration
+	lastLevelAt   time.Time
+
 	mu        sync.RWMutex
 	state     RecorderState
 	audioData []byte
@@ -41,6 +46,13 @@ type Recorder struct {
 
 	wg sync.WaitGroup
 }
+
+type LevelSample struct {
+	RMS  float64
+	Peak float64
+}
+
+type LevelObserver func(LevelSample)
 
 func NewRecorder(c utils.AudioConfig) (*Recorder, error) {
 	recorder := &Recorder{
@@ -59,6 +71,15 @@ func NewRecorder(c utils.AudioConfig) (*Recorder, error) {
 
 	slog.Debug("recorder initialized", "sr", c.SampleRate, "channels", c.Channels, "bit_depth", c.BitDepth)
 	return recorder, nil
+}
+
+func (r *Recorder) SetLevelObserver(observer LevelObserver, interval time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.levelObserver = observer
+	r.levelInterval = interval
+	r.lastLevelAt = time.Time{}
 }
 
 func (r *Recorder) refreshPortAudio() error {
@@ -145,6 +166,7 @@ func (r *Recorder) Start() error {
 	r.buffer = make([]float32, 0)
 	r.audioData = make([]byte, 0)
 	r.startTime = time.Now()
+	r.lastLevelAt = time.Time{}
 
 	r.durationTimer = time.AfterFunc(
 		time.Duration(r.config.MaxDurationMin)*time.Minute,
@@ -202,6 +224,8 @@ func (r *Recorder) Start() error {
 			// copy audio data to buffer
 			dataCopy := make([]float32, len(framesPerBuffer))
 			copy(dataCopy, framesPerBuffer)
+			r.publishLevelSample(dataCopy)
+
 			r.mu.Lock()
 			r.buffer = append(r.buffer, dataCopy...)
 			r.mu.Unlock()
@@ -210,6 +234,59 @@ func (r *Recorder) Start() error {
 
 	slog.Info("recording started", "max_duration_min", r.config.MaxDurationMin)
 	return nil
+}
+
+func (r *Recorder) publishLevelSample(samples []float32) {
+	r.mu.RLock()
+	observer := r.levelObserver
+	interval := r.levelInterval
+	lastLevelAt := r.lastLevelAt
+	r.mu.RUnlock()
+
+	if observer == nil {
+		return
+	}
+
+	now := time.Now()
+	if interval > 0 && !lastLevelAt.IsZero() && now.Sub(lastLevelAt) < interval {
+		return
+	}
+
+	r.mu.Lock()
+	if r.levelObserver == nil {
+		r.mu.Unlock()
+		return
+	}
+	if interval > 0 && !r.lastLevelAt.IsZero() && now.Sub(r.lastLevelAt) < interval {
+		r.mu.Unlock()
+		return
+	}
+	observer = r.levelObserver
+	r.lastLevelAt = now
+	r.mu.Unlock()
+
+	observer(calculateLevel(samples))
+}
+
+func calculateLevel(samples []float32) LevelSample {
+	if len(samples) == 0 {
+		return LevelSample{}
+	}
+
+	var sumSquares float64
+	var peak float64
+	for _, sample := range samples {
+		value := math.Abs(float64(sample))
+		sumSquares += value * value
+		if value > peak {
+			peak = value
+		}
+	}
+
+	return LevelSample{
+		RMS:  math.Sqrt(sumSquares / float64(len(samples))),
+		Peak: math.Min(peak, 1),
+	}
 }
 
 func (r *Recorder) Stop() ([]byte, string, error) {

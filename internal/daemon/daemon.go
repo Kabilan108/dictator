@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,11 +17,13 @@ import (
 	"github.com/kabilan108/dictator/internal/storage"
 	"github.com/kabilan108/dictator/internal/typing"
 	"github.com/kabilan108/dictator/internal/utils"
+	"github.com/kabilan108/dictator/internal/visual"
 )
 
 const (
 	NotificationUpdateInterval = 1 * time.Second
 	ErrorDisplayDuration       = 5 * time.Second
+	OSDMeterUpdateInterval     = time.Second / 30
 )
 
 type Daemon struct {
@@ -28,15 +31,21 @@ type Daemon struct {
 	recorder    *audio.Recorder
 	transcriber audio.WhisperClient
 	notifier    notifier.Notifier
+	visualSink  visual.Sink
 	typer       typing.Typer
 	ipcServer   *ipc.Server
 	db          *storage.DB
 
-	mu        sync.RWMutex
-	state     ipc.DaemonState
-	lastError *string
-	startTime time.Time
-	stopChan  chan struct{}
+	mu                sync.RWMutex
+	state             ipc.DaemonState
+	lastError         *string
+	recordingDuration time.Duration
+	startTime         time.Time
+	stopChan          chan struct{}
+
+	osdMeterCh     chan audio.LevelSample
+	osdMeterCancel context.CancelFunc
+	osdMeterWG     sync.WaitGroup
 
 	operationCtx    context.Context
 	operationCancel context.CancelFunc
@@ -72,6 +81,7 @@ func NewDaemon(cfg *utils.Config) (*Daemon, error) {
 		recorder:    recorder,
 		transcriber: transcriber,
 		notifier:    notifier,
+		visualSink:  visual.NoopSink{},
 		typer:       typer,
 		db:          db,
 		state:       ipc.StateIdle,
@@ -99,6 +109,8 @@ func (d *Daemon) Run() error {
 	if err := d.notifier.UpdateState(d.state); err != nil {
 		return fmt.Errorf("failed to show initial notification: %w", err)
 	}
+
+	d.startOSD()
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -152,6 +164,14 @@ func (d *Daemon) shutdown() error {
 		}
 	}
 
+	if d.visualSink != nil {
+		d.stopOSDMeterPublisher()
+		if err := d.visualSink.Close(); err != nil {
+			slog.Error("failed to close OSD sink", "err", err)
+			lastErr = err
+		}
+	}
+
 	if d.db != nil {
 		if err := d.db.Close(); err != nil {
 			slog.Error("failed to close database", "err", err)
@@ -169,10 +189,15 @@ func (d *Daemon) shutdown() error {
 
 func (d *Daemon) HandleStart() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	if d.state == ipc.StateRecording {
+		d.mu.Unlock()
 		return fmt.Errorf(ipc.ErrAlreadyRecording)
+	}
+	if d.state != ipc.StateIdle {
+		state := d.state
+		d.mu.Unlock()
+		return fmt.Errorf("cannot start in current state: %s", state.String())
 	}
 
 	slog.Debug("starting recording")
@@ -181,19 +206,24 @@ func (d *Daemon) HandleStart() error {
 
 	if err := d.recorder.Start(); err != nil {
 		slog.Error("failed to start recording", "err", err)
-		msg := err.Error()
-		d.lastError = &msg
+		d.mu.Unlock()
+		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrRecordingFailed, err))
 		return fmt.Errorf("%s: %w", ipc.ErrRecordingFailed, err)
 	}
 
 	d.state = ipc.StateRecording
 	d.lastError = nil
+	d.recordingDuration = 0
 
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	d.startNotificationTimer()
+	d.mu.Unlock()
+
+	if err := d.notifier.UpdateState(ipc.StateRecording); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
-	d.startNotificationTimer()
+	duration := time.Duration(0)
+	d.publishOSDState(ipc.StateRecording, &duration, "")
 
 	slog.Info("recording started")
 	return nil
@@ -201,20 +231,26 @@ func (d *Daemon) HandleStart() error {
 
 func (d *Daemon) HandleStop() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	if d.state != ipc.StateRecording {
+		d.mu.Unlock()
 		return fmt.Errorf(ipc.ErrNotRecording)
 	}
 
 	slog.Info("stopping recording and starting transcription")
 
+	recordingDuration := d.recorder.GetRecordingDuration()
 	d.stopNotificationTimer()
 
 	d.state = ipc.StateTranscribing
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	d.recordingDuration = recordingDuration
+	d.mu.Unlock()
+
+	if err := d.notifier.UpdateState(ipc.StateTranscribing); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
+
+	d.publishOSDState(ipc.StateTranscribing, &recordingDuration, "")
 
 	go d.transcribeAndType()
 
@@ -238,7 +274,6 @@ func (d *Daemon) HandleToggle() error {
 
 func (d *Daemon) HandleCancel() error {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	slog.Debug("canceling current operation")
 
@@ -248,18 +283,24 @@ func (d *Daemon) HandleCancel() error {
 		d.operationCancel()
 	}
 
-	if d.state == ipc.StateRecording {
+	wasRecording := d.state == ipc.StateRecording
+
+	d.state = ipc.StateIdle
+	d.lastError = nil
+	d.recordingDuration = 0
+	d.mu.Unlock()
+
+	if wasRecording {
 		if _, _, err := d.recorder.Stop(); err != nil {
 			slog.Error("failed to stop recording during cancel", "err", err)
 		}
 	}
 
-	d.state = ipc.StateIdle
-	d.lastError = nil
-
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
+
+	d.publishOSDState(ipc.StateIdle, nil, "")
 
 	slog.Info("operation canceled")
 	return nil
@@ -286,6 +327,128 @@ func (d *Daemon) GetStatus() ipc.StatusData {
 	return status
 }
 
+func (d *Daemon) osdSnapshot() visual.StateEvent {
+	d.mu.RLock()
+	state := d.state
+	recordingDuration := d.recordingDuration
+	errorMessage := ""
+	if d.lastError != nil {
+		errorMessage = *d.lastError
+	}
+	d.mu.RUnlock()
+
+	if state == ipc.StateRecording {
+		recordingDuration = d.recorder.GetRecordingDuration()
+	}
+
+	return d.osdStateEvent(state, recordingDuration, errorMessage)
+}
+
+func (d *Daemon) publishOSDState(state ipc.DaemonState, recordingDuration *time.Duration, errorMessage string) {
+	var duration time.Duration
+	if recordingDuration != nil {
+		duration = *recordingDuration
+	}
+
+	d.visualSink.Publish(d.osdStateEvent(state, duration, errorMessage))
+}
+
+func publicOSDErrorMessage(errorMessage string) string {
+	switch {
+	case strings.HasPrefix(errorMessage, ipc.ErrRecordingFailed):
+		return ipc.ErrRecordingFailed
+	case strings.HasPrefix(errorMessage, ipc.ErrTranscriptionFailed):
+		return ipc.ErrTranscriptionFailed
+	case strings.HasPrefix(errorMessage, ipc.ErrTypingFailed):
+		return ipc.ErrTypingFailed
+	default:
+		return "dictation failed"
+	}
+}
+
+func (d *Daemon) osdStateEvent(state ipc.DaemonState, recordingDuration time.Duration, errorMessage string) visual.StateEvent {
+	switch state {
+	case ipc.StateRecording:
+		return visual.NewStateEvent(visual.StateRecording, &recordingDuration, "")
+	case ipc.StateTranscribing:
+		return visual.NewStateEvent(visual.StateTranscribing, &recordingDuration, "")
+	case ipc.StateTyping:
+		return visual.NewStateEvent(visual.StateTyping, nil, "")
+	case ipc.StateError:
+		return visual.NewStateEvent(visual.StateError, nil, publicOSDErrorMessage(errorMessage))
+	default:
+		return visual.NewStateEvent(visual.StateIdle, nil, "")
+	}
+}
+
+func (d *Daemon) startOSD() {
+	if !d.config.EnableOSD {
+		return
+	}
+
+	visualSink, err := visual.NewSocketSink(d.osdSnapshot)
+	if err != nil {
+		slog.Warn("failed to start OSD event socket; continuing without OSD", "err", err)
+		return
+	}
+
+	d.visualSink = visualSink
+	d.startOSDMeterPublisher()
+	d.recorder.SetLevelObserver(d.enqueueLevelSample, OSDMeterUpdateInterval)
+}
+
+func (d *Daemon) startOSDMeterPublisher() {
+	ctx, cancel := context.WithCancel(context.Background())
+	d.osdMeterCancel = cancel
+	d.osdMeterCh = make(chan audio.LevelSample, 1)
+	d.osdMeterWG.Add(1)
+	go func() {
+		defer d.osdMeterWG.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case sample := <-d.osdMeterCh:
+				d.visualSink.Publish(visual.NewMeterEvent(sample.RMS, sample.Peak))
+			}
+		}
+	}()
+}
+
+func (d *Daemon) stopOSDMeterPublisher() {
+	d.recorder.SetLevelObserver(nil, 0)
+	if d.osdMeterCancel != nil {
+		d.osdMeterCancel()
+		d.osdMeterCancel = nil
+	}
+	d.osdMeterWG.Wait()
+}
+
+func (d *Daemon) enqueueLevelSample(sample audio.LevelSample) {
+	d.mu.RLock()
+	recording := d.state == ipc.StateRecording
+	d.mu.RUnlock()
+
+	if !recording {
+		return
+	}
+
+	select {
+	case d.osdMeterCh <- sample:
+		return
+	default:
+	}
+
+	select {
+	case <-d.osdMeterCh:
+	default:
+	}
+	select {
+	case d.osdMeterCh <- sample:
+	default:
+	}
+}
+
 func (d *Daemon) transcribeAndType() {
 	recordingDuration := d.recorder.GetRecordingDuration()
 
@@ -301,6 +464,10 @@ func (d *Daemon) transcribeAndType() {
 
 	text, err := d.transcribe(ctx, audioData, audioPath)
 	if err != nil {
+		if ctx.Err() != nil {
+			slog.Debug("transcription cancelled")
+			return
+		}
 		d.handleError(fmt.Sprintf("%s: %v", ipc.ErrTranscriptionFailed, err))
 		return
 	}
@@ -312,11 +479,14 @@ func (d *Daemon) transcribeAndType() {
 	d.mu.Lock()
 	d.state = ipc.StateIdle
 	d.lastError = nil
+	d.recordingDuration = 0
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
+
+	d.publishOSDState(ipc.StateIdle, nil, "")
 }
 
 func (d *Daemon) saveRecording() ([]byte, string, error) {
@@ -360,9 +530,11 @@ func (d *Daemon) typeAndSave(ctx context.Context, text string, duration time.Dur
 	d.state = ipc.StateTyping
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	if err := d.notifier.UpdateState(ipc.StateTyping); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
+
+	d.publishOSDState(ipc.StateTyping, nil, "")
 
 	if err := d.typer.Type(ctx, text); err != nil {
 		if ctx.Err() != nil {
@@ -370,6 +542,7 @@ func (d *Daemon) typeAndSave(ctx context.Context, text string, duration time.Dur
 			d.mu.Lock()
 			d.state = ipc.StateIdle
 			d.lastError = nil
+			d.recordingDuration = 0
 			d.mu.Unlock()
 			return nil
 		}
@@ -429,26 +602,35 @@ func (d *Daemon) updateRecordingNotification() {
 
 func (d *Daemon) handleError(errorMsg string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 
 	d.stopNotificationTimer()
 
 	d.state = ipc.StateError
 	d.lastError = &errorMsg
+	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	if err := d.notifier.UpdateState(ipc.StateError); err != nil {
 		slog.Warn("failed to update error notification", "err", err)
 	}
+
+	d.publishOSDState(ipc.StateError, nil, errorMsg)
 
 	// auto-return to idle after error display
 	time.AfterFunc(ErrorDisplayDuration, func() {
 		d.mu.Lock()
+		if d.state != ipc.StateError {
+			d.mu.Unlock()
+			return
+		}
 		d.state = ipc.StateIdle
+		d.recordingDuration = 0
 		d.mu.Unlock()
 
-		if err := d.notifier.UpdateState(d.state); err != nil {
+		if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
 			slog.Warn("failed to update notification after error", "err", err)
 		}
+
+		d.publishOSDState(ipc.StateIdle, nil, "")
 	})
 }
 
