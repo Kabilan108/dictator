@@ -19,7 +19,7 @@
         {
           default = pkgs.buildGoModule rec {
             pname = "dictator";
-            version = "2.3.1";
+            version = "2.4.0";
             src = ./.;
             vendorHash = "sha256-Jud5o3QUVlWab/dICquh5PWUnIj6YkxWdRA8INKL3Jw=";
 
