@@ -84,6 +84,7 @@ in
       description = "Configuration for Dictator written to config.json.";
       example = {
         enable_osd = true;
+        notifications = "errors_only";
         api = {
           active_provider = "openai";
           timeout = 60;

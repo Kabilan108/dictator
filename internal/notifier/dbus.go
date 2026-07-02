@@ -5,7 +5,6 @@ import (
 	"log/slog"
 	"slices"
 	"sync"
-	"time"
 
 	"github.com/godbus/dbus/v5"
 	"github.com/kabilan108/dictator/internal/ipc"
@@ -19,9 +18,22 @@ type NotificationContent struct {
 
 type Notifier interface {
 	UpdateState(state ipc.DaemonState) error
-	UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error
 	Update(title, body string) error
 	Close() error
+}
+
+type NoopNotifier struct{}
+
+func (NoopNotifier) UpdateState(ipc.DaemonState) error {
+	return nil
+}
+
+func (NoopNotifier) Update(string, string) error {
+	return nil
+}
+
+func (NoopNotifier) Close() error {
+	return nil
 }
 
 type DBusNotifier struct {
@@ -66,14 +78,6 @@ const (
 	methodClose   = "org.freedesktop.Notifications.CloseNotification"
 )
 
-// formatDuration formats a duration into a readable string (e.g., "0:15", "1:30")
-func formatDuration(d time.Duration) string {
-	totalSeconds := int(d.Seconds())
-	minutes := totalSeconds / 60
-	seconds := totalSeconds % 60
-	return fmt.Sprintf("%d:%02d", minutes, seconds)
-}
-
 func New() (Notifier, error) {
 	conn, err := dbus.ConnectSessionBus()
 	if err != nil {
@@ -117,30 +121,6 @@ func (n *DBusNotifier) UpdateState(state ipc.DaemonState) error {
 		return fmt.Errorf("unknown notification state: %d", state)
 	}
 
-	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
-	return n.updateNotification(content.Title, content.Body, content.Icon)
-}
-
-// UpdateStateWithDuration updates the notification with current recording duration
-func (n *DBusNotifier) UpdateStateWithDuration(state ipc.DaemonState, duration time.Duration) error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	content, exists := stateNotifications[state]
-	if !exists {
-		slog.Error("unknown notification state", "state", state)
-		return fmt.Errorf("unknown notification state: %d", state)
-	}
-
-	// Format duration and update body for recording state
-	if state == ipc.StateRecording {
-		formattedDuration := formatDuration(duration)
-		updatedBody := fmt.Sprintf("Recording audio %s", formattedDuration)
-		slog.Debug("updating recording notification with duration", "duration", formattedDuration)
-		return n.updateNotification(content.Title, updatedBody, content.Icon)
-	}
-
-	// For non-recording states, use standard notification
 	slog.Debug("updating notification state", "title", content.Title, "body", content.Body)
 	return n.updateNotification(content.Title, content.Body, content.Icon)
 }

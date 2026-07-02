@@ -44,10 +44,19 @@ var CONFIG_DIR = func() string {
 }()
 
 type Config struct {
-	EnableOSD bool        `json:"enable_osd" mapstructure:"enable_osd"`
-	API       APIConfig   `json:"api" mapstructure:"api"`
-	Audio     AudioConfig `json:"audio" mapstructure:"audio"`
+	EnableOSD     bool             `json:"enable_osd" mapstructure:"enable_osd"`
+	Notifications NotificationMode `json:"notifications" mapstructure:"notifications"`
+	API           APIConfig        `json:"api" mapstructure:"api"`
+	Audio         AudioConfig      `json:"audio" mapstructure:"audio"`
 }
+
+type NotificationMode string
+
+const (
+	NotificationModeAll        NotificationMode = "all"
+	NotificationModeErrorsOnly NotificationMode = "errors_only"
+	NotificationModeOff        NotificationMode = "off"
+)
 
 type Provider struct {
 	Endpoint string `json:"endpoint" mapstructure:"endpoint"`
@@ -73,7 +82,8 @@ var envKeyPattern = regexp.MustCompile(`\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 func DefaultConfig() *Config {
 	return &Config{
-		EnableOSD: true,
+		EnableOSD:     true,
+		Notifications: NotificationModeErrorsOnly,
 		API: APIConfig{
 			ActiveProvider: "openai",
 			Timeout:        60,
@@ -96,6 +106,12 @@ func DefaultConfig() *Config {
 }
 
 func Validate(config *Config) error {
+	switch config.Notifications {
+	case NotificationModeAll, NotificationModeErrorsOnly, NotificationModeOff:
+	default:
+		return fmt.Errorf("notifications must be one of: all, errors_only, off")
+	}
+
 	if config.API.ActiveProvider == "" {
 		return fmt.Errorf("active provider is required")
 	}

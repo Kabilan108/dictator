@@ -21,9 +21,8 @@ import (
 )
 
 const (
-	NotificationUpdateInterval = 1 * time.Second
-	ErrorDisplayDuration       = 5 * time.Second
-	OSDMeterUpdateInterval     = time.Second / 30
+	ErrorDisplayDuration   = 5 * time.Second
+	OSDMeterUpdateInterval = time.Second / 30
 )
 
 type Daemon struct {
@@ -49,8 +48,6 @@ type Daemon struct {
 
 	operationCtx    context.Context
 	operationCancel context.CancelFunc
-
-	notificationTimer *time.Timer
 }
 
 func NewDaemon(cfg *utils.Config) (*Daemon, error) {
@@ -61,9 +58,12 @@ func NewDaemon(cfg *utils.Config) (*Daemon, error) {
 
 	transcriber := audio.NewWhisperClient(&cfg.API)
 
-	notifier, err := notifier.New()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create notifier: %w", err)
+	var stateNotifier notifier.Notifier = notifier.NoopNotifier{}
+	if cfg.Notifications != utils.NotificationModeOff {
+		stateNotifier, err = notifier.New()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create notifier: %w", err)
+		}
 	}
 
 	typer, err := typing.New()
@@ -80,7 +80,7 @@ func NewDaemon(cfg *utils.Config) (*Daemon, error) {
 		config:      cfg,
 		recorder:    recorder,
 		transcriber: transcriber,
-		notifier:    notifier,
+		notifier:    stateNotifier,
 		visualSink:  visual.NoopSink{},
 		typer:       typer,
 		db:          db,
@@ -106,7 +106,7 @@ func (d *Daemon) Run() error {
 		}
 	}()
 
-	if err := d.notifier.UpdateState(d.state); err != nil {
+	if err := d.updateNotificationState(d.state); err != nil {
 		return fmt.Errorf("failed to show initial notification: %w", err)
 	}
 
@@ -142,7 +142,6 @@ func (d *Daemon) shutdown() error {
 	slog.Debug("shutting down daemon")
 
 	d.mu.Lock()
-	d.stopNotificationTimer()
 	if d.operationCancel != nil {
 		d.operationCancel()
 	}
@@ -214,11 +213,9 @@ func (d *Daemon) HandleStart() error {
 	d.state = ipc.StateRecording
 	d.lastError = nil
 	d.recordingDuration = 0
-
-	d.startNotificationTimer()
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(ipc.StateRecording); err != nil {
+	if err := d.updateNotificationState(ipc.StateRecording); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
@@ -240,13 +237,12 @@ func (d *Daemon) HandleStop() error {
 	slog.Info("stopping recording and starting transcription")
 
 	recordingDuration := d.recorder.GetRecordingDuration()
-	d.stopNotificationTimer()
 
 	d.state = ipc.StateTranscribing
 	d.recordingDuration = recordingDuration
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(ipc.StateTranscribing); err != nil {
+	if err := d.updateNotificationState(ipc.StateTranscribing); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
@@ -277,8 +273,6 @@ func (d *Daemon) HandleCancel() error {
 
 	slog.Debug("canceling current operation")
 
-	d.stopNotificationTimer()
-
 	if d.operationCancel != nil {
 		d.operationCancel()
 	}
@@ -296,7 +290,7 @@ func (d *Daemon) HandleCancel() error {
 		}
 	}
 
-	if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
+	if err := d.updateNotificationState(ipc.StateIdle); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
@@ -482,7 +476,7 @@ func (d *Daemon) transcribeAndType() {
 	d.recordingDuration = 0
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
+	if err := d.updateNotificationState(ipc.StateIdle); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
@@ -530,7 +524,7 @@ func (d *Daemon) typeAndSave(ctx context.Context, text string, duration time.Dur
 	d.state = ipc.StateTyping
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(ipc.StateTyping); err != nil {
+	if err := d.updateNotificationState(ipc.StateTyping); err != nil {
 		slog.Warn("failed to update notification", "err", err)
 	}
 
@@ -564,52 +558,14 @@ func (d *Daemon) typeAndSave(ctx context.Context, text string, duration time.Dur
 	return nil
 }
 
-func (d *Daemon) startNotificationTimer() {
-	d.stopNotificationTimer()
-	d.notificationTimer = time.AfterFunc(NotificationUpdateInterval, func() {
-		d.updateRecordingNotification()
-	})
-}
-
-func (d *Daemon) stopNotificationTimer() {
-	if d.notificationTimer != nil {
-		d.notificationTimer.Stop()
-		d.notificationTimer = nil
-	}
-}
-
-func (d *Daemon) updateRecordingNotification() {
-	d.mu.RLock()
-	state := d.state
-	d.mu.RUnlock()
-
-	if state == ipc.StateRecording {
-		duration := d.recorder.GetRecordingDuration()
-		if err := d.notifier.UpdateStateWithDuration(state, duration); err != nil {
-			slog.Warn("failed to update recording notification", "err", err)
-		}
-
-		// Schedule next update
-		d.mu.Lock()
-		if d.state == ipc.StateRecording {
-			d.notificationTimer = time.AfterFunc(NotificationUpdateInterval, func() {
-				d.updateRecordingNotification()
-			})
-		}
-		d.mu.Unlock()
-	}
-}
-
 func (d *Daemon) handleError(errorMsg string) {
 	d.mu.Lock()
-
-	d.stopNotificationTimer()
 
 	d.state = ipc.StateError
 	d.lastError = &errorMsg
 	d.mu.Unlock()
 
-	if err := d.notifier.UpdateState(ipc.StateError); err != nil {
+	if err := d.updateNotificationState(ipc.StateError); err != nil {
 		slog.Warn("failed to update error notification", "err", err)
 	}
 
@@ -626,12 +582,28 @@ func (d *Daemon) handleError(errorMsg string) {
 		d.recordingDuration = 0
 		d.mu.Unlock()
 
-		if err := d.notifier.UpdateState(ipc.StateIdle); err != nil {
+		if err := d.updateNotificationState(ipc.StateIdle); err != nil {
 			slog.Warn("failed to update notification after error", "err", err)
 		}
 
 		d.publishOSDState(ipc.StateIdle, nil, "")
 	})
+}
+
+func (d *Daemon) updateNotificationState(state ipc.DaemonState) error {
+	switch d.config.Notifications {
+	case utils.NotificationModeAll:
+		return d.notifier.UpdateState(state)
+	case utils.NotificationModeErrorsOnly:
+		if state == ipc.StateError {
+			return d.notifier.UpdateState(state)
+		}
+		return nil
+	case utils.NotificationModeOff:
+		return nil
+	default:
+		return fmt.Errorf("unknown notification mode: %s", d.config.Notifications)
+	}
 }
 
 func NotRunning(e error) error {

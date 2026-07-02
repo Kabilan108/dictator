@@ -76,6 +76,7 @@ sudo dnf install wl-clipboard wtype portaudio-devel
    ```json
    {
      "enable_osd": true,
+     "notifications": "errors_only",
      "api": {
        "endpoint": "https://api.openai.com/v1/audio/transcriptions",
        "key": "your-api-key-here",
@@ -127,6 +128,7 @@ Example `flake.nix` usage:
                   };
                 };
                 enable_osd = true;
+                notifications = "errors_only";
                 audio = {
                   max_duration_min = 20;
                 };
@@ -228,6 +230,7 @@ Configuration file location: `~/.config/dictator/config.json`
 ```json
 {
   "enable_osd": true,
+  "notifications": "errors_only",
   "api": {
     "active_provider": "openai",
     "timeout": 60,
@@ -250,6 +253,14 @@ Configuration file location: `~/.config/dictator/config.json`
 ```
 
 The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails.
+
+The `notifications` field controls desktop notifications:
+
+| Value | Behavior |
+|-------|----------|
+| `"all"` | Notify for idle, recording, transcribing, typing, and error states |
+| `"errors_only"` | Notify only when an operation fails |
+| `"off"` | Disable desktop notifications |
 
 When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_DIR/dictator/osd.sock`, falling back to `/tmp/dictator-osd-$USER/osd.sock` when `XDG_RUNTIME_DIR` is unavailable.
 
