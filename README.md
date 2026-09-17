@@ -1,6 +1,6 @@
 # Dictator
 
-[![Go Version](https://img.shields.io/badge/go-1.24+-00ADD8?style=flat&logo=go)](https://golang.org/)
+[![Rust](https://img.shields.io/badge/rust-2024_edition-orange?style=flat&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/github/license/kabilan108/dictator)](LICENSE)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Kabilan108/dictator)
 [![Platform](https://img.shields.io/badge/platform-linux-lightgrey.svg)](https://github.com/kabilan108/dictator)
@@ -16,26 +16,28 @@ Make sure you have the following system dependencies installed:
 **For X11:**
 ```bash
 # Ubuntu/Debian
-sudo apt install xdotool xclip portaudio19-dev
+sudo apt install xdotool xclip libasound2-dev pkg-config
 
 # Arch Linux
-sudo pacman -S xdotool xclip portaudio
+sudo pacman -S xdotool xclip alsa-lib
 
 # Fedora
-sudo dnf install xdotool xclip portaudio-devel
+sudo dnf install xdotool xclip alsa-lib-devel
 ```
 
 **For Wayland:**
 ```bash
 # Ubuntu/Debian
-sudo apt install wl-clipboard wtype portaudio19-dev
+sudo apt install wl-clipboard wtype libasound2-dev pkg-config
 
 # Arch Linux
-sudo pacman -S wl-clipboard wtype portaudio
+sudo pacman -S wl-clipboard wtype alsa-lib
 
 # Fedora
-sudo dnf install wl-clipboard wtype portaudio-devel
+sudo dnf install wl-clipboard wtype alsa-lib-devel
 ```
+
+You also need a Rust toolchain (`cargo`, 1.85 or newer for the 2024 edition). Audio capture uses ALSA and works through PipeWire or PulseAudio via their ALSA plugins.
 
 ### Installation
 
@@ -286,14 +288,17 @@ A production-ready QuickShell reference client is available in `examples/quicksh
 ### Building from Source
 
 ```bash
-# Install dependencies
-go mod download
+# Enter a shell with the toolchain and native deps (optional, needs nix)
+nix develop
 
-# Build binary
+# Build release binary (build/dictator)
 make build
 
-# Run tests (when available)
+# Run unit and integration tests
 make test
+
+# rustfmt + clippy
+make check
 
 # Clean build artifacts
 make clean
@@ -311,5 +316,5 @@ make deps
 - Daemon logs to stderr (capture with `dictator daemon 2> daemon.log`)
 - Application logs stored in `~/.local/state/dictator/app.log`
 - Audio recordings stored in `~/.local/share/dictator/recordings/`
-- Database stored in `~/.local/share/dictator/transcripts.db`
+- Database stored in `~/.local/share/dictator/app.db`
 - Config stored in `~/.config/dictator/config.json`

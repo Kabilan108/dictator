@@ -28,7 +28,7 @@ let
         pkgs.coreutils
         pkgs.wtype
       ];
-  pathPackages = displayPackages ++ [ pkgs.portaudio ] ++ cfg.extraPathPackages;
+  pathPackages = displayPackages ++ cfg.extraPathPackages;
   defaultPassEnvironment = [
     "DISPLAY"
     "XAUTHORITY"

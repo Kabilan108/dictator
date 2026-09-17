@@ -17,24 +17,16 @@
           lib = pkgs.lib;
         in
         {
-          default = pkgs.buildGoModule rec {
+          default = pkgs.rustPlatform.buildRustPackage rec {
             pname = "dictator";
             version = "2.4.0";
             src = ./.;
-            vendorHash = "sha256-Jud5o3QUVlWab/dICquh5PWUnIj6YkxWdRA8INKL3Jw=";
+            cargoHash = "sha256-mhAKeIY4WkYRQHrXWkvBEfgA6aLqfLR7/Y/tSkWk5F0=";
 
-            buildPhase = ''
-              runHook preBuild
-              make build VERSION=${version}
-              runHook postBuild
-            '';
+            DICTATOR_VERSION = version;
 
-            installPhase = ''
-              runHook preInstall
-
-              install -Dm755 build/dictator $out/bin/dictator
-
-              # Shell completions (Cobra-generated)
+            postInstall = ''
+              # Shell completions (clap-generated)
               install -d $out/share/bash-completion/completions
               $out/bin/dictator completion bash > $out/share/bash-completion/completions/dictator
 
@@ -43,13 +35,10 @@
 
               install -d $out/share/fish/vendor_completions.d
               $out/bin/dictator completion fish > $out/share/fish/vendor_completions.d/dictator.fish
-
-              runHook postInstall
             '';
 
             # ensure tests run under nix
             # doCheck = true;
-            # checkPhase = "make test";
 
             meta = with lib; {
               description = "native speech to text daemon for linux";
@@ -59,7 +48,7 @@
               mainProgram = "dictator";
             };
 
-            buildInputs = with pkgs; [ portaudio ];
+            buildInputs = with pkgs; [ alsa-lib ];
             nativeBuildInputs = with pkgs; [ pkg-config ];
           };
         }
@@ -69,11 +58,14 @@
         let
           pkgs = import nixpkgs { inherit system; };
           commonPackages = with pkgs; [
-            go
-            gopls
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
             ffmpeg
             pkg-config
-            portaudio
+            alsa-lib
           ];
           x11Packages = with pkgs; [
             xclip
