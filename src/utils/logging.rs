@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 
 use tracing::Level;
@@ -32,7 +33,12 @@ pub fn setup_logger(level: &str) {
 
     let log_path = STATE_DIR.join("app.log");
     let _ = std::fs::create_dir_all(&*STATE_DIR);
-    match OpenOptions::new().create(true).append(true).open(&log_path) {
+    match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(&log_path)
+    {
         Ok(file) => {
             let file_layer = fmt::layer()
                 .json()

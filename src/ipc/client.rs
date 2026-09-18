@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::{debug, error};
 
@@ -10,6 +10,7 @@ use super::protocol::*;
 
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 pub struct Client {
     socket_path: PathBuf,
@@ -63,18 +64,27 @@ impl Client {
 
         let mut payload = serde_json::to_vec(&cmd)?;
         payload.push(b'\n');
+        if payload.len() > super::server::MAX_COMMAND_BYTES {
+            bail!("command exceeds {} bytes", super::server::MAX_COMMAND_BYTES);
+        }
         if let Err(err) = writer.write_all(&payload).await {
             error!(err = %err, "failed to encode command");
             bail!("failed to send command: {err}");
         }
 
-        let mut line = String::new();
-        let mut reader = BufReader::new(reader);
-        if let Err(err) = reader.read_line(&mut line).await {
+        let mut line = Vec::new();
+        let mut reader = BufReader::new(reader).take(MAX_RESPONSE_BYTES as u64 + 1);
+        if let Err(err) = reader.read_until(b'\n', &mut line).await {
             error!(err = %err, "failed to decode response");
             bail!("failed to receive response: {err}");
         }
-        let response: Response = match serde_json::from_str(&line) {
+        if line.len() > MAX_RESPONSE_BYTES {
+            bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+        }
+        if line.is_empty() {
+            bail!("failed to receive response: daemon closed the connection");
+        }
+        let response: Response = match serde_json::from_slice(&line) {
             Ok(response) => response,
             Err(err) => {
                 error!(err = %err, "failed to decode response");

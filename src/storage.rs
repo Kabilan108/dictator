@@ -1,3 +1,4 @@
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
@@ -37,8 +38,18 @@ pub struct Db {
 
 impl Db {
     pub fn new() -> Result<Self> {
-        std::fs::create_dir_all(&*DATA_DIR)?;
-        Self::open(&DATA_DIR.join(DB_FILENAME))
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(&*DATA_DIR)?;
+        std::fs::set_permissions(&*DATA_DIR, std::fs::Permissions::from_mode(0o700))?;
+        let path = DATA_DIR.join(DB_FILENAME);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        Self::open(&path)
     }
 
     pub fn open(path: &Path) -> Result<Self> {
@@ -94,7 +105,7 @@ impl Db {
     /// Returns the most recent transcripts. A non-positive `limit` returns all.
     pub fn get_transcripts(&self, limit: i64) -> Result<Vec<Transcript>> {
         let mut query = String::from(
-            "SELECT id, timestamp, duration_ms, text, audio_path, model FROM transcripts ORDER BY timestamp DESC",
+            "SELECT id, timestamp, duration_ms, text, audio_path, model FROM transcripts ORDER BY timestamp DESC, id DESC",
         );
         if limit > 0 {
             query.push_str(" LIMIT ?");
@@ -108,7 +119,7 @@ impl Db {
         let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Transcript> {
             Ok(Transcript {
                 id: row.get(0)?,
-                timestamp: parse_timestamp(&row.get::<_, String>(1)?),
+                timestamp: parse_timestamp(&row.get::<_, String>(1)?)?,
                 duration_ms: row.get(2)?,
                 text: row.get(3)?,
                 audio_path: row.get::<_, Option<String>>(4)?.unwrap_or_default(),
@@ -129,20 +140,30 @@ impl Db {
 }
 
 /// SQLite stores `CURRENT_TIMESTAMP` as `YYYY-MM-DD HH:MM:SS` in UTC.
-fn parse_timestamp(raw: &str) -> DateTime<Utc> {
+fn parse_timestamp(raw: &str) -> rusqlite::Result<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(raw) {
-        return dt.with_timezone(&Utc);
+        return Ok(dt.with_timezone(&Utc));
     }
     for fmt in ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d %H:%M:%S"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(raw, fmt) {
-            return naive.and_utc();
+            return Ok(naive.and_utc());
         }
     }
-    Utc::now()
+    Err(rusqlite::Error::FromSqlConversionFailure(
+        1,
+        rusqlite::types::Type::Text,
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid transcript timestamp: {raw:?}"),
+        )
+        .into(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
     use super::*;
 
     #[test]
@@ -156,17 +177,71 @@ mod tests {
             .unwrap();
         db.save_transcript(2500, "second", "/tmp/b.wav", "whisper-1")
             .unwrap();
+        db.conn
+            .execute(
+                "UPDATE transcripts SET timestamp = ?",
+                params!["2026-01-01 00:00:00"],
+            )
+            .unwrap();
 
         let all = db.get_transcripts(-1).unwrap();
         assert_eq!(all.len(), 2);
 
         let one = db.get_transcripts(1).unwrap();
         assert_eq!(one.len(), 1);
-        // newest first; both rows may share a timestamp so accept either text
-        assert!(one[0].text == "second" || one[0].text == "hello world");
+        assert_eq!(one[0].text, "second");
         assert_eq!(one[0].model, "whisper-1");
 
         let last = db.get_last_transcript().unwrap().unwrap();
         assert_eq!(last.id, one[0].id);
+    }
+
+    #[test]
+    fn rejects_malformed_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO transcripts (timestamp, duration_ms, text) VALUES (?, ?, ?)",
+                params!["not-a-timestamp", 1, "bad row"],
+            )
+            .unwrap();
+
+        let err = db.get_transcripts(1).unwrap_err().to_string();
+        assert!(err.contains("failed to scan transcript"));
+    }
+
+    #[test]
+    #[ignore = "subprocess probe"]
+    fn private_database_probe_child() {
+        let db = Db::new().unwrap();
+        assert_eq!(
+            std::fs::metadata(&*DATA_DIR).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(db.path()).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn creates_private_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::private_database_probe_child",
+                "--ignored",
+            ])
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

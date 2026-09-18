@@ -2,6 +2,7 @@
 name = "dictator"
 version = "2.4.0"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "native speech to text daemon for linux"
 homepage = "https://github.com/kabilan108/dictator"
@@ -17,6 +18,7 @@ name = "dictator"
 path = "src/main.rs"
 
 [dependencies]
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"

@@ -37,7 +37,7 @@ sudo pacman -S wl-clipboard wtype alsa-lib
 sudo dnf install wl-clipboard wtype alsa-lib-devel
 ```
 
-You also need a Rust toolchain (`cargo`, 1.85 or newer for the 2024 edition). Audio capture uses ALSA and works through PipeWire or PulseAudio via their ALSA plugins.
+You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses ALSA and works through PipeWire or PulseAudio via their ALSA plugins.
 
 ### Installation
 
@@ -70,8 +70,8 @@ You also need a Rust toolchain (`cargo`, 1.85 or newer for the 2024 edition). Au
 
 4. **Configure API access:**
    ```bash
-   # Edit the config file that gets created automatically
-   ~/.config/dictator/config.json
+   dictator init
+   $EDITOR ~/.config/dictator/config.json
    ```
 
    Add your Whisper API endpoint and key:
@@ -80,10 +80,15 @@ You also need a Rust toolchain (`cargo`, 1.85 or newer for the 2024 edition). Au
      "enable_osd": true,
      "notifications": "errors_only",
      "api": {
-       "endpoint": "https://api.openai.com/v1/audio/transcriptions",
-       "key": "your-api-key-here",
-       "model": "whisper-1",
-       "timeout": 60
+       "active_provider": "openai",
+       "timeout": 60,
+       "providers": {
+         "openai": {
+           "endpoint": "https://api.openai.com/v1/audio/transcriptions",
+           "key": "${env:OPENAI_API_KEY}",
+           "model": "gpt-4o-transcribe"
+         }
+       }
      }
    }
    ```
@@ -172,7 +177,6 @@ dictator status
 
 # You can also run the service manually:
 dictator daemon
-```
 
 # List recent transcripts
 dictator transcripts
@@ -182,6 +186,7 @@ dictator transcripts -n 5
 
 # Output only text for piping
 dictator transcripts -t
+```
 
 ## Usage
 
@@ -250,11 +255,21 @@ Configuration file location: `~/.config/dictator/config.json`
     "bit_depth": 16,
     "frames_per_block": 1024,
     "max_duration_min": 5
+  },
+  "typing": {
+    "shortcut": "ctrl_shift_v",
+    "niri_app_shortcuts": {
+      "com.t3tools.T3Code": "ctrl_v"
+    }
   }
 }
 ```
 
+Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording.
+
 The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails.
+
+The `typing.shortcut` field selects the default simulated paste shortcut. It accepts `"ctrl_v"` or `"ctrl_shift_v"` and defaults to `"ctrl_shift_v"`. Under Niri, `typing.niri_app_shortcuts` can override that shortcut for the focused application's Niri `app_id`; the example uses Ctrl+V for T3 Code. Applications without an override use `typing.shortcut`, and X11 always uses `typing.shortcut`.
 
 The `notifications` field controls desktop notifications:
 
@@ -309,6 +324,7 @@ make deps
 
 ### Debug Mode
 
+Run `dictator --log-level DEBUG daemon` for diagnostic output.
 
 
 ### Log Files

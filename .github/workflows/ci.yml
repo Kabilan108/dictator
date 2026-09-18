@@ -1,0 +1,20 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v4
+      - name: Check formatting and lints
+        run: nix develop --command make check
+      - name: Run tests
+        run: nix develop --command make test

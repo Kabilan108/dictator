@@ -358,6 +358,7 @@ name = "dictator"
 version = "2.4.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "clap",
  "clap_complete",

@@ -11,10 +11,10 @@ async fn main() {
         .expect("usage: transcribe_file <wav>");
     let cfg = get_config().expect("config");
     let provider = &cfg.api.providers[&cfg.api.active_provider];
-    let client = WhisperClient::new(&cfg.api);
+    let client = WhisperClient::new(&cfg.api).expect("HTTP client");
     let audio_data = std::fs::read(&path).expect("read wav");
     let req = TranscriptionRequest {
-        audio_data,
+        audio_data: audio_data.into(),
         filename: path.clone(),
         model: provider.model.clone(),
         language: String::new(),

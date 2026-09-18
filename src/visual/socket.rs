@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinSet;
@@ -12,13 +12,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::event::*;
+use crate::ipc::unix_socket::{SocketProbe, probe_socket};
 
 pub const RELIABLE_QUEUE_SIZE: usize = 16;
 pub const MAX_CLIENTS: usize = 4;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 const SOCKET_DIR_PERM: u32 = 0o700;
 const SOCKET_FILE_PERM: u32 = 0o600;
-const SOCKET_DIAL_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub type SnapshotFn = Arc<dyn Fn() -> StateEvent + Send + Sync>;
 
@@ -117,11 +117,17 @@ impl Client {
 
 struct SinkState {
     clients: Vec<Arc<Client>>,
-    tasks: JoinSet<()>,
+}
+
+#[derive(Clone, Copy)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
 }
 
 pub struct SocketSink {
     socket_path: PathBuf,
+    socket_identity: SocketIdentity,
     snapshot: SnapshotFn,
     cancel: CancellationToken,
     state: Mutex<SinkState>,
@@ -132,7 +138,13 @@ impl SocketSink {
     /// Binds the OSD socket and starts accepting clients. `snapshot` is called
     /// for every new client so it receives the current state immediately.
     pub fn new(snapshot: Option<SnapshotFn>) -> Result<Arc<Self>> {
-        let socket_path = default_socket_path();
+        Self::with_path(snapshot, default_socket_path())
+    }
+
+    /// Like [`SocketSink::new`] but listens on a custom socket path.
+    pub fn with_path(snapshot: Option<SnapshotFn>, socket_path: PathBuf) -> Result<Arc<Self>> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow!("OSD socket requires a Tokio runtime"))?;
         let dir = socket_path
             .parent()
             .ok_or_else(|| anyhow!("invalid OSD socket path"))?;
@@ -142,32 +154,42 @@ impl SocketSink {
 
         let listener = UnixListener::bind(&socket_path)
             .map_err(|e| anyhow!("failed to listen on OSD socket: {e}"))?;
+        let socket_identity = match socket_identity(&socket_path) {
+            Ok(identity) => identity,
+            Err(err) => {
+                drop(listener);
+                return Err(err);
+            }
+        };
 
         if let Err(err) = std::fs::set_permissions(
             &socket_path,
             std::fs::Permissions::from_mode(SOCKET_FILE_PERM),
         ) {
             drop(listener);
+            let _ = remove_socket_if_owned(&socket_path, socket_identity);
             bail!("failed to set OSD socket permissions: {err}");
         }
 
         let snapshot = snapshot.unwrap_or_else(|| {
             Arc::new(|| new_state_event(StateValue::Idle, None, "")) as SnapshotFn
         });
-
         let sink = Arc::new(Self {
             socket_path: socket_path.clone(),
+            socket_identity,
             snapshot,
             cancel: CancellationToken::new(),
             state: Mutex::new(SinkState {
                 clients: Vec::new(),
-                tasks: JoinSet::new(),
             }),
             accept_task: Mutex::new(None),
         });
 
-        let accept_sink = Arc::clone(&sink);
-        let handle = tokio::spawn(async move { accept_sink.accept_connections(listener).await });
+        let handle = runtime.spawn(accept_connections(
+            Arc::downgrade(&sink),
+            listener,
+            sink.cancel.clone(),
+        ));
         *sink.accept_task.lock().unwrap() = Some(handle);
 
         info!(path = %socket_path.display(), "OSD event socket started");
@@ -207,40 +229,27 @@ impl SocketSink {
     pub async fn close(&self) -> Result<()> {
         self.cancel.cancel();
 
-        let accept_task = self.accept_task.lock().unwrap().take();
-        if let Some(task) = accept_task {
-            let _ = task.await;
-        }
-
-        let mut tasks = {
+        {
             let mut state = self.state.lock().unwrap();
             for client in state.clients.drain(..) {
                 client.close();
             }
-            std::mem::take(&mut state.tasks)
+        }
+
+        let accept_task = self.accept_task.lock().unwrap().take();
+        let task_result = match accept_task {
+            Some(task) => task.await,
+            None => Ok(()),
         };
-        while tasks.join_next().await.is_some() {}
+        let socket_result = remove_socket_if_owned(&self.socket_path, self.socket_identity);
 
-        match std::fs::remove_file(&self.socket_path) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(err.into()),
+        if let Err(err) = task_result {
+            return Err(anyhow!("OSD server task failed during shutdown: {err}"));
         }
+        socket_result
     }
 
-    async fn accept_connections(self: Arc<Self>, listener: UnixListener) {
-        loop {
-            tokio::select! {
-                _ = self.cancel.cancelled() => return,
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, _)) => self.add_client(stream),
-                    Err(err) => warn!(err = %err, "failed to accept OSD client"),
-                }
-            }
-        }
-    }
-
-    fn add_client(self: &Arc<Self>, stream: UnixStream) {
+    fn add_client(&self) -> Option<(Arc<Client>, mpsc::Receiver<Event>)> {
         let (tx, rx) = mpsc::channel::<Event>(RELIABLE_QUEUE_SIZE);
         let client = Arc::new(Client {
             reliable: tx,
@@ -249,11 +258,17 @@ impl SocketSink {
             done: CancellationToken::new(),
         });
 
+        if self.cancel.is_cancelled() {
+            client.close();
+            return None;
+        }
+
+        let snapshot: Event = (self.snapshot)().into();
         let mut state = self.state.lock().unwrap();
 
         if self.cancel.is_cancelled() {
             client.close();
-            return;
+            return None;
         }
 
         if state.clients.len() >= MAX_CLIENTS {
@@ -262,25 +277,17 @@ impl SocketSink {
                 "rejecting OSD client because client limit is reached"
             );
             client.close();
-            drop(stream);
-            return;
+            return None;
         }
 
-        let snapshot: Event = (self.snapshot)().into();
         if !client.publish_reliable(snapshot) {
             client.close();
-            return;
+            return None;
         }
 
         state.clients.push(Arc::clone(&client));
-        let sink = Arc::downgrade(self);
-        state.tasks.spawn(async move {
-            run_client(Arc::clone(&client), stream, rx).await;
-            if let Some(sink) = sink.upgrade() {
-                sink.remove_client(&client);
-            }
-        });
         debug!("OSD client connected");
+        Some((client, rx))
     }
 
     fn remove_client(&self, client: &Arc<Client>) {
@@ -293,11 +300,66 @@ impl SocketSink {
     }
 }
 
-async fn run_client(
-    client: Arc<Client>,
-    mut stream: UnixStream,
-    mut reliable: mpsc::Receiver<Event>,
+impl Drop for SocketSink {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        for client in self.state.lock().unwrap().clients.drain(..) {
+            client.close();
+        }
+        if let Err(err) = remove_socket_if_owned(&self.socket_path, self.socket_identity) {
+            warn!(err = %err, "failed to remove OSD socket while dropping sink");
+        }
+    }
+}
+
+async fn accept_connections(
+    sink: std::sync::Weak<SocketSink>,
+    listener: UnixListener,
+    cancel: CancellationToken,
 ) {
+    let mut clients = JoinSet::new();
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = clients.join_next(), if !clients.is_empty() => {
+                if let Some(Err(err)) = result {
+                    warn!(err = %err, "OSD client task panicked");
+                }
+            }
+            accepted = listener.accept() => match accepted {
+                Ok((stream, _)) => {
+                    let Some(sink_ref) = sink.upgrade() else { break };
+                    let Some((client, rx)) = sink_ref.add_client() else {
+                        drop(stream);
+                        continue;
+                    };
+                    let task_sink = sink.clone();
+                    clients.spawn(async move {
+                        run_client(Arc::clone(&client), stream, rx).await;
+                        if let Some(sink) = task_sink.upgrade() {
+                            sink.remove_client(&client);
+                        }
+                    });
+                }
+                Err(err) => {
+                    warn!(err = %err, "failed to accept OSD client");
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    }
+
+    while let Some(result) = clients.join_next().await {
+        if let Err(err) = result {
+            warn!(err = %err, "OSD client task panicked during shutdown");
+        }
+    }
+}
+
+async fn run_client(client: Arc<Client>, stream: UnixStream, mut reliable: mpsc::Receiver<Event>) {
+    let (mut reader, mut writer) = stream.into_split();
+    let mut peer_input = [0_u8; 1];
     loop {
         if client.done.is_cancelled() {
             break;
@@ -306,7 +368,7 @@ async fn run_client(
         // reliable events first
         match reliable.try_recv() {
             Ok(event) => {
-                if !write_event(&mut stream, &event).await {
+                if !write_event(&mut writer, &event).await {
                     break;
                 }
                 continue;
@@ -316,7 +378,7 @@ async fn run_client(
         }
 
         if let Some(meter) = client.take_meter() {
-            if !write_event(&mut stream, &Event::Meter(meter)).await {
+            if !write_event(&mut writer, &Event::Meter(meter)).await {
                 break;
             }
             continue;
@@ -326,21 +388,34 @@ async fn run_client(
             _ = client.done.cancelled() => break,
             event = reliable.recv() => match event {
                 Some(event) => {
-                    if !write_event(&mut stream, &event).await {
+                    if !write_event(&mut writer, &event).await {
                         break;
                     }
                 }
                 None => break,
             },
             _ = client.wake.notified() => {}
+            result = reader.read(&mut peer_input) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        warn!("disconnecting OSD client that sent unexpected data");
+                        break;
+                    }
+                    Err(err) => {
+                        debug!(err = %err, "OSD client read side closed");
+                        break;
+                    }
+                }
+            }
         }
     }
 
     client.close();
-    let _ = stream.shutdown().await;
+    let _ = writer.shutdown().await;
 }
 
-async fn write_event(stream: &mut UnixStream, event: &Event) -> bool {
+async fn write_event<W: AsyncWrite + Unpin>(stream: &mut W, event: &Event) -> bool {
     let mut payload = match serde_json::to_vec(event) {
         Ok(payload) => payload,
         Err(err) => {
@@ -402,18 +477,42 @@ fn prepare_socket_path(socket_path: &Path) -> Result<()> {
             socket_path.display()
         );
     }
+    let identity = SocketIdentity {
+        device: meta.dev(),
+        inode: meta.ino(),
+    };
 
-    // probe: if something is listening, refuse to clobber it
-    let probe = std::os::unix::net::UnixStream::connect(socket_path);
-    if let Ok(conn) = probe {
-        let _ = conn.set_read_timeout(Some(SOCKET_DIAL_TIMEOUT));
-        drop(conn);
-        bail!("OSD socket already in use: {}", socket_path.display());
+    match probe_socket(socket_path)? {
+        SocketProbe::Active => {
+            bail!("OSD socket already in use: {}", socket_path.display())
+        }
+        SocketProbe::Stale => {}
     }
 
-    match std::fs::remove_file(socket_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => bail!("failed to remove stale OSD socket: {err}"),
+    remove_socket_if_owned(socket_path, identity)
+        .map_err(|err| anyhow!("failed to remove stale OSD socket: {err}"))
+}
+
+fn socket_identity(socket_path: &Path) -> Result<SocketIdentity> {
+    let metadata = std::fs::symlink_metadata(socket_path)?;
+    Ok(SocketIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn remove_socket_if_owned(socket_path: &Path, expected: SocketIdentity) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if !metadata.file_type().is_socket()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.inode
+    {
+        bail!("refusing to remove an OSD socket path no longer owned by this sink");
     }
+    std::fs::remove_file(socket_path)?;
+    Ok(())
 }

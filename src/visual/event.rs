@@ -54,7 +54,8 @@ pub fn new_state_event(
 ) -> StateEvent {
     StateEvent {
         value,
-        recording_duration_ms: recording_duration.map(|d| d.as_millis() as i64),
+        recording_duration_ms: recording_duration
+            .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)),
         message: message.to_string(),
     }
 }
@@ -99,5 +100,11 @@ mod tests {
             serde_json::to_string(&meter).unwrap(),
             r#"{"type":"meter","rms":0.03,"peak":0.2}"#
         );
+    }
+
+    #[test]
+    fn recording_duration_saturates_instead_of_wrapping() {
+        let event = new_state_event(StateValue::Recording, Some(Duration::MAX), "");
+        assert_eq!(event.recording_duration_ms, Some(i64::MAX));
     }
 }

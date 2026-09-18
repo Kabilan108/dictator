@@ -21,7 +21,7 @@
             pname = "dictator";
             version = "2.4.0";
             src = ./.;
-            cargoHash = "sha256-mhAKeIY4WkYRQHrXWkvBEfgA6aLqfLR7/Y/tSkWk5F0=";
+            cargoHash = "sha256-ZW9zsroO0oD7euyQQ8kdF4ypBHyqIVRgM1P/7Vv1iqg=";
 
             DICTATOR_VERSION = version;
 

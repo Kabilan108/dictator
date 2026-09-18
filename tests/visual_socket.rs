@@ -91,6 +91,34 @@ fn default_socket_path_fallback_is_user_scoped() {
     );
 }
 
+#[test]
+fn socket_sink_requires_a_tokio_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = SocketSink::with_path(None, dir.path().join("dictator").join("osd.sock"));
+    let err = match result {
+        Ok(_) => panic!("sink creation outside a runtime must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("Tokio runtime"));
+}
+
+#[tokio::test]
+async fn socket_sink_replaces_a_stale_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dictator").join("osd.sock");
+    std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+    let stale = tokio::net::UnixListener::bind(&socket_path).unwrap();
+    drop(stale);
+
+    let sink = SocketSink::with_path(None, socket_path.clone()).unwrap();
+    let conn = UnixStream::connect(&socket_path).await.unwrap();
+    let mut reader = BufReader::new(conn);
+    read_line(&mut reader, Duration::from_secs(1))
+        .await
+        .expect("snapshot from replacement listener");
+    sink.close().await.unwrap();
+}
+
 #[tokio::test]
 async fn socket_sink_does_not_remove_active_socket() {
     let _guard = lock_env();
@@ -140,4 +168,113 @@ async fn socket_sink_rejects_clients_over_limit() {
     );
 
     sink.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn socket_sink_reclaims_an_idle_client_after_eof() {
+    let _guard = lock_env();
+    let dir = tempfile::tempdir().unwrap();
+    set_runtime_dir(dir.path());
+
+    let sink = SocketSink::new(None).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..MAX_CLIENTS {
+        let conn = UnixStream::connect(default_socket_path()).await.unwrap();
+        let mut reader = BufReader::new(conn);
+        read_line(&mut reader, Duration::from_secs(1))
+            .await
+            .expect("snapshot for accepted client");
+        clients.push(reader);
+    }
+    drop(clients.pop());
+
+    let mut replacement = None;
+    for _ in 0..20 {
+        let conn = UnixStream::connect(default_socket_path()).await.unwrap();
+        let mut reader = BufReader::new(conn);
+        if read_line(&mut reader, Duration::from_millis(100))
+            .await
+            .is_some()
+        {
+            replacement = Some(reader);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        replacement.is_some(),
+        "an EOF client continued to occupy a slot"
+    );
+
+    sink.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn socket_sink_drops_slow_clients_when_reliable_queue_fills() {
+    let _guard = lock_env();
+    let dir = tempfile::tempdir().unwrap();
+    set_runtime_dir(dir.path());
+
+    let sink = SocketSink::new(None).unwrap();
+    let mut clients = Vec::new();
+    for _ in 0..MAX_CLIENTS {
+        let conn = UnixStream::connect(default_socket_path()).await.unwrap();
+        let mut reader = BufReader::new(conn);
+        read_line(&mut reader, Duration::from_secs(1))
+            .await
+            .expect("snapshot for slow client");
+        clients.push(reader);
+    }
+
+    let message = "x".repeat(256 * 1024);
+    for _ in 0..32 {
+        sink.publish(new_state_event(StateValue::Recording, None, &message).into());
+    }
+
+    let replacement = UnixStream::connect(default_socket_path()).await.unwrap();
+    let mut reader = BufReader::new(replacement);
+    read_line(&mut reader, Duration::from_secs(1))
+        .await
+        .expect("snapshot after slow clients were dropped");
+
+    tokio::time::timeout(Duration::from_secs(2), sink.close())
+        .await
+        .expect("sink close timed out")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_socket_sink_releases_listener_and_socket_path() {
+    let _guard = lock_env();
+    let dir = tempfile::tempdir().unwrap();
+    set_runtime_dir(dir.path());
+
+    let sink = SocketSink::new(None).unwrap();
+    let socket_path = sink.socket_path().to_path_buf();
+    drop(sink);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while socket_path.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("dropping the sink left its socket path behind");
+    assert!(UnixStream::connect(socket_path).await.is_err());
+}
+
+#[tokio::test]
+async fn close_does_not_unlink_a_replacement_socket() {
+    let _guard = lock_env();
+    let dir = tempfile::tempdir().unwrap();
+    set_runtime_dir(dir.path());
+
+    let sink = SocketSink::new(None).unwrap();
+    let socket_path = sink.socket_path().to_path_buf();
+    std::fs::remove_file(&socket_path).unwrap();
+    let replacement = tokio::net::UnixListener::bind(&socket_path).unwrap();
+
+    assert!(sink.close().await.is_err());
+    assert!(UnixStream::connect(&socket_path).await.is_ok());
+    drop(replacement);
 }

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use tokio::sync::Mutex;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use zbus::Connection;
 use zbus::zvariant::Value;
 
@@ -20,6 +21,7 @@ const DBUS_PATH: &str = "/org/freedesktop/Notifications";
 const DBUS_INTERFACE: &str = "org.freedesktop.Notifications";
 const METHOD_NOTIFY: &str = "Notify";
 const METHOD_CLOSE: &str = "CloseNotification";
+const DBUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn state_notification(state: DaemonState) -> NotificationContent {
     match state {
@@ -94,29 +96,23 @@ impl DBusNotifier {
     /// Connects to the session bus and verifies the notification service is
     /// available.
     pub async fn new() -> Result<Self> {
-        let conn = match Connection::session().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                error!(err = %err, "failed to connect to session D-Bus");
-                bail!("failed to connect to D-Bus session bus: {err}");
-            }
-        };
+        let conn = tokio::time::timeout(DBUS_TIMEOUT, Connection::session())
+            .await
+            .context("timed out connecting to D-Bus session bus")?
+            .context("failed to connect to D-Bus session bus")?;
 
-        let names: Vec<String> = match zbus::fdo::DBusProxy::new(&conn).await {
-            Ok(proxy) => match proxy.list_names().await {
-                Ok(names) => names.into_iter().map(|n| n.to_string()).collect(),
-                Err(err) => {
-                    error!(err = %err, "failed to list D-Bus names");
-                    bail!("failed to query D-Bus services: {err}");
-                }
-            },
-            Err(err) => {
-                error!(err = %err, "failed to list D-Bus names");
-                bail!("failed to query D-Bus services: {err}");
-            }
-        };
+        let proxy = tokio::time::timeout(DBUS_TIMEOUT, zbus::fdo::DBusProxy::new(&conn))
+            .await
+            .context("timed out creating D-Bus proxy")?
+            .context("failed to create D-Bus proxy")?;
+        let names = tokio::time::timeout(DBUS_TIMEOUT, proxy.list_names())
+            .await
+            .context("timed out listing D-Bus names")?
+            .context("failed to list D-Bus names")?;
+        let service_available = names.iter().any(|name| name.as_str() == DBUS_SERVICE);
+        drop(proxy);
 
-        if !names.iter().any(|n| n == DBUS_SERVICE) {
+        if !service_available {
             warn!(
                 "notification service not available, D-Bus notification service may not be running"
             );
@@ -161,23 +157,31 @@ impl DBusNotifier {
         };
 
         if guard.notification_id != 0 {
-            let result = conn
-                .call_method(
+            let result = tokio::time::timeout(
+                DBUS_TIMEOUT,
+                conn.call_method(
                     Some(DBUS_SERVICE),
                     DBUS_PATH,
                     Some(DBUS_INTERFACE),
                     METHOD_CLOSE,
                     &(guard.notification_id,),
-                )
-                .await;
+                ),
+            )
+            .await;
             match result {
-                Ok(_) => debug!(id = guard.notification_id, "notification closed"),
-                Err(err) => warn!(err = %err, "failed to close notification"),
+                Ok(Ok(_)) => debug!(id = guard.notification_id, "notification closed"),
+                Ok(Err(err)) => warn!(err = %err, "failed to close notification"),
+                Err(_) => warn!("timed out closing notification"),
             }
             guard.notification_id = 0;
         }
 
-        conn.graceful_shutdown().await;
+        if tokio::time::timeout(DBUS_TIMEOUT, conn.graceful_shutdown())
+            .await
+            .is_err()
+        {
+            warn!("timed out shutting down D-Bus connection");
+        }
         debug!("dbus notifier closed");
         Ok(())
     }
@@ -201,8 +205,9 @@ async fn update_notification(
     hints.insert("urgency", Value::U8(1)); // Normal urgency
     let timeout: i32 = -1; // Use default timeout
 
-    let reply = conn
-        .call_method(
+    let reply = tokio::time::timeout(
+        DBUS_TIMEOUT,
+        conn.call_method(
             Some(DBUS_SERVICE),
             DBUS_PATH,
             Some(DBUS_INTERFACE),
@@ -210,17 +215,16 @@ async fn update_notification(
             &(
                 app_name, replace_id, icon, title, body, actions, hints, timeout,
             ),
-        )
-        .await
-        .map_err(|err| {
-            error!(err = %err, "failed to send notification");
-            anyhow!("failed to send notification: {err}")
-        })?;
+        ),
+    )
+    .await
+    .context("timed out sending notification")?
+    .context("failed to send notification")?;
 
-    let new_id: u32 = reply.body().deserialize().map_err(|err| {
-        error!(err = %err, "failed to get notification ID");
-        anyhow!("failed to get notification ID: {err}")
-    })?;
+    let new_id: u32 = reply
+        .body()
+        .deserialize()
+        .context("failed to get notification ID")?;
 
     state.notification_id = new_id;
     debug!(id = new_id, "notification sent successfully");

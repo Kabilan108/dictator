@@ -14,6 +14,8 @@ pub struct Config {
     pub notifications: NotificationMode,
     pub api: ApiConfig,
     pub audio: AudioConfig,
+    #[serde(default)]
+    pub typing: TypingConfig,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,6 +62,29 @@ pub struct AudioConfig {
     pub max_duration_min: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TypingConfig {
+    #[serde(default)]
+    pub shortcut: PasteShortcut,
+    #[serde(default)]
+    pub niri_app_shortcuts: BTreeMap<String, PasteShortcut>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PasteShortcut {
+    CtrlV,
+    #[default]
+    CtrlShiftV,
+}
+
+const MAX_SAMPLE_RATE: i64 = 384_000;
+const MAX_FRAMES_PER_BLOCK: i64 = 1_048_576;
+const MAX_DURATION_MIN: i64 = 24 * 60;
+/// Caps the in-memory float capture buffer at 128 MiB and the encoded PCM at
+/// 64 MiB. This still permits a little over 34 minutes at the default 16 kHz.
+const MAX_CAPTURE_SAMPLES: u64 = 32 * 1024 * 1024;
+
 static ENV_KEY_PATTERN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\{env:([A-Za-z_][A-Za-z0-9_]*)\}").expect("valid regex"));
 
@@ -88,6 +113,7 @@ pub fn default_config() -> Config {
             frames_per_block: 1024,
             max_duration_min: 5,
         },
+        typing: TypingConfig::default(),
     }
 }
 
@@ -119,20 +145,54 @@ pub fn validate(config: &Config) -> Result<()> {
         bail!("API timeout must be > 0");
     }
 
-    if config.audio.sample_rate <= 0 {
+    validate_audio_config(&config.audio)
+}
+
+/// Validates values both against the recorder's supported PCM format and the
+/// integer limits used by CPAL and the WAV container.
+pub fn validate_audio_config(audio: &AudioConfig) -> Result<()> {
+    if audio.sample_rate <= 0 {
         bail!("audio sample rate must be positive");
     }
-    if config.audio.channels <= 0 {
-        bail!("audio channels must be positive");
+    if audio.sample_rate > MAX_SAMPLE_RATE {
+        bail!("audio sample rate must be <= {MAX_SAMPLE_RATE}");
     }
-    if config.audio.bit_depth <= 0 {
-        bail!("audio bit depth must be positive");
+    if audio.channels != 1 {
+        bail!("audio channels must be 1 (mono)");
     }
-    if config.audio.frames_per_block <= 0 {
+    if audio.bit_depth != 16 {
+        bail!("audio bit depth must be 16");
+    }
+    if audio.frames_per_block <= 0 {
         bail!("audio frames per block must be positive");
     }
-    if config.audio.max_duration_min <= 0 {
+    if audio.frames_per_block > MAX_FRAMES_PER_BLOCK {
+        bail!("audio frames per block must be <= {MAX_FRAMES_PER_BLOCK}");
+    }
+    if audio.max_duration_min <= 0 {
         bail!("audio max duration min must be positive");
+    }
+    if audio.max_duration_min > MAX_DURATION_MIN {
+        bail!("audio max duration min must be <= {MAX_DURATION_MIN}");
+    }
+
+    let capture_samples = u64::try_from(audio.sample_rate)
+        .ok()
+        .and_then(|sample_rate| sample_rate.checked_mul(60))
+        .and_then(|per_minute| {
+            u64::try_from(audio.max_duration_min)
+                .ok()
+                .and_then(|minutes| per_minute.checked_mul(minutes))
+        })
+        .ok_or_else(|| anyhow!("configured audio capture size overflows"))?;
+    if capture_samples > MAX_CAPTURE_SAMPLES {
+        bail!("configured audio capture exceeds the {MAX_CAPTURE_SAMPLES}-sample memory limit");
+    }
+    let capture_bytes = capture_samples
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("configured audio capture size overflows"))?;
+    if capture_bytes > u64::from(u32::MAX - 36) {
+        bail!("configured audio capture is too large for a WAV file");
     }
 
     Ok(())
@@ -316,6 +376,39 @@ mod tests {
     }
 
     #[test]
+    fn validates_supported_audio_format_and_wav_size() {
+        let mut audio = default_config().audio;
+        assert!(validate_audio_config(&audio).is_ok());
+
+        audio.channels = 2;
+        assert_eq!(
+            validate_audio_config(&audio).unwrap_err().to_string(),
+            "audio channels must be 1 (mono)"
+        );
+
+        audio.channels = 1;
+        audio.bit_depth = 24;
+        assert_eq!(
+            validate_audio_config(&audio).unwrap_err().to_string(),
+            "audio bit depth must be 16"
+        );
+
+        audio.bit_depth = 16;
+        audio.sample_rate = MAX_SAMPLE_RATE;
+        audio.max_duration_min = MAX_DURATION_MIN;
+        assert_eq!(
+            validate_audio_config(&audio).unwrap_err().to_string(),
+            format!(
+                "configured audio capture exceeds the {MAX_CAPTURE_SAMPLES}-sample memory limit"
+            )
+        );
+
+        audio.sample_rate = 16_000;
+        audio.max_duration_min = 20;
+        assert!(validate_audio_config(&audio).is_ok());
+    }
+
+    #[test]
     fn deep_merge_keeps_defaults() {
         let mut base = serde_json::to_value(default_config()).unwrap();
         deep_merge(
@@ -327,5 +420,47 @@ mod tests {
         assert_eq!(cfg.audio.sample_rate, 16000);
         assert_eq!(cfg.notifications, NotificationMode::Off);
         assert_eq!(cfg.api.providers["openai"].model, "gpt-4o-transcribe");
+    }
+
+    #[test]
+    fn legacy_config_without_typing_uses_defaults() {
+        let mut value = serde_json::to_value(default_config()).unwrap();
+        value.as_object_mut().unwrap().remove("typing");
+
+        let cfg: Config = serde_json::from_value(value).unwrap();
+
+        assert_eq!(cfg.typing, TypingConfig::default());
+    }
+
+    #[test]
+    fn parses_typing_shortcut_and_niri_app_overrides() {
+        let typing: TypingConfig = serde_json::from_value(serde_json::json!({
+            "shortcut": "ctrl_v",
+            "niri_app_shortcuts": {
+                "com.t3tools.T3Code": "ctrl_v",
+                "com.example.Terminal": "ctrl_shift_v"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(typing.shortcut, PasteShortcut::CtrlV);
+        assert_eq!(
+            typing.niri_app_shortcuts["com.t3tools.T3Code"],
+            PasteShortcut::CtrlV
+        );
+        assert_eq!(
+            typing.niri_app_shortcuts["com.example.Terminal"],
+            PasteShortcut::CtrlShiftV
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_typing_shortcut() {
+        let err = serde_json::from_value::<TypingConfig>(serde_json::json!({
+            "shortcut": "shift_insert"
+        }))
+        .unwrap_err();
+
+        assert!(err.to_string().contains("unknown variant `shift_insert`"));
     }
 }

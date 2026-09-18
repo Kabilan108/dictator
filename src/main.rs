@@ -221,18 +221,12 @@ async fn run_daemon() {
     exit_if_error(d.run().await, 1);
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let cli = Cli::parse();
     utils::setup_logger(&cli.log_level);
 
+    let daemon_runtime = matches!(&cli.command, Commands::Daemon);
     match cli.command {
-        Commands::Daemon => run_daemon().await,
-        Commands::Start => run_command(ipc::ACTION_START, "Recording started").await,
-        Commands::Stop => run_command(ipc::ACTION_STOP, "Recording stopped, transcribing").await,
-        Commands::Toggle => run_command(ipc::ACTION_TOGGLE, "toggled daemon").await,
-        Commands::Cancel => run_command(ipc::ACTION_CANCEL, "operation canceled").await,
-        Commands::Status => run_status().await,
         Commands::Version => println!("{VERSION}"),
         Commands::Init => run_init(),
         Commands::Transcripts { num, text } => run_transcripts(num, text),
@@ -240,5 +234,36 @@ async fn main() {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "dictator", &mut std::io::stdout());
         }
+        command => run_async(command, daemon_runtime),
     }
+}
+
+fn run_async(command: Commands, daemon_runtime: bool) {
+    let runtime = if daemon_runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    };
+    let runtime = exit_if_error(runtime.map_err(anyhow::Error::from), 1);
+
+    runtime.block_on(async move {
+        match command {
+            Commands::Daemon => run_daemon().await,
+            Commands::Start => run_command(ipc::ACTION_START, "Recording started").await,
+            Commands::Stop => {
+                run_command(ipc::ACTION_STOP, "Recording stopped, transcribing").await
+            }
+            Commands::Toggle => run_command(ipc::ACTION_TOGGLE, "toggled daemon").await,
+            Commands::Cancel => run_command(ipc::ACTION_CANCEL, "operation canceled").await,
+            Commands::Status => run_status().await,
+            Commands::Version
+            | Commands::Init
+            | Commands::Transcripts { .. }
+            | Commands::Completion { .. } => unreachable!("sync command routed to async runtime"),
+        }
+    });
 }

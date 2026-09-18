@@ -1,9 +1,9 @@
-.PHONY: build install deps clean test fmt check run release
+.PHONY: build install deps clean test fmt check run release FORCE
 
 VERSION ?= $(shell git describe --tags --always --dirty)
 CARGO ?= cargo
 
-build/dictator: $(shell find src tests -name '*.rs') Cargo.toml Cargo.lock
+build/dictator: FORCE $(shell find src tests -name '*.rs') Cargo.toml Cargo.lock build.rs
 	DICTATOR_VERSION=$(VERSION) $(CARGO) build --release
 	mkdir -p build
 	cp target/release/dictator build/dictator
@@ -32,3 +32,5 @@ check:
 
 run: build
 	./build/dictator daemon
+
+FORCE:
