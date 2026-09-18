@@ -18,6 +18,7 @@ use crate::ipc::unix_socket::{SocketProbe, ensure_private_socket_parent, probe_s
 pub const RELIABLE_QUEUE_SIZE: usize = 16;
 pub const MAX_CLIENTS: usize = 4;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
+const SNAPSHOT_RETRY_LIMIT: usize = 3;
 const SOCKET_FILE_PERM: u32 = 0o600;
 
 pub type SnapshotFn = Arc<dyn Fn() -> StateEvent + Send + Sync>;
@@ -89,6 +90,8 @@ impl Client {
 
 struct SinkState {
     clients: Vec<Arc<Client>>,
+    state_generation: u64,
+    latest_state: Option<StateEvent>,
 }
 
 #[derive(Clone, Copy)]
@@ -149,6 +152,8 @@ impl SocketSink {
             cancel: CancellationToken::new(),
             state: Mutex::new(SinkState {
                 clients: Vec::new(),
+                state_generation: 0,
+                latest_state: None,
             }),
             accept_task: Mutex::new(None),
         });
@@ -170,6 +175,10 @@ impl SocketSink {
 
     pub fn publish(&self, event: Event) {
         let mut state = self.state.lock().unwrap();
+        if let Event::State(state_event) = &event {
+            state.state_generation = state.state_generation.wrapping_add(1);
+            state.latest_state = Some(state_event.clone());
+        }
 
         let mut dropped: Vec<usize> = Vec::new();
         for (idx, client) in state.clients.iter().enumerate() {
@@ -231,31 +240,63 @@ impl SocketSink {
             return None;
         }
 
-        let snapshot: Event = (self.snapshot)().into();
-        let mut state = self.state.lock().unwrap();
+        let mut snapshot_retries = 0;
+        loop {
+            let generation = {
+                let state = self.state.lock().unwrap();
+                if state.clients.len() >= MAX_CLIENTS {
+                    warn!(
+                        limit = MAX_CLIENTS,
+                        "rejecting OSD client because client limit is reached"
+                    );
+                    client.close();
+                    return None;
+                }
+                state.state_generation
+            };
 
-        if self.cancel.is_cancelled() {
-            client.close();
-            return None;
+            // The callback can acquire daemon locks, so do not call it while
+            // holding the client registry lock. If a publish races the
+            // callback, retry the snapshot instead of registering a client
+            // with state from before an event it never received.
+            let mut snapshot: Event = (self.snapshot)().into();
+            let mut state = self.state.lock().unwrap();
+
+            if self.cancel.is_cancelled() {
+                client.close();
+                return None;
+            }
+            if state.clients.len() >= MAX_CLIENTS {
+                warn!(
+                    limit = MAX_CLIENTS,
+                    "rejecting OSD client because client limit is reached"
+                );
+                client.close();
+                return None;
+            }
+            if state.state_generation != generation {
+                if snapshot_retries < SNAPSHOT_RETRY_LIMIT {
+                    snapshot_retries += 1;
+                    continue;
+                }
+                // A reentrant callback can publish on every invocation. Avoid
+                // retrying forever and use the newest state event observed by
+                // the sink as the registration snapshot.
+                snapshot = state
+                    .latest_state
+                    .clone()
+                    .expect("a changed state generation has a cached event")
+                    .into();
+            }
+            if !client.publish_reliable(snapshot) {
+                client.close();
+                return None;
+            }
+
+            state.clients.push(Arc::clone(&client));
+            debug!("OSD client connected");
+            return Some((client, rx));
         }
-
-        if state.clients.len() >= MAX_CLIENTS {
-            warn!(
-                limit = MAX_CLIENTS,
-                "rejecting OSD client because client limit is reached"
-            );
-            client.close();
-            return None;
-        }
-
-        if !client.publish_reliable(snapshot) {
-            client.close();
-            return None;
-        }
-
-        state.clients.push(Arc::clone(&client));
-        debug!("OSD client connected");
-        Some((client, rx))
     }
 
     fn remove_client(&self, client: &Arc<Client>) {

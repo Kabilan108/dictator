@@ -1,7 +1,7 @@
 #![allow(clippy::await_holding_lock)]
 
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc as std_mpsc};
 use std::time::Duration;
 
 use dictator::visual::{
@@ -75,6 +75,98 @@ async fn socket_sink_sends_snapshot_and_events() {
 
     sink.close().await.unwrap();
     assert!(!default_socket_path().exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn client_registration_does_not_lose_a_concurrent_state_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = dir.path().join("dictator").join("osd.sock");
+
+    let state = Arc::new(Mutex::new(StateValue::Idle));
+    let (snapshot_started_tx, snapshot_started_rx) = std_mpsc::channel();
+    let (release_snapshot_tx, release_snapshot_rx) = std_mpsc::channel();
+    let release_snapshot_rx = Arc::new(Mutex::new(release_snapshot_rx));
+    let first_snapshot = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+    let snapshot_state = Arc::clone(&state);
+    let snapshot_release = Arc::clone(&release_snapshot_rx);
+    let snapshot_is_first = Arc::clone(&first_snapshot);
+    let snapshot = Arc::new(move || {
+        let value = *snapshot_state.lock().unwrap();
+        if snapshot_is_first.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            snapshot_started_tx.send(()).unwrap();
+            snapshot_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(1))
+                .expect("test did not release the first snapshot");
+        }
+        new_state_event(value, None, "")
+    });
+    let sink = SocketSink::with_path(Some(snapshot), socket_path.clone()).unwrap();
+
+    let conn = UnixStream::connect(&socket_path).await.unwrap();
+    snapshot_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("client registration did not start its snapshot");
+
+    *state.lock().unwrap() = StateValue::Recording;
+    sink.publish(new_state_event(StateValue::Recording, None, "").into());
+    release_snapshot_tx.send(()).unwrap();
+
+    let mut reader = BufReader::new(conn);
+    let line = read_line(&mut reader, Duration::from_secs(1))
+        .await
+        .expect("registered client did not receive a state snapshot");
+    let event: Event = serde_json::from_str(&line).unwrap();
+    match event {
+        Event::State(state) => assert_eq!(state.value, StateValue::Recording),
+        other => panic!("expected state snapshot, got {other:?}"),
+    }
+
+    sink.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn reentrant_snapshot_publish_has_a_bounded_registration_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let socket_path = dir.path().join("dictator").join("osd.sock");
+
+    let sink_slot: Arc<Mutex<std::sync::Weak<SocketSink>>> =
+        Arc::new(Mutex::new(std::sync::Weak::new()));
+    let snapshot_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let callback_sink = Arc::clone(&sink_slot);
+    let callback_calls = Arc::clone(&snapshot_calls);
+    let snapshot = Arc::new(move || {
+        let invocation = callback_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(
+            invocation < 10,
+            "snapshot registration retried without a bound"
+        );
+        let sink = callback_sink.lock().unwrap().upgrade();
+        if let Some(sink) = sink {
+            sink.publish(new_state_event(StateValue::Recording, None, "").into());
+        }
+        new_state_event(StateValue::Idle, None, "")
+    });
+    let sink = SocketSink::with_path(Some(snapshot), socket_path.clone()).unwrap();
+    *sink_slot.lock().unwrap() = Arc::downgrade(&sink);
+
+    let conn = UnixStream::connect(&socket_path).await.unwrap();
+    let mut reader = BufReader::new(conn);
+    let line = read_line(&mut reader, Duration::from_secs(1))
+        .await
+        .expect("reentrant snapshot did not finish client registration");
+    let event: Event = serde_json::from_str(&line).unwrap();
+    match event {
+        Event::State(state) => assert_eq!(state.value, StateValue::Recording),
+        other => panic!("expected state snapshot, got {other:?}"),
+    }
+    assert!(snapshot_calls.load(std::sync::atomic::Ordering::SeqCst) > 1);
+
+    sink.close().await.unwrap();
 }
 
 #[test]
