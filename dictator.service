@@ -2,6 +2,7 @@
 Description=Dictator voice typing daemon
 Documentation=https://github.com/kabilan108/dictator
 After=graphical-session.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -25,4 +26,4 @@ RestrictRealtime=true
 RestrictSUIDSGID=true
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

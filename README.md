@@ -123,10 +123,29 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
    Environment=XDG_CONFIG_HOME=/absolute/path/to/config-root
    ```
 
-   After adding any needed drop-in, enable and start the service:
+   After adding any needed drop-in, enable the service. This attaches it to
+   `graphical-session.target` without starting it during a headless login:
    ```bash
-   systemctl --user enable --now dictator.service
+   systemctl --user enable dictator.service
    ```
+
+   A desktop session must import its display environment into the systemd user
+   manager before Dictator starts. Many desktop environments already do this
+   and activate `graphical-session.target`. Run these commands once from a
+   terminal in the current graphical session to start Dictator now. For a custom
+   compositor, also add them to its graphical-session startup, in this order:
+   ```bash
+   systemctl --user import-environment \
+     DISPLAY XAUTHORITY WAYLAND_DISPLAY XDG_SESSION_TYPE DBUS_SESSION_BUS_ADDRESS
+   if [ -n "${NIRI_SOCKET:-}" ]; then
+     systemctl --user import-environment NIRI_SOCKET
+   fi
+   systemctl --user start dictator.service
+   ```
+
+   Run that startup hook from the graphical session, not from a shell profile
+   or headless boot. It starts Dictator directly and does not manually start
+   `graphical-session.target` on compositors that do not manage that target.
 
    The service reads `~/.config/dictator/environment` if it exists. Keep that
    file private because it contains the API key. If you run `dictator daemon`
