@@ -70,6 +70,26 @@ struct LevelMailbox {
     notification_pending: AtomicBool,
 }
 
+struct OwnerThreadRegistration {
+    owner_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
+}
+
+impl OwnerThreadRegistration {
+    fn new(owner_thread: Arc<Mutex<Option<std::thread::ThreadId>>>) -> Self {
+        *owner_thread.lock().unwrap() = Some(std::thread::current().id());
+        Self { owner_thread }
+    }
+}
+
+impl Drop for OwnerThreadRegistration {
+    fn drop(&mut self) {
+        let mut owner = self.owner_thread.lock().unwrap();
+        if owner.is_some_and(|id| id == std::thread::current().id()) {
+            *owner = None;
+        }
+    }
+}
+
 /// Records mono float32 audio from the default input device into memory and
 /// encodes it as 16-bit PCM WAV on stop.
 pub struct Recorder {
@@ -79,6 +99,7 @@ pub struct Recorder {
     capture: Arc<Mutex<CaptureState>>,
     level: Arc<Mutex<LevelState>>,
     stream_error: Arc<Mutex<Option<String>>>,
+    owner_thread: Arc<Mutex<Option<std::thread::ThreadId>>>,
 }
 
 impl Recorder {
@@ -122,6 +143,7 @@ impl Recorder {
                 last_level_at: None,
             })),
             stream_error: Arc::new(Mutex::new(None)),
+            owner_thread: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -148,6 +170,7 @@ impl Recorder {
     }
 
     pub fn start(&self) -> Result<()> {
+        self.reject_owner_thread_control()?;
         let _control = self.control.lock().unwrap();
         let mut inner = self.inner.lock().unwrap();
 
@@ -224,6 +247,7 @@ impl Recorder {
         let capture = Arc::clone(&self.capture);
         let level = Arc::clone(&self.level);
         let stream_error = Arc::clone(&self.stream_error);
+        let owner_thread = Arc::clone(&self.owner_thread);
         let level_mailbox = Arc::new(LevelMailbox::default());
         // At most one coalesced level notification plus one control message.
         let (command_tx, command_rx) = mpsc::sync_channel::<StreamCommand>(2);
@@ -233,6 +257,7 @@ impl Recorder {
         let thread = std::thread::Builder::new()
             .name("dictator-audio".into())
             .spawn(move || {
+                let _owner_registration = OwnerThreadRegistration::new(owner_thread);
                 let host = cpal::default_host();
                 let Some(device) = host.default_input_device() else {
                     let _ = ready_tx.send(Err(anyhow!(
@@ -353,11 +378,13 @@ impl Recorder {
     }
 
     fn stop_and_wait_samples(&self) -> Result<(Vec<f32>, DateTime<Local>)> {
+        self.reject_owner_thread_control()?;
         let _control = self.control.lock().unwrap();
         self.stop_and_wait_samples_locked()
     }
 
     fn stop_and_wait_samples_locked(&self) -> Result<(Vec<f32>, DateTime<Local>)> {
+        self.reject_owner_thread_control()?;
         let mut inner = self.inner.lock().unwrap();
         if inner.stream.is_none() {
             bail!("recorder is not recording");
@@ -482,6 +509,7 @@ impl Recorder {
     }
 
     pub fn close(&self) -> Result<()> {
+        self.reject_owner_thread_control()?;
         let _control = self.control.lock().unwrap();
         if self.inner.lock().unwrap().stream.is_some() {
             warn!("recorder still active during close, stopping recording");
@@ -491,6 +519,18 @@ impl Recorder {
             }
         }
         debug!("audio recorder closed");
+        Ok(())
+    }
+
+    fn reject_owner_thread_control(&self) -> Result<()> {
+        if self
+            .owner_thread
+            .lock()
+            .unwrap()
+            .is_some_and(|id| id == std::thread::current().id())
+        {
+            bail!("cannot control recorder from its audio stream thread");
+        }
         Ok(())
     }
 }
@@ -516,6 +556,10 @@ impl Drop for Recorder {
 
         if let Some(handle) = stream {
             let _ = handle.command_tx.send(StreamCommand::Stop);
+            if handle.thread.thread().id() == std::thread::current().id() {
+                // The owner will observe Stop after the current callback returns.
+                return;
+            }
             if handle.thread.join().is_err() {
                 error!("audio stream thread panicked during recorder drop");
             }
@@ -751,6 +795,126 @@ mod tests {
         let capture = recorder.capture.lock().unwrap();
         assert!(capture.buffer.is_empty());
         assert!(!capture.accepting);
+    }
+
+    #[test]
+    fn observer_cannot_reentrantly_stop_or_discard_recording() {
+        let recorder = Arc::new(Recorder::for_test(cfg()));
+        let (result_tx, result_rx) = mpsc::channel();
+        let weak_recorder = Arc::downgrade(&recorder);
+        recorder.set_level_observer(
+            Some(Arc::new(move |_| {
+                let err = weak_recorder
+                    .upgrade()
+                    .expect("recorder remains alive")
+                    .stop()
+                    .unwrap_err()
+                    .to_string();
+                result_tx.send(err).unwrap();
+            })),
+            Duration::ZERO,
+        );
+
+        let (command_tx, command_rx) = mpsc::sync_channel(2);
+        let (invoke_tx, invoke_rx) = mpsc::channel();
+        let level = Arc::clone(&recorder.level);
+        let owner_thread = Arc::clone(&recorder.owner_thread);
+        let thread = std::thread::spawn(move || {
+            let _owner_registration = OwnerThreadRegistration::new(owner_thread);
+            invoke_rx.recv().unwrap();
+            deliver_level_sample(&level, LevelSample::default());
+            while let Ok(command) = command_rx.recv() {
+                if matches!(command, StreamCommand::Stop) {
+                    break;
+                }
+            }
+        });
+        {
+            let mut inner = recorder.inner.lock().unwrap();
+            inner.state = RecorderState::Recording;
+            inner.stream = Some(StreamHandle { command_tx, thread });
+        }
+        {
+            let mut capture = recorder.capture.lock().unwrap();
+            capture.accepting = true;
+            capture.buffer.extend_from_slice(&[0.25, -0.25]);
+        }
+
+        invoke_tx.send(()).unwrap();
+        let err = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(err, "cannot control recorder from its audio stream thread");
+        assert_eq!(recorder.get_state(), RecorderState::Recording);
+        assert!(recorder.inner.lock().unwrap().stream.is_some());
+        let capture = recorder.capture.lock().unwrap();
+        assert_eq!(capture.buffer, [0.25, -0.25]);
+        assert!(capture.accepting);
+        drop(capture);
+        recorder.cancel().unwrap();
+    }
+
+    #[test]
+    fn observer_reentrant_stop_does_not_deadlock_external_stop() {
+        let recorder = Arc::new(Recorder::for_test(cfg()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (proceed_tx, proceed_rx) = mpsc::channel();
+        let proceed_rx = Arc::new(Mutex::new(proceed_rx));
+        let (result_tx, result_rx) = mpsc::channel();
+        let weak_recorder = Arc::downgrade(&recorder);
+        recorder.set_level_observer(
+            Some(Arc::new(move |_| {
+                entered_tx.send(()).unwrap();
+                proceed_rx.lock().unwrap().recv().unwrap();
+                let err = weak_recorder
+                    .upgrade()
+                    .expect("recorder remains alive")
+                    .stop()
+                    .unwrap_err()
+                    .to_string();
+                result_tx.send(err).unwrap();
+            })),
+            Duration::ZERO,
+        );
+
+        let (command_tx, command_rx) = mpsc::sync_channel(2);
+        let (invoke_tx, invoke_rx) = mpsc::channel();
+        let level = Arc::clone(&recorder.level);
+        let owner_thread = Arc::clone(&recorder.owner_thread);
+        let thread = std::thread::spawn(move || {
+            let _owner_registration = OwnerThreadRegistration::new(owner_thread);
+            invoke_rx.recv().unwrap();
+            deliver_level_sample(&level, LevelSample::default());
+            while let Ok(command) = command_rx.recv() {
+                if matches!(command, StreamCommand::Stop) {
+                    break;
+                }
+            }
+        });
+        {
+            let mut inner = recorder.inner.lock().unwrap();
+            inner.state = RecorderState::Recording;
+            inner.stream = Some(StreamHandle { command_tx, thread });
+        }
+
+        invoke_tx.send(()).unwrap();
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let stopping_recorder = Arc::clone(&recorder);
+        let external_stop = std::thread::spawn(move || stopping_recorder.cancel());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while recorder.inner.lock().unwrap().stream.is_some() {
+            assert!(
+                Instant::now() < deadline,
+                "external stop did not reach join"
+            );
+            std::thread::yield_now();
+        }
+        proceed_tx.send(()).unwrap();
+
+        let err = result_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(err, "cannot control recorder from its audio stream thread");
+        external_stop.join().unwrap().unwrap();
+        assert_eq!(recorder.get_state(), RecorderState::Stopped);
     }
 
     #[test]
