@@ -48,33 +48,23 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
    make build
    ```
 
-2. **Install to system (optional):**
+2. **Install for the current user:**
    ```bash
    make install
    ```
 
-3. **Set up as systemd service:**
-
-   **For traditional Linux distributions:**
-   ```bash
-   # Copy the service file
-   sudo cp dictator.service /etc/systemd/system/dictator@.service
-
-   # Reload systemd and enable the service for your user
-   sudo systemctl daemon-reload
-   sudo systemctl enable dictator@$USER.service
-
-   # Start the service
-   sudo systemctl start dictator@$USER.service
-   ```
-
-4. **Configure API access:**
+3. **Configure API access:**
    ```bash
    dictator init
    $EDITOR ~/.config/dictator/config.json
+
+   # Store service secrets outside config.json
+   touch ~/.config/dictator/environment
+   chmod 600 ~/.config/dictator/environment
+   $EDITOR ~/.config/dictator/environment
    ```
 
-   Add your Whisper API endpoint and key:
+   Add your Whisper API endpoint and an environment-variable reference for the key:
    ```json
    {
      "enable_osd": true,
@@ -92,6 +82,24 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
      }
    }
    ```
+
+   Add the referenced variable to `~/.config/dictator/environment` using systemd
+   `EnvironmentFile` syntax (no `export`):
+   ```text
+   OPENAI_API_KEY=replace-with-your-key
+   ```
+
+4. **Set up the systemd user service:**
+   ```bash
+   mkdir -p ~/.config/systemd/user
+   cp dictator.service ~/.config/systemd/user/dictator.service
+   systemctl --user daemon-reload
+   systemctl --user enable --now dictator.service
+   ```
+
+   The service reads `~/.config/dictator/environment` if it exists. Keep that
+   file private because it contains the API key. If you run `dictator daemon`
+   directly instead, export `OPENAI_API_KEY` in that shell first.
 
 ### Home Manager (Nix)
 
@@ -197,15 +205,15 @@ The daemon runs in the background and handles all audio recording, transcription
 #### Using systemd:
 ```bash
 # Check service status
-sudo systemctl status dictator@$USER.service
+systemctl --user status dictator.service
 
 # Start/stop/restart the service
-sudo systemctl start dictator@$USER.service
-sudo systemctl stop dictator@$USER.service
-sudo systemctl restart dictator@$USER.service
+systemctl --user start dictator.service
+systemctl --user stop dictator.service
+systemctl --user restart dictator.service
 
 # View service logs
-journalctl -u dictator@$USER.service -f
+journalctl --user -u dictator.service -f
 ```
 
 #### Manual execution:
@@ -271,7 +279,7 @@ Configuration file location: `~/.config/dictator/config.json`
 
 Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording.
 
-The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails.
+The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails. The supplied systemd user service loads variables from `~/.config/dictator/environment` when that file exists.
 
 The `typing.shortcut` field selects the default simulated paste shortcut. It accepts `"ctrl_v"` or `"ctrl_shift_v"` and defaults to `"ctrl_shift_v"`. Under Niri, `typing.niri_app_shortcuts` can override that shortcut for the focused application's Niri `app_id`; the example uses Ctrl+V for T3 Code. Applications without an override use `typing.shortcut`, and X11 always uses `typing.shortcut`.
 
