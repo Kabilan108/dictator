@@ -158,6 +158,9 @@ impl Client {
 
     /// Waits until the daemon accepts connections, polling every `check_interval`.
     pub async fn wait_for_daemon(&self, check_interval: Duration) -> Result<()> {
+        if check_interval.is_zero() {
+            bail!("check interval must be greater than zero");
+        }
         debug!("waiting for daemon to become available");
         let mut ticker = tokio::time::interval(check_interval);
         ticker.tick().await;
@@ -177,6 +180,16 @@ mod tests {
 
     use tokio::net::UnixListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn zero_poll_interval_returns_an_error() {
+        let client = Client::with_path(PathBuf::from("/unused/dictator.sock"));
+        let error = client.wait_for_daemon(Duration::ZERO).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "check interval must be greater than zero"
+        );
+    }
 
     #[tokio::test]
     async fn timeout_reports_unknown_outcome_after_command_was_received() {

@@ -1,5 +1,6 @@
 use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Arc;
 
 use tracing::Level;
@@ -33,12 +34,7 @@ pub fn setup_logger(level: &str) {
 
     let log_path = STATE_DIR.join("app.log");
     let _ = std::fs::create_dir_all(&*STATE_DIR);
-    match OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(&log_path)
-    {
+    match open_private_log(&log_path) {
         Ok(file) => {
             let file_layer = fmt::layer()
                 .json()
@@ -56,5 +52,36 @@ pub fn setup_logger(level: &str) {
             eprintln!("warning: failed to open log file: {err}");
             registry().with(filter).with(stderr_layer).init();
         }
+    }
+}
+
+fn open_private_log(path: &Path) -> std::io::Result<std::fs::File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)?;
+    // mode() applies only at creation. Secure migrated logs through the opened
+    // descriptor before a subscriber is allowed to append any new records.
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    #[test]
+    fn migrated_log_is_private_and_preserves_existing_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        std::fs::write(&path, b"old record\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mut file = open_private_log(&path).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        file.write_all(b"new record\n").unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"old record\nnew record\n");
     }
 }
