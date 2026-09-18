@@ -380,6 +380,20 @@ mod tests {
         let mut audio = default_config().audio;
         assert!(validate_audio_config(&audio).is_ok());
 
+        audio.sample_rate = i64::from(u32::MAX) + 1;
+        assert_eq!(
+            validate_audio_config(&audio).unwrap_err().to_string(),
+            format!("audio sample rate must be <= {MAX_SAMPLE_RATE}")
+        );
+
+        audio.sample_rate = 16_000;
+        audio.max_duration_min = i64::MAX;
+        assert_eq!(
+            validate_audio_config(&audio).unwrap_err().to_string(),
+            format!("audio max duration min must be <= {MAX_DURATION_MIN}")
+        );
+
+        audio.max_duration_min = 5;
         audio.channels = 2;
         assert_eq!(
             validate_audio_config(&audio).unwrap_err().to_string(),
