@@ -2,8 +2,9 @@
 Copyright © 2025 kabilan108 tonykabilanokeke@gmail.com
 */
 
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -133,28 +134,65 @@ async fn run_status() {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateOutcome {
+    Created,
+    AlreadyExists,
+}
+
+struct TempPath(PathBuf);
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn atomic_create_file_with(
+    path: &Path,
+    writer: impl FnOnce(&mut std::fs::File) -> io::Result<()>,
+) -> io::Result<CreateOutcome> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(CreateOutcome::AlreadyExists),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
+    let temp_path = parent.join(format!(".config.json.{}.tmp", uuid::Uuid::new_v4()));
+    let mut temp = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp_path)?;
+    let cleanup = TempPath(temp_path.clone());
+
+    writer(&mut temp)?;
+    temp.sync_all()?;
+    drop(temp);
+
+    let outcome = match std::fs::hard_link(&temp_path, path) {
+        Ok(()) => CreateOutcome::Created,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => CreateOutcome::AlreadyExists,
+        Err(err) => return Err(err),
+    };
+    drop(cleanup);
+    Ok(outcome)
+}
+
+fn initialize_config(config_dir: &Path, data: &[u8]) -> io::Result<CreateOutcome> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(config_dir)?;
+
+    atomic_create_file_with(&config_dir.join("config.json"), |file| file.write_all(data))
+}
+
 fn run_init() {
     let config_dir = &*utils::CONFIG_DIR;
-    if let Err(err) = std::fs::create_dir_all(config_dir) {
-        eprintln!("failed to create config dir: {err}");
-        std::process::exit(1);
-    }
-
     let config_path = config_dir.join("config.json");
-    match std::fs::metadata(&config_path) {
-        Ok(_) => {
-            eprintln!("Config already exists at {}", config_path.display());
-            return;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => {
-            eprintln!("failed to check config: {err}");
-            std::process::exit(1);
-        }
-    }
-
-    let cfg = utils::default_config();
-    let data = match serde_json::to_string_pretty(&cfg) {
+    let data = match serde_json::to_vec_pretty(&utils::default_config()) {
         Ok(data) => data,
         Err(err) => {
             eprintln!("failed to serialize default config: {err}");
@@ -162,19 +200,21 @@ fn run_init() {
         }
     };
 
-    let write = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&config_path)
-        .and_then(|mut f| f.write_all(data.as_bytes()));
-    if let Err(err) = write {
-        eprintln!("failed to write config file: {err}");
-        std::process::exit(1);
+    match initialize_config(config_dir, &data) {
+        Ok(CreateOutcome::Created) => {
+            eprintln!("Config written to {}", config_path.display());
+            eprintln!(
+                "Update api.providers.openai.key with your API key, then run 'dictator daemon'."
+            );
+        }
+        Ok(CreateOutcome::AlreadyExists) => {
+            eprintln!("Config already exists at {}", config_path.display());
+        }
+        Err(err) => {
+            eprintln!("failed to write config file: {err}");
+            std::process::exit(1);
+        }
     }
-
-    eprintln!("Config written to {}", config_path.display());
-    eprintln!("Update api.providers.openai.key with your API key, then run 'dictator daemon'.");
 }
 
 fn run_transcripts(num: i64, text_only: bool) {
@@ -266,4 +306,122 @@ fn run_async(command: Commands, daemon_runtime: bool) {
             | Commands::Completion { .. } => unreachable!("sync command routed to async runtime"),
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Barrier};
+
+    use super::*;
+
+    #[test]
+    fn failed_write_never_publishes_partial_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+
+        let err = atomic_create_file_with(&path, |file| {
+            file.write_all(b"partial")?;
+            Err(io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn existing_config_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"keep me").unwrap();
+
+        let outcome = initialize_config(dir.path(), b"replacement").unwrap();
+
+        assert_eq!(outcome, CreateOutcome::AlreadyExists);
+        assert_eq!(std::fs::read(path).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn existing_config_does_not_change_directory_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        std::fs::write(config_dir.join("config.json"), b"keep me").unwrap();
+
+        let outcome = initialize_config(&config_dir, b"replacement").unwrap();
+
+        assert_eq!(outcome, CreateOutcome::AlreadyExists);
+        assert_eq!(
+            std::fs::metadata(config_dir).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+    }
+
+    #[test]
+    fn dangling_config_symlink_counts_as_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::os::unix::fs::symlink("missing-target", &path).unwrap();
+
+        let outcome =
+            atomic_create_file_with(&path, |file| file.write_all(b"replacement")).unwrap();
+
+        assert_eq!(outcome, CreateOutcome::AlreadyExists);
+        assert_eq!(
+            std::fs::read_link(path).unwrap(),
+            Path::new("missing-target")
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn concurrent_initializers_publish_once_with_private_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let barrier = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+
+        for _ in 0..8 {
+            let config_dir = config_dir.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                initialize_config(&config_dir, b"complete config").unwrap()
+            }));
+        }
+
+        let outcomes: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == CreateOutcome::Created)
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| **outcome == CreateOutcome::AlreadyExists)
+                .count(),
+            7
+        );
+
+        let path = config_dir.join("config.json");
+        assert_eq!(std::fs::read(&path).unwrap(), b"complete config");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&config_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(std::fs::read_dir(config_dir).unwrap().count(), 1);
+    }
 }
