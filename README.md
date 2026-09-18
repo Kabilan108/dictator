@@ -56,9 +56,11 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
 3. **Configure API access:**
    ```bash
    dictator init
-   $EDITOR ~/.config/dictator/config.json
+   config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
+   $EDITOR "$config_home/dictator/config.json"
 
-   # Store service secrets outside config.json
+   # The supplied service reads secrets from this fixed path.
+   install -d -m 700 ~/.config/dictator
    touch ~/.config/dictator/environment
    chmod 600 ~/.config/dictator/environment
    $EDITOR ~/.config/dictator/environment
@@ -91,9 +93,38 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
 
 4. **Set up the systemd user service:**
    ```bash
-   mkdir -p ~/.config/systemd/user
-   cp dictator.service ~/.config/systemd/user/dictator.service
+   mkdir -p "$config_home/systemd/user"
+   cp dictator.service "$config_home/systemd/user/dictator.service"
    systemctl --user daemon-reload
+   ```
+
+   The unit directory above assumes the shell and systemd user manager use the
+   same config root. If they differ, install the unit in the manager's config
+   root instead; the daemon config path can be set independently below.
+
+   The supplied unit expects the default Cargo install path,
+   `~/.cargo/bin/dictator`. If `make install` used `CARGO_HOME` or
+   `CARGO_INSTALL_ROOT`, find the full installed binary path and run
+   `systemctl --user edit dictator.service` before enabling the service. Add an
+   `ExecStart=` reset followed by the absolute path:
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=/absolute/path/to/dictator daemon
+   ```
+
+   `dictator init` honors `XDG_CONFIG_HOME`. If that variable points somewhere
+   other than `~/.config` and the systemd user manager does not already have the
+   same value, run `systemctl --user edit dictator.service` and add it as an
+   absolute path. If you also changed `ExecStart`, put this line under the same
+   `[Service]` heading:
+   ```ini
+   [Service]
+   Environment=XDG_CONFIG_HOME=/absolute/path/to/config-root
+   ```
+
+   After adding any needed drop-in, enable and start the service:
+   ```bash
    systemctl --user enable --now dictator.service
    ```
 
@@ -242,7 +273,7 @@ A CLI response timeout does not cancel a command already delivered to the daemon
 
 ## Configuration
 
-Configuration file location: `~/.config/dictator/config.json`
+Configuration file location: `$XDG_CONFIG_HOME/dictator/config.json`, defaulting to `~/.config/dictator/config.json` when `XDG_CONFIG_HOME` is unset or empty.
 
 ### Example Configuration
 
@@ -345,4 +376,4 @@ Run `dictator --log-level DEBUG daemon` for diagnostic output.
 - Application logs stored in `~/.local/state/dictator/app.log`
 - Audio recordings stored in `~/.local/share/dictator/recordings/`
 - Database stored in `~/.local/share/dictator/app.db`
-- Config stored in `~/.config/dictator/config.json`
+- Config stored in `$XDG_CONFIG_HOME/dictator/config.json`, with `~/.config` as the default config root
