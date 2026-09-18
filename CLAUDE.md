@@ -20,7 +20,7 @@ make deps          # cargo update
 Dictator is a voice typing daemon for Linux using a client-server architecture:
 
 - **Binary modes**: Single binary operates as both daemon and CLI client
-- **IPC**: Unix socket communication at `/tmp/dictator.sock`
+- **IPC**: Unix socket communication at `$XDG_RUNTIME_DIR/dictator/dictator.sock`, with a private `/tmp/dictator-$UID/dictator.sock` fallback
 - **State machine**: Daemon manages states: idle → recording → transcribing → typing → idle
 - **Configuration**: JSON config at `~/.config/dictator/config.json`
 

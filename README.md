@@ -228,6 +228,8 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `status` | Show daemon status and uptime |
 | `transcripts` | Manage transcript history |
 
+The daemon and CLI communicate through `$XDG_RUNTIME_DIR/dictator/dictator.sock`. If `XDG_RUNTIME_DIR` is unavailable, they use `/tmp/dictator-$UID/dictator.sock` inside a private directory owned by the current user. The Rust CLI does not fall back to the legacy Go socket at `/tmp/dictator.sock`, because that shared path can be claimed by another user. After upgrading from the Go daemon or an earlier Rust build, restart the daemon before using CLI commands or desktop shortcuts so both processes use the new socket.
+
 ## Configuration
 
 Configuration file location: `~/.config/dictator/config.json`
@@ -279,7 +281,7 @@ The `notifications` field controls desktop notifications:
 | `"errors_only"` | Notify only when an operation fails |
 | `"off"` | Disable desktop notifications |
 
-When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_DIR/dictator/osd.sock`, falling back to `/tmp/dictator-osd-$USER/osd.sock` when `XDG_RUNTIME_DIR` is unavailable.
+When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_DIR/dictator/osd.sock`, falling back to `/tmp/dictator-$UID/osd.sock` when `XDG_RUNTIME_DIR` is unavailable.
 
 ### Visual OSD Events
 

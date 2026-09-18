@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
@@ -8,7 +9,7 @@ use dictator::ipc::server::MAX_COMMAND_BYTES;
 use dictator::ipc::{
     ACTION_CANCEL, ACTION_START, ACTION_STATUS, ACTION_STOP, ACTION_TOGGLE, Client, CommandHandler,
     DATA_KEY_LAST_ERROR, DATA_KEY_RECORDING_DURATION, DATA_KEY_STATE, DATA_KEY_UPTIME, DaemonState,
-    ERR_INVALID_COMMAND, SOCKET_PATH, Server, StatusData,
+    ERR_INVALID_COMMAND, LEGACY_SOCKET_PATH, Server, StatusData, default_socket_path,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -90,13 +91,40 @@ async fn client_server_roundtrip() {
     assert!(!client.is_connected().await);
 }
 
-#[test]
-fn default_socket_path_matches_go() {
-    assert_eq!(SOCKET_PATH, "/tmp/dictator.sock");
-    assert_eq!(
-        Client::new().socket_path(),
-        std::path::Path::new(SOCKET_PATH)
+#[tokio::test]
+async fn default_socket_path_is_private_and_shared_by_client_and_server() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let original_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    // SAFETY: no other test in this integration-test process reads this variable.
+    unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir.path()) };
+    let server = Server::new(Arc::new(FakeHandler {
+        starts: AtomicUsize::new(0),
+    }));
+    let client = Client::new();
+    let expected = dir.path().join("dictator").join("dictator.sock");
+    assert_eq!(default_socket_path(), expected);
+    match original_runtime_dir {
+        Some(value) => unsafe { std::env::set_var("XDG_RUNTIME_DIR", value) },
+        None => unsafe { std::env::remove_var("XDG_RUNTIME_DIR") },
+    }
+
+    assert_eq!(client.socket_path(), expected);
+    assert_eq!(server.socket_path(), expected);
+    assert_ne!(
+        client.socket_path(),
+        std::path::Path::new(LEGACY_SOCKET_PATH)
     );
+
+    server.start().await.unwrap();
+    assert!(client.is_connected().await);
+    let mode = std::fs::metadata(expected.parent().unwrap())
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+    server.stop().await.unwrap();
 }
 
 #[tokio::test]

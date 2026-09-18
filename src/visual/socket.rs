@@ -12,12 +12,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::event::*;
-use crate::ipc::unix_socket::{SocketProbe, probe_socket};
+use crate::ipc::protocol::default_socket_directory;
+use crate::ipc::unix_socket::{SocketProbe, ensure_private_socket_parent, probe_socket};
 
 pub const RELIABLE_QUEUE_SIZE: usize = 16;
 pub const MAX_CLIENTS: usize = 4;
 const WRITE_TIMEOUT: Duration = Duration::from_millis(500);
-const SOCKET_DIR_PERM: u32 = 0o700;
 const SOCKET_FILE_PERM: u32 = 0o600;
 
 pub type SnapshotFn = Arc<dyn Fn() -> StateEvent + Send + Sync>;
@@ -45,35 +45,7 @@ impl Sink {
 }
 
 pub fn default_socket_path() -> PathBuf {
-    match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("dictator").join("osd.sock"),
-        _ => std::env::temp_dir()
-            .join(format!("dictator-osd-{}", socket_user_id()))
-            .join("osd.sock"),
-    }
-}
-
-fn uid() -> u32 {
-    // SAFETY: getuid has no preconditions and cannot fail.
-    unsafe { libc::getuid() }
-}
-
-fn socket_user_id() -> String {
-    match std::env::var("USER") {
-        Ok(user) if !user.is_empty() => sanitize_path_part(&user),
-        _ => uid().to_string(),
-    }
-}
-
-fn sanitize_path_part(value: &str) -> String {
-    let out: String = value
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    if out.is_empty() {
-        return uid().to_string();
-    }
-    out
+    default_socket_directory().join("osd.sock")
 }
 
 struct Client {
@@ -145,11 +117,7 @@ impl SocketSink {
     pub fn with_path(snapshot: Option<SnapshotFn>, socket_path: PathBuf) -> Result<Arc<Self>> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| anyhow!("OSD socket requires a Tokio runtime"))?;
-        let dir = socket_path
-            .parent()
-            .ok_or_else(|| anyhow!("invalid OSD socket path"))?;
-
-        ensure_socket_dir(dir)?;
+        ensure_private_socket_parent(&socket_path)?;
         prepare_socket_path(&socket_path)?;
 
         let listener = UnixListener::bind(&socket_path)
@@ -436,33 +404,6 @@ async fn write_event<W: AsyncWrite + Unpin>(stream: &mut W, event: &Event) -> bo
             false
         }
     }
-}
-
-fn ensure_socket_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
-        .map_err(|e| anyhow!("failed to create OSD socket directory: {e}"))?;
-
-    let meta = std::fs::metadata(dir)
-        .map_err(|e| anyhow!("failed to inspect OSD socket directory: {e}"))?;
-    if !meta.is_dir() {
-        bail!(
-            "OSD socket directory path is not a directory: {}",
-            dir.display()
-        );
-    }
-    if meta.uid() != uid() {
-        bail!(
-            "OSD socket directory is owned by uid {}, want {}: {}",
-            meta.uid(),
-            uid(),
-            dir.display()
-        );
-    }
-    if meta.permissions().mode() & 0o777 != SOCKET_DIR_PERM {
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(SOCKET_DIR_PERM))
-            .map_err(|e| anyhow!("failed to secure OSD socket directory: {e}"))?;
-    }
-    Ok(())
 }
 
 fn prepare_socket_path(socket_path: &Path) -> Result<()> {

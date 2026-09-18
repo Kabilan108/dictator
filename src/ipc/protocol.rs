@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -77,7 +78,32 @@ pub const ACTION_CANCEL: &str = "cancel";
 pub const ACTION_STATUS: &str = "status";
 
 // Socket configuration
-pub const SOCKET_PATH: &str = "/tmp/dictator.sock";
+pub const LEGACY_SOCKET_PATH: &str = "/tmp/dictator.sock";
+#[deprecated(note = "use default_socket_path(); the shared /tmp path is insecure")]
+pub const SOCKET_PATH: &str = LEGACY_SOCKET_PATH;
+
+/// Returns the per-user IPC socket path used by the Rust daemon and CLI.
+pub fn default_socket_path() -> PathBuf {
+    default_socket_directory().join("dictator.sock")
+}
+
+pub(crate) fn default_socket_directory() -> PathBuf {
+    let runtime_root = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    if runtime_root == Path::new("/tmp") {
+        runtime_root.join(format!("dictator-{}", current_uid()))
+    } else {
+        runtime_root.join("dictator")
+    }
+}
+
+fn current_uid() -> u32 {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
 
 // Response data keys
 pub const DATA_KEY_STATE: &str = "state";

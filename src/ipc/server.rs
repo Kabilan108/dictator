@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use super::protocol::*;
-use super::unix_socket::{SocketProbe, probe_socket};
+use super::unix_socket::{SocketProbe, ensure_private_socket_parent, probe_socket};
 use crate::utils::format_go_duration;
 
 pub const SERVER_CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
@@ -48,11 +48,17 @@ pub struct Server {
     socket_path: PathBuf,
     handler: Arc<dyn CommandHandler>,
     running: Mutex<Option<Running>>,
+    secure_socket_parent: bool,
 }
 
 impl Server {
     pub fn new(handler: Arc<dyn CommandHandler>) -> Self {
-        Self::with_path(handler, PathBuf::from(SOCKET_PATH))
+        Self {
+            socket_path: default_socket_path(),
+            handler,
+            running: Mutex::new(None),
+            secure_socket_parent: true,
+        }
     }
 
     /// Like [`Server::new`] but listens on a custom socket path.
@@ -61,6 +67,7 @@ impl Server {
             socket_path,
             handler,
             running: Mutex::new(None),
+            secure_socket_parent: false,
         }
     }
 
@@ -77,6 +84,9 @@ impl Server {
             bail!("server is already running");
         }
 
+        if self.secure_socket_parent {
+            ensure_private_socket_parent(&self.socket_path)?;
+        }
         prepare_socket_path(&self.socket_path)?;
 
         let listener = UnixListener::bind(&self.socket_path)?;

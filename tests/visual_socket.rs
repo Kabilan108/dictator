@@ -1,5 +1,6 @@
 #![allow(clippy::await_holding_lock)]
 
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -18,6 +19,7 @@ fn lock_env() -> MutexGuard<'static, ()> {
 }
 
 fn set_runtime_dir(dir: &std::path::Path) {
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     // SAFETY: guarded by ENV_LOCK; tests in this file are the only writers.
     unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir) };
 }
@@ -76,16 +78,17 @@ async fn socket_sink_sends_snapshot_and_events() {
 }
 
 #[test]
-fn default_socket_path_fallback_is_user_scoped() {
+fn default_socket_path_fallback_is_uid_scoped() {
     let _guard = lock_env();
     // SAFETY: guarded by ENV_LOCK.
     unsafe {
         std::env::set_var("XDG_RUNTIME_DIR", "");
-        std::env::set_var("USER", "dictator-test");
     }
     let path = default_socket_path();
+    // SAFETY: getuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::getuid() };
     assert!(
-        path.ends_with("dictator-osd-dictator-test/osd.sock"),
+        path.ends_with(format!("dictator-{uid}/osd.sock")),
         "path = {}",
         path.display()
     );
@@ -105,6 +108,7 @@ fn socket_sink_requires_a_tokio_runtime() {
 #[tokio::test]
 async fn socket_sink_replaces_a_stale_socket() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let socket_path = dir.path().join("dictator").join("osd.sock");
     std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
     let stale = tokio::net::UnixListener::bind(&socket_path).unwrap();
@@ -117,6 +121,21 @@ async fn socket_sink_replaces_a_stale_socket() {
         .await
         .expect("snapshot from replacement listener");
     sink.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn socket_sink_rejects_a_symlinked_private_directory_without_chmod() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let target = root.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&target, root.path().join("dictator")).unwrap();
+    let socket_path = root.path().join("dictator").join("osd.sock");
+
+    assert!(SocketSink::with_path(None, socket_path).is_err());
+    let mode = std::fs::metadata(target).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o755, "symlink target permissions were changed");
 }
 
 #[tokio::test]

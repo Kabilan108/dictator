@@ -7,6 +7,7 @@ use tokio::net::UnixStream;
 use tracing::{debug, error};
 
 use super::protocol::*;
+use super::unix_socket::validate_private_socket_parent;
 
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(2);
@@ -15,6 +16,7 @@ pub const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 pub struct Client {
     socket_path: PathBuf,
     timeout: Duration,
+    validate_socket_parent: bool,
 }
 
 impl Default for Client {
@@ -25,7 +27,11 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
-        Self::with_path(PathBuf::from(SOCKET_PATH))
+        Self {
+            socket_path: default_socket_path(),
+            timeout: CLIENT_TIMEOUT,
+            validate_socket_parent: true,
+        }
     }
 
     /// Like [`Client::new`] but connects to a custom socket path.
@@ -33,6 +39,7 @@ impl Client {
         Self {
             socket_path,
             timeout: CLIENT_TIMEOUT,
+            validate_socket_parent: false,
         }
     }
 
@@ -102,6 +109,9 @@ impl Client {
     }
 
     async fn connect(&self) -> Result<UnixStream> {
+        if self.validate_socket_parent {
+            validate_private_socket_parent(&self.socket_path)?;
+        }
         match UnixStream::connect(&self.socket_path).await {
             Ok(stream) => {
                 debug!(path = %self.socket_path.display(), "connected to daemon");
