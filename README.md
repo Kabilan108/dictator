@@ -285,6 +285,30 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `cancel` | Cancel any ongoing operation |
 | `status` | Show daemon status and uptime |
 | `transcripts` | Manage transcript history |
+| `retry [AUDIO_FILE]` | Retry the latest failed transcription or a saved WAV file |
+
+### Retrying a transcription
+
+```bash
+# Retry the most recent failed transcription
+dictator retry
+
+# Retry a specific recording, including one saved by an older version
+dictator retry ~/.local/share/dictator/recordings/recording.wav
+
+# Save the recovered text to a file
+dictator retry > recovered.txt
+```
+
+Retry prints the recovered text in the terminal and saves it to transcript history. It preserves the audio file. A successful retry removes that recording from the pending failures, so the next `dictator retry` selects the next most recent failure.
+
+Only one CLI retry can run at a time. Ctrl-C cancels the request and keeps an existing failure available for another attempt. If the provider succeeds but history cannot be saved, the command still prints the recovered text, reports the storage error on stderr, and exits with a nonzero status.
+
+The command contacts the configured transcription provider directly and works without a running daemon. Run it with the same configuration and API key environment variables as the daemon. Variables loaded only by systemd's `EnvironmentFile` are not inherited by your terminal.
+
+Automatic failure tracking starts with this version of the daemon. For recordings from earlier versions, pass the WAV path explicitly. Recordings are stored under `$XDG_DATA_HOME/dictator/recordings`, or `~/.local/share/dictator/recordings` by default.
+
+### Daemon connection
 
 The daemon and CLI communicate through `$XDG_RUNTIME_DIR/dictator/dictator.sock`. If `XDG_RUNTIME_DIR` is unavailable, they use `/tmp/dictator-$UID/dictator.sock` inside a private directory owned by the current user. The Rust CLI does not fall back to the legacy Go socket at `/tmp/dictator.sock`, because that shared path can be claimed by another user. After upgrading from the Go daemon or an earlier Rust build, restart the daemon before using CLI commands or desktop shortcuts so both processes use the new socket.
 

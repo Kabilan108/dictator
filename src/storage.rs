@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::utils::DATA_DIR;
@@ -19,6 +19,14 @@ CREATE TABLE IF NOT EXISTS transcripts (
     model TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_timestamp ON transcripts(timestamp DESC);
+CREATE TABLE IF NOT EXISTS failed_transcriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    duration_ms INTEGER NOT NULL,
+    audio_path TEXT NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS idx_failed_transcriptions_timestamp
+    ON failed_transcriptions(timestamp DESC);
 ";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -29,6 +37,14 @@ pub struct Transcript {
     pub text: String,
     pub audio_path: String,
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FailedTranscription {
+    pub id: i64,
+    pub timestamp: DateTime<Utc>,
+    pub duration_ms: i64,
+    pub audio_path: String,
 }
 
 pub struct Db {
@@ -96,6 +112,68 @@ impl Db {
             )
             .map_err(|e| anyhow!("failed to save transcript: {e}"))?;
         Ok(())
+    }
+
+    pub fn save_failed_transcription(&self, duration_ms: i64, audio_path: &str) -> Result<()> {
+        // REPLACE assigns a new AUTOINCREMENT id, so the last save wins when
+        // multiple failures share SQLite's seconds-resolution timestamp.
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO failed_transcriptions (duration_ms, audio_path)
+                 VALUES (?, ?)",
+                params![duration_ms, audio_path],
+            )
+            .map_err(|e| anyhow!("failed to save failed transcription: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_last_failed_transcription(&self) -> Result<Option<FailedTranscription>> {
+        self.conn
+            .query_row(
+                "SELECT id, timestamp, duration_ms, audio_path
+                 FROM failed_transcriptions
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(FailedTranscription {
+                        id: row.get(0)?,
+                        timestamp: parse_timestamp(&row.get::<_, String>(1)?)?,
+                        duration_ms: row.get(2)?,
+                        audio_path: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| anyhow!("failed to get last failed transcription: {e}"))
+    }
+
+    pub fn save_retried_transcript(
+        &self,
+        duration_ms: i64,
+        text: &str,
+        audio_path: &str,
+        model: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| anyhow!("failed to start retry transaction: {e}"))?;
+        transaction
+            .execute(
+                "INSERT INTO transcripts (duration_ms, text, audio_path, model) VALUES (?, ?, ?, ?)",
+                params![duration_ms, text, audio_path, model],
+            )
+            .map_err(|e| anyhow!("failed to save retried transcript: {e}"))?;
+        transaction
+            .execute(
+                "DELETE FROM failed_transcriptions WHERE audio_path = ?",
+                params![audio_path],
+            )
+            .map_err(|e| anyhow!("failed to remove retried transcription: {e}"))?;
+        transaction
+            .commit()
+            .map_err(|e| anyhow!("failed to commit retry transaction: {e}"))
     }
 
     pub fn get_last_transcript(&self) -> Result<Option<Transcript>> {
@@ -209,6 +287,139 @@ mod tests {
 
         let err = db.get_transcripts(1).unwrap_err().to_string();
         assert!(err.contains("failed to scan transcript"));
+    }
+
+    #[test]
+    fn failed_transcriptions_persist_and_use_stable_latest_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        {
+            let db = Db::open(&path).unwrap();
+            assert!(db.get_last_failed_transcription().unwrap().is_none());
+            db.save_failed_transcription(1_500, "/tmp/first.wav")
+                .unwrap();
+            db.save_failed_transcription(2_500, "/tmp/second.wav")
+                .unwrap();
+            db.conn
+                .execute(
+                    "UPDATE failed_transcriptions SET timestamp = ?",
+                    params!["2026-01-01 00:00:00"],
+                )
+                .unwrap();
+            let latest = db.get_last_failed_transcription().unwrap().unwrap();
+            assert_eq!(latest.audio_path, "/tmp/second.wav");
+        }
+
+        let reopened = Db::open(&path).unwrap();
+        let latest = reopened.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(latest.audio_path, "/tmp/second.wav");
+        assert_eq!(latest.duration_ms, 2_500);
+    }
+
+    #[test]
+    fn failed_transcription_upsert_keeps_one_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_failed_transcription(1_500, "/tmp/retry.wav")
+            .unwrap();
+        db.save_failed_transcription(3_000, "/tmp/retry.wav")
+            .unwrap();
+
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM failed_transcriptions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+        let failed = db.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(failed.duration_ms, 3_000);
+    }
+
+    #[test]
+    fn resaving_failed_transcription_makes_it_latest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_failed_transcription(1_500, "/tmp/first.wav")
+            .unwrap();
+        db.save_failed_transcription(2_500, "/tmp/second.wav")
+            .unwrap();
+        db.save_failed_transcription(3_000, "/tmp/first.wav")
+            .unwrap();
+
+        let latest = db.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(latest.audio_path, "/tmp/first.wav");
+        assert_eq!(latest.duration_ms, 3_000);
+        let count: i64 = db
+            .conn
+            .query_row("SELECT COUNT(*) FROM failed_transcriptions", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn retry_saves_transcript_and_removes_only_matching_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_failed_transcription(1_500, "/tmp/retry.wav")
+            .unwrap();
+        db.save_failed_transcription(2_500, "/tmp/other.wav")
+            .unwrap();
+
+        db.save_retried_transcript(
+            1_500,
+            "recovered text",
+            "/tmp/retry.wav",
+            "gpt-4o-transcribe",
+        )
+        .unwrap();
+
+        let transcripts = db.get_transcripts(-1).unwrap();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].text, "recovered text");
+        assert_eq!(transcripts[0].audio_path, "/tmp/retry.wav");
+
+        let remaining: Vec<String> = db
+            .conn
+            .prepare("SELECT audio_path FROM failed_transcriptions ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining, vec!["/tmp/other.wav"]);
+    }
+
+    #[test]
+    fn failed_retry_keeps_pending_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_failed_transcription(1_500, "/tmp/retry.wav")
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER reject_transcript
+                 BEFORE INSERT ON transcripts
+                 BEGIN
+                     SELECT RAISE(ABORT, 'forced insert failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(
+            db.save_retried_transcript(
+                1_500,
+                "recovered text",
+                "/tmp/retry.wav",
+                "gpt-4o-transcribe",
+            )
+            .is_err()
+        );
+        assert!(db.get_transcripts(-1).unwrap().is_empty());
+        let pending = db.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(pending.audio_path, "/tmp/retry.wav");
     }
 
     #[test]

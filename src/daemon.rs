@@ -635,6 +635,17 @@ impl Daemon {
                     debug!("transcription cancelled");
                     return;
                 }
+                if !self
+                    .persist_failed_transcription(
+                        operation_id,
+                        &cancel,
+                        recording_duration,
+                        &audio_path,
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.handle_operation_error(
                     operation_id,
                     format!("{}: {err:#}", ipc::ERR_TRANSCRIPTION_FAILED),
@@ -692,6 +703,47 @@ impl Daemon {
         let audio_path = audio_path.to_string_lossy().into_owned();
         info!(filepath = %audio_path, "audio saved");
         Ok((audio_data, audio_path))
+    }
+
+    async fn persist_failed_transcription(
+        self: &Arc<Self>,
+        operation_id: u64,
+        cancel: &CancellationToken,
+        duration: Duration,
+        audio_path: &str,
+    ) -> bool {
+        let daemon = Arc::clone(self);
+        let task_cancel = cancel.clone();
+        let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        let audio_path = audio_path.to_owned();
+        let saved = tokio::task::spawn_blocking(move || {
+            let _command = daemon.command_lock.lock().unwrap();
+            if task_cancel.is_cancelled() || !daemon.state_matches_operation(operation_id) {
+                return None;
+            }
+
+            Some(match daemon.db.lock().unwrap().as_ref() {
+                Some(db) => db.save_failed_transcription(duration_ms, &audio_path),
+                None => Err(anyhow!("database is closed")),
+            })
+        })
+        .await;
+
+        match saved {
+            Ok(Some(Ok(()))) => {
+                debug!(operation_id, "failed transcription saved for retry");
+                true
+            }
+            Ok(Some(Err(err))) => {
+                warn!(operation_id, err = %err, "failed to save transcription for retry");
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                error!(operation_id, err = %err, "failed transcription persistence task failed");
+                !cancel.is_cancelled() && self.state_matches_operation(operation_id)
+            }
+        }
     }
 
     async fn transcribe(
@@ -1354,6 +1406,78 @@ mod tests {
         assert_eq!(state.state, DaemonState::Recording);
         assert_eq!(state.recording_duration, Duration::from_secs(17));
         assert!(state.matches_operation(2));
+    }
+
+    #[tokio::test]
+    async fn failed_transcription_persistence_skips_canceled_and_stale_operations() {
+        let (daemon, _dir) = daemon_fixture();
+        let operation = daemon.shutdown_cancel.child_token();
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Transcribing;
+            state.operation = Some(Operation {
+                id: 4,
+                cancel: operation.clone(),
+            });
+            state.next_operation_id = 4;
+            state.revision = 1;
+        }
+
+        assert!(
+            daemon
+                .persist_failed_transcription(
+                    4,
+                    &operation,
+                    Duration::from_millis(4_321),
+                    "/tmp/current-failure.wav",
+                )
+                .await
+        );
+        let failed = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_last_failed_transcription()
+            .unwrap()
+            .unwrap();
+        assert_eq!(failed.duration_ms, 4_321);
+        assert_eq!(failed.audio_path, "/tmp/current-failure.wav");
+
+        operation.cancel();
+        assert!(
+            !daemon
+                .persist_failed_transcription(
+                    4,
+                    &operation,
+                    Duration::from_secs(5),
+                    "/tmp/canceled-failure.wav",
+                )
+                .await
+        );
+        assert!(
+            !daemon
+                .persist_failed_transcription(
+                    3,
+                    &daemon.shutdown_cancel.child_token(),
+                    Duration::from_secs(6),
+                    "/tmp/stale-failure.wav",
+                )
+                .await
+        );
+
+        let latest = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_last_failed_transcription()
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.audio_path, "/tmp/current-failure.wav");
+        daemon.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

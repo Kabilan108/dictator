@@ -64,6 +64,13 @@ enum Commands {
     ///
     /// shows the current status of the dictator daemon
     Status,
+    /// retry a failed transcription
+    ///
+    /// retries the newest failed transcription, or a specific WAV recording
+    Retry {
+        /// WAV recording to transcribe (defaults to the newest failed recording)
+        audio_file: Option<PathBuf>,
+    },
     /// print the version number
     ///
     /// prints the version number of the dictator daemon
@@ -300,6 +307,25 @@ fn run_async(command: Commands, daemon_runtime: bool) {
             Commands::Toggle => run_command(ipc::ACTION_TOGGLE, "toggled daemon").await,
             Commands::Cancel => run_command(ipc::ACTION_CANCEL, "operation canceled").await,
             Commands::Status => run_status().await,
+            Commands::Retry { audio_file } => match dictator::retry::run(audio_file).await {
+                Ok(output) => {
+                    let mut stdout = io::stdout().lock();
+                    exit_if_error(
+                        writeln!(stdout, "{}", output.text)
+                            .and_then(|()| stdout.flush())
+                            .map_err(anyhow::Error::from),
+                        1,
+                    );
+                    if let Some(err) = output.save_error {
+                        eprintln!("retry warning: {err:#}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(err) => {
+                    eprintln!("retry failed: {err:#}");
+                    std::process::exit(1);
+                }
+            },
             Commands::Version
             | Commands::Init
             | Commands::Transcripts { .. }

@@ -16,6 +16,7 @@ pub mod audio;
 pub mod daemon;
 pub mod ipc;
 pub mod notifier;
+pub mod retry;
 pub mod storage;
 pub mod typing;
 pub mod utils;
