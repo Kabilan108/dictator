@@ -72,6 +72,17 @@ impl State {
         self.revision = self.revision.wrapping_add(1);
         Some(self.revision)
     }
+
+    fn reset_error(&mut self, error_revision: u64) -> Option<u64> {
+        if self.state != DaemonState::Error || self.revision != error_revision {
+            return None;
+        }
+        self.state = DaemonState::Idle;
+        self.last_error = None;
+        self.recording_duration = Duration::ZERO;
+        self.revision = self.revision.wrapping_add(1);
+        Some(self.revision)
+    }
 }
 
 #[derive(Clone)]
@@ -555,13 +566,7 @@ impl Daemon {
                 let _command = transition_daemon.command_lock.lock().unwrap();
                 let idle_revision = {
                     let mut state = transition_daemon.state.write().unwrap();
-                    if state.state != DaemonState::Error || state.revision != revision {
-                        return None;
-                    }
-                    state.state = DaemonState::Idle;
-                    state.recording_duration = Duration::ZERO;
-                    state.revision = state.revision.wrapping_add(1);
-                    state.revision
+                    state.reset_error(revision)?
                 };
                 transition_daemon.publish_osd_state(DaemonState::Idle, None, "");
                 Some(idle_revision)
@@ -1265,6 +1270,40 @@ mod tests {
             state.operation.as_ref().map(|operation| operation.id),
             Some(12)
         );
+    }
+
+    #[test]
+    fn error_reset_clears_the_error_when_returning_to_idle() {
+        let mut state = State {
+            state: DaemonState::Error,
+            last_error: Some("transcription failed: provider token leaked".into()),
+            recording_duration: Duration::from_secs(9),
+            operation: None,
+            next_operation_id: 4,
+            revision: 12,
+        };
+
+        assert_eq!(state.reset_error(12), Some(13));
+        assert_eq!(state.state, DaemonState::Idle);
+        assert_eq!(state.last_error, None);
+        assert_eq!(state.recording_duration, Duration::ZERO);
+    }
+
+    #[test]
+    fn stale_error_reset_does_not_clear_a_newer_error() {
+        let mut state = State {
+            state: DaemonState::Error,
+            last_error: Some("newer failure".into()),
+            recording_duration: Duration::ZERO,
+            operation: None,
+            next_operation_id: 4,
+            revision: 13,
+        };
+
+        assert_eq!(state.reset_error(12), None);
+        assert_eq!(state.state, DaemonState::Error);
+        assert_eq!(state.last_error.as_deref(), Some("newer failure"));
+        assert_eq!(state.revision, 13);
     }
 
     #[tokio::test]
