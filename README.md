@@ -230,6 +230,8 @@ nohup dictator daemon > /dev/null 2>&1 &
 
 The daemon and CLI communicate through `$XDG_RUNTIME_DIR/dictator/dictator.sock`. If `XDG_RUNTIME_DIR` is unavailable, they use `/tmp/dictator-$UID/dictator.sock` inside a private directory owned by the current user. The Rust CLI does not fall back to the legacy Go socket at `/tmp/dictator.sock`, because that shared path can be claimed by another user. After upgrading from the Go daemon or an earlier Rust build, restart the daemon before using CLI commands or desktop shortcuts so both processes use the new socket.
 
+A CLI response timeout does not cancel a command already delivered to the daemon. Its outcome is unknown and it may still execute; do not automatically retry a mutating command after a timeout.
+
 ## Configuration
 
 Configuration file location: `~/.config/dictator/config.json`

@@ -59,7 +59,12 @@ impl Client {
 
         tokio::time::timeout(self.timeout, self.exchange(cmd))
             .await
-            .map_err(|_| anyhow!("timed out waiting for daemon response"))?
+            .map_err(|_| {
+                anyhow!(
+                    "timed out waiting for daemon response; outcome is unknown; the command may \
+                     still execute, so do not automatically retry"
+                )
+            })?
     }
 
     async fn exchange(&self, cmd: Command) -> Result<Response> {
@@ -163,5 +168,55 @@ impl Client {
                 return Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use tokio::net::UnixListener;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn timeout_reports_unknown_outcome_after_command_was_received() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("dictator.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let (received_tx, received_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut line = Vec::new();
+            let mut reader = BufReader::new(stream);
+            reader.read_until(b'\n', &mut line).await.unwrap();
+            let command: Command = serde_json::from_slice(&line).unwrap();
+            received_tx.send(command).unwrap();
+            let _ = release_rx.await;
+        });
+
+        let mut client = Client::with_path(socket_path);
+        client.timeout = Duration::from_millis(50);
+        let request = tokio::spawn(async move { client.start().await });
+
+        let command = tokio::time::timeout(Duration::from_secs(1), received_rx)
+            .await
+            .expect("server did not receive command before test timeout")
+            .expect("mock server stopped before reporting the command");
+        assert_eq!(command.action, ACTION_START);
+
+        let error = request
+            .await
+            .unwrap()
+            .expect_err("client should time out while the server holds its response");
+        assert_eq!(
+            error.to_string(),
+            "timed out waiting for daemon response; outcome is unknown; the command may still \
+             execute, so do not automatically retry"
+        );
+
+        let _ = release_tx.send(());
+        server.await.unwrap();
     }
 }
