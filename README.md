@@ -277,6 +277,8 @@ Notes:
 - The service sandbox derives its writable config, data, and state directories
   from Home Manager's XDG paths, or from absolute `XDG_CONFIG_HOME`,
   `XDG_DATA_HOME`, and `XDG_STATE_HOME` values in `services.dictator.environment`.
+  The effective config root must be within `home.homeDirectory` because Home
+  Manager owns `config.json` there.
   If an `environmentFile` is intended to change any XDG root at runtime, add
   direct `Environment`, `ExecStartPre`, and `ReadWritePaths` service overrides
   for the resulting `dictator` directories; the unit's direct XDG assignments

@@ -398,7 +398,12 @@ impl Db {
             .query_row(
                 "SELECT id, timestamp, duration_ms, audio_path FROM recordings
                  WHERE status = 'failed' AND audio_path IS NOT NULL
-                 ORDER BY COALESCE(legacy_failed_id, id) DESC LIMIT 1",
+                 ORDER BY COALESCE(
+                              (SELECT MAX(a.finished_at) FROM transcription_attempts a
+                               WHERE a.recording_id = recordings.id AND a.status = 'error'),
+                              recordings.timestamp
+                          ) DESC,
+                          COALESCE(legacy_failed_id, id) DESC LIMIT 1",
                 [],
                 |row| {
                     Ok(FailedTranscription {
@@ -775,15 +780,12 @@ impl Db {
             .map(|text| text.split_whitespace().count() as i64)
             .sum();
         let local_today = Local::now().date_naive();
-        let local_midnight = Local
-            .from_local_datetime(
-                &local_today
-                    .and_hms_opt(0, 0, 0)
-                    .expect("midnight is a valid local time"),
-            )
-            .earliest()
-            .expect("the local day has a midnight");
-        let today_start = sql_timestamp(local_midnight.with_timezone(&Utc));
+        let today_start = sql_timestamp(first_valid_local_instant(local_today, |naive| {
+            Local
+                .from_local_datetime(naive)
+                .earliest()
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+        })?);
         let today_rows = self
             .conn
             .prepare(
@@ -1127,6 +1129,24 @@ fn sql_timestamp(timestamp: DateTime<Utc>) -> String {
     timestamp.format("%Y-%m-%d %H:%M:%S%.f").to_string()
 }
 
+fn first_valid_local_instant(
+    date: NaiveDate,
+    mut resolve: impl FnMut(&NaiveDateTime) -> Option<DateTime<Utc>>,
+) -> Result<DateTime<Utc>> {
+    let midnight = date
+        .and_hms_opt(0, 0, 0)
+        .ok_or_else(|| anyhow!("invalid local date {date}"))?;
+    for seconds in 0..86_400 {
+        let local = midnight
+            .checked_add_signed(ChronoDuration::seconds(seconds))
+            .ok_or_else(|| anyhow!("local date {date} is out of range"))?;
+        if let Some(timestamp) = resolve(&local) {
+            return Ok(timestamp);
+        }
+    }
+    bail!("local date {date} has no valid time")
+}
+
 fn invalid_data(column: usize, message: String) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         column,
@@ -1154,6 +1174,8 @@ fn parse_timestamp(raw: &str) -> rusqlite::Result<DateTime<Utc>> {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+
+    use chrono::Timelike;
 
     use super::*;
 
@@ -1288,6 +1310,36 @@ mod tests {
             })
             .unwrap();
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn failed_retry_becomes_the_latest_retry_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        let first = db
+            .save_failed_attempt(
+                1_500,
+                Some("/tmp/first.wav"),
+                "first failure",
+                Some("m"),
+                Some(100),
+            )
+            .unwrap();
+        db.save_failed_attempt(
+            2_500,
+            Some("/tmp/second.wav"),
+            "second failure",
+            Some("m"),
+            Some(200),
+        )
+        .unwrap();
+
+        db.record_retry_failure(first, "first failed again", "m", Some(300))
+            .unwrap();
+
+        let latest = db.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(latest.id, first);
+        assert_eq!(latest.audio_path, "/tmp/first.wav");
     }
 
     #[test]
@@ -1628,6 +1680,16 @@ mod tests {
             Local::now().date_naive()
         );
         assert_eq!(stats.daily_last_7.last().unwrap().count, 4);
+    }
+
+    #[test]
+    fn local_day_start_skips_a_nonexistent_midnight() {
+        let date = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
+        let first =
+            first_valid_local_instant(date, |local| (local.hour() >= 1).then_some(local.and_utc()))
+                .unwrap();
+
+        assert_eq!(first, date.and_hms_opt(1, 0, 0).unwrap().and_utc());
     }
 
     #[test]

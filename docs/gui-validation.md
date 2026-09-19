@@ -14,7 +14,7 @@ direnv exec "$PWD" cargo build --features gui --bins
 nix build .#gui
 ```
 
-The full GUI-feature test suite passed 157 tests, with 4 opt-in probes ignored.
+The full GUI-feature test suite passed 166 tests, with 4 opt-in probes ignored.
 Formatting and all-target Clippy passed with warnings denied.
 The Nix GUI package also passed its release-profile tests and launched on this
 machine without a development shell or an inherited `LD_LIBRARY_PATH`.

@@ -532,6 +532,14 @@ impl Daemon {
         publisher.tx.send_replace(sample);
     }
 
+    fn reset_audio_level(&self) {
+        let level = LevelSample::default();
+        *self.latest_level.lock().unwrap() = level;
+        if let Some(publisher) = self.meter.lock().unwrap().as_ref() {
+            publisher.tx.send_replace(level);
+        }
+    }
+
     fn record_terminal(&self, recording_id: i64) {
         let mut terminal = self.terminal_recording.lock().unwrap();
         terminal.id = Some(recording_id);
@@ -1002,6 +1010,7 @@ impl Daemon {
         }
 
         debug!("starting recording");
+        self.reset_audio_level();
         if let Err(err) = self.recorder.start() {
             error!(err = %err, "failed to start recording");
             self.persist_capture_failure(Duration::ZERO, &format!("{err:#}"));
@@ -1630,6 +1639,30 @@ mod tests {
         assert_eq!(state.state, DaemonState::Error);
         assert_eq!(state.last_error.as_deref(), Some("newer failure"));
         assert_eq!(state.revision, 13);
+    }
+
+    #[tokio::test]
+    async fn resetting_audio_level_clears_cache_and_publishes_zero() {
+        let (daemon, _dir) = daemon_fixture();
+        let previous = LevelSample {
+            rms: 0.75,
+            peak: 0.9,
+        };
+        *daemon.latest_level.lock().unwrap() = previous;
+        let (tx, mut rx) = watch::channel(previous);
+        let cancel = daemon.shutdown_cancel.child_token();
+        let task_cancel = cancel.clone();
+        let task = daemon.runtime.spawn(async move {
+            task_cancel.cancelled().await;
+        });
+        *daemon.meter.lock().unwrap() = Some(MeterPublisher { tx, cancel, task });
+
+        daemon.reset_audio_level();
+
+        rx.changed().await.unwrap();
+        assert_eq!(*daemon.latest_level.lock().unwrap(), LevelSample::default());
+        assert_eq!(*rx.borrow_and_update(), LevelSample::default());
+        daemon.shutdown().await.unwrap();
     }
 
     #[tokio::test]

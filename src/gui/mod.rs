@@ -640,10 +640,7 @@ impl MainView {
                     }
                 }
                 Reply::Action(result) => {
-                    self.notice = match result {
-                        Ok(()) => "Request accepted".to_string(),
-                        Err(error) => error,
-                    };
+                    self.notice = action_notice(result);
                     if !self.status_pending {
                         self.backend.send(Request::Status);
                         self.status_pending = true;
@@ -855,7 +852,11 @@ impl MainView {
                             .border_color(LINE)
                             .text_size(px(10.))
                             .text_color(MUTED)
-                            .child(self.page_button("Previous", false, cx))
+                            .child(self.page_button(
+                                "Previous",
+                                can_go_previous(self.page_index),
+                                cx,
+                            ))
                             .child(format!("{} / {pages}", self.page_index + 1))
                             .child(self.page_button("Next", page.has_next, cx)),
                     ),
@@ -951,6 +952,7 @@ impl MainView {
             let id = recording.id;
             let retained_audio = !recording.audio_path.as_os_str().is_empty();
             let metadata_json = detail_json(&detail);
+            let notice = self.notice.clone();
             let mut attempts = div().flex().flex_col().gap(px(6.));
             for attempt in detail.attempts.iter().rev() {
                 attempts = attempts.child(
@@ -1010,6 +1012,19 @@ impl MainView {
                             )
                         }),
                 )
+                .when(!notice.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .px(px(10.))
+                            .py(px(8.))
+                            .bg(SURFACE)
+                            .border_l_2()
+                            .border_color(LINE_STRONG)
+                            .text_size(px(10.))
+                            .text_color(SUBTEXT)
+                            .child(notice),
+                    )
+                })
                 .child(
                     div()
                         .p(px(14.))
@@ -1034,12 +1049,6 @@ impl MainView {
                         .items_center()
                         .gap(px(10.))
                         .text_size(px(10.))
-                        .text_color(if self.notice.contains("failed") {
-                            RED
-                        } else {
-                            MUTED
-                        })
-                        .child(self.notice.clone())
                         .child(div().flex_1())
                         .child(action_button(
                             "Copy JSON",
@@ -1725,6 +1734,9 @@ impl TrayView {
                         Ok(status) => {
                             self.status = status;
                             self.connected = true;
+                            if self.notice.starts_with("Daemon disconnected:") {
+                                self.notice.clear();
+                            }
                         }
                         Err(error) => {
                             self.connected = false;
@@ -1732,12 +1744,14 @@ impl TrayView {
                         }
                     }
                 }
-                Reply::History(Ok(page)) => self.page = Some(page),
-                Reply::Stats(Ok(stats)) => self.stats = Some(stats),
+                Reply::History(result) => {
+                    apply_tray_result(&mut self.page, result, &mut self.notice)
+                }
+                Reply::Stats(result) => {
+                    apply_tray_result(&mut self.stats, result, &mut self.notice)
+                }
                 Reply::Action(result) => {
-                    self.notice = result
-                        .err()
-                        .unwrap_or_else(|| "Request accepted".to_string());
+                    self.notice = action_notice(result);
                     if !self.status_pending {
                         self.backend.send(Request::Status);
                         self.status_pending = true;
@@ -1780,6 +1794,7 @@ impl Render for TrayView {
         };
         let options = self.options;
         let recovery = recovery_banner(&status, true);
+        let notice = self.notice.clone();
         div()
             .size_full()
             .flex()
@@ -1807,6 +1822,23 @@ impl Render for TrayView {
                     ),
             )
             .when_some(recovery, |this, recovery| this.child(recovery))
+            .when(!notice.is_empty(), |this| {
+                this.child(
+                    div()
+                        .mx(px(12.))
+                        .mt(px(8.))
+                        .px(px(10.))
+                        .py(px(7.))
+                        .max_h(px(42.))
+                        .overflow_hidden()
+                        .bg(SURFACE)
+                        .border_l_2()
+                        .border_color(LINE_STRONG)
+                        .text_size(px(10.))
+                        .text_color(SUBTEXT)
+                        .child(notice),
+                )
+            })
             .child(
                 div()
                     .p(px(16.))
@@ -2458,6 +2490,27 @@ fn apply_history_error(loading: &mut bool, notice: &mut String, error: String) {
     *notice = error;
 }
 
+fn can_go_previous(page_index: usize) -> bool {
+    page_index > 0
+}
+
+fn apply_tray_result<T>(slot: &mut Option<T>, result: Result<T, String>, notice: &mut String) {
+    match result {
+        Ok(value) => *slot = Some(value),
+        Err(error) => {
+            *slot = None;
+            *notice = error;
+        }
+    }
+}
+
+fn action_notice(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => "Request accepted".to_string(),
+        Err(error) => format!("Request failed: {error}"),
+    }
+}
+
 fn choose_history_selection(
     reveal_id: &mut Option<i64>,
     visible_ids: &[i64],
@@ -2673,6 +2726,36 @@ mod state_tests {
         assert_eq!(
             accept_search_change(&mut accepted_value, "deployment"),
             None
+        );
+    }
+
+    #[test]
+    fn previous_page_is_enabled_after_first_page() {
+        assert!(!can_go_previous(0));
+        assert!(can_go_previous(1));
+        assert!(can_go_previous(4));
+    }
+
+    #[test]
+    fn tray_backend_failure_replaces_stale_data_and_is_visible() {
+        let mut value = Some(41);
+        let mut notice = String::new();
+
+        apply_tray_result(
+            &mut value,
+            Err("history unavailable".to_string()),
+            &mut notice,
+        );
+
+        assert_eq!(value, None);
+        assert_eq!(notice, "history unavailable");
+    }
+
+    #[test]
+    fn rejected_retry_action_has_explicit_feedback() {
+        assert_eq!(
+            action_notice(Err("recording is no longer failed".to_string())),
+            "Request failed: recording is no longer failed"
         );
     }
 }

@@ -205,27 +205,14 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
     {
         Ok(runtime) => runtime,
         Err(error) => {
-            let _ = replies.send(Reply::Action(Err(error.to_string())));
+            run_failed_worker(requests, replies, error.to_string());
             return;
         }
     };
     let db = match Db::new() {
         Ok(db) => db,
         Err(error) => {
-            let message = error.to_string();
-            while let Ok(request) = requests.recv() {
-                let reply = match request {
-                    Request::History { .. } => Reply::History(Err(message.clone())),
-                    Request::Detail(_) => Reply::Detail(Err(message.clone())),
-                    Request::Stats => Reply::Stats(Err(message.clone())),
-                    Request::Microphones | Request::ReorderMicrophones(_) => {
-                        Reply::Microphones(Err(message.clone()))
-                    }
-                    Request::Status => Reply::Status(Err(message.clone())),
-                    _ => Reply::Action(Err(message.clone())),
-                };
-                let _ = replies.send(reply);
-            }
+            run_failed_worker(requests, replies, error.to_string());
             return;
         }
     };
@@ -233,6 +220,32 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
         let reply = handle_live(&db, &runtime, request);
         if replies.send(reply).is_err() {
             break;
+        }
+    }
+}
+
+fn run_failed_worker(requests: Receiver<Request>, replies: Sender<Reply>, message: String) {
+    while let Ok(request) = requests.recv() {
+        if replies.send(failed_reply(request, &message)).is_err() {
+            break;
+        }
+    }
+}
+
+fn failed_reply(request: Request, message: &str) -> Reply {
+    match request {
+        Request::History { .. } => Reply::History(Err(message.to_string())),
+        Request::Detail(_) => Reply::Detail(Err(message.to_string())),
+        Request::SaveRevision { .. } | Request::RestoreRevision { .. } => {
+            Reply::Saved(Err(message.to_string()))
+        }
+        Request::Stats => Reply::Stats(Err(message.to_string())),
+        Request::Microphones | Request::ReorderMicrophones(_) => {
+            Reply::Microphones(Err(message.to_string()))
+        }
+        Request::Status => Reply::Status(Err(message.to_string())),
+        Request::Toggle | Request::Cancel | Request::Retry(_) => {
+            Reply::Action(Err(message.to_string()))
         }
     }
 }
@@ -1096,5 +1109,47 @@ mod tests {
         assert_eq!(settings.paste_shortcut, "ctrl_v");
         assert_eq!(settings.notifications, "all");
         assert!(!format!("{settings:?}").contains("must-not-enter-gui-state"));
+    }
+
+    #[test]
+    fn failed_worker_replies_in_kind_and_stays_alive() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_failed_worker(request_rx, reply_tx, "runtime unavailable".to_string())
+        });
+
+        request_tx.send(Request::Status).expect("status request");
+        request_tx
+            .send(Request::History {
+                search: String::new(),
+                filter: Filter::All,
+                page: 0,
+            })
+            .expect("history request");
+        request_tx
+            .send(Request::SaveRevision {
+                id: 7,
+                expected_revision: 1,
+                text: "edit".to_string(),
+            })
+            .expect("save request");
+        request_tx.send(Request::Retry(7)).expect("retry request");
+
+        assert!(
+            matches!(reply_rx.recv(), Ok(Reply::Status(Err(error))) if error == "runtime unavailable")
+        );
+        assert!(
+            matches!(reply_rx.recv(), Ok(Reply::History(Err(error))) if error == "runtime unavailable")
+        );
+        assert!(
+            matches!(reply_rx.recv(), Ok(Reply::Saved(Err(error))) if error == "runtime unavailable")
+        );
+        assert!(
+            matches!(reply_rx.recv(), Ok(Reply::Action(Err(error))) if error == "runtime unavailable")
+        );
+
+        drop(request_tx);
+        worker.join().expect("failed worker exits cleanly");
     }
 }

@@ -192,6 +192,11 @@ in
         ];
         message = "services.dictator: XDG config, data, and state roots must be absolute paths.";
       }
+      {
+        assertion =
+          configRoot == config.home.homeDirectory || lib.hasPrefix "${config.home.homeDirectory}/" configRoot;
+        message = "services.dictator: XDG_CONFIG_HOME must be within home.homeDirectory so Home Manager can manage config.json.";
+      }
     ];
 
     home.packages = [
