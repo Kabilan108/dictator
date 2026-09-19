@@ -35,6 +35,18 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn handle_toggle(&self) -> Result<()>;
     fn handle_cancel(&self) -> Result<()>;
     fn get_status(&self) -> StatusData;
+    fn handle_retry(&self, _recording_id: Option<i64>) -> Result<i64> {
+        bail!("retry is not supported")
+    }
+    fn get_last_recording(&self) -> Option<(i64, u64)> {
+        None
+    }
+    fn get_audio_level(&self) -> Option<(f64, f64)> {
+        None
+    }
+    fn get_recovered_text(&self) -> Option<String> {
+        None
+    }
 }
 
 struct Running {
@@ -350,6 +362,28 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
             }
             Err(e) => err = Some(e),
         },
+        ACTION_RETRY => {
+            let recording_id = match cmd.args.as_slice() {
+                [] => Ok(None),
+                [value] => value
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| anyhow!("recording id must be an integer")),
+                _ => Err(anyhow!("retry accepts at most one recording id")),
+            };
+            match recording_id.and_then(|id| handler.handle_retry(id)) {
+                Ok(recording_id) => {
+                    response.success = true;
+                    response
+                        .data
+                        .insert(DATA_KEY_RECORDING_ID.into(), recording_id.to_string());
+                    response
+                        .data
+                        .insert(DATA_KEY_STATE.into(), DaemonState::Transcribing.to_string());
+                }
+                Err(e) => err = Some(e),
+            }
+        }
         ACTION_STATUS => {
             let status = handler.get_status();
             response.success = true;
@@ -367,6 +401,26 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
             }
             if let Some(last_error) = status.last_error {
                 response.data.insert(DATA_KEY_LAST_ERROR.into(), last_error);
+            }
+            if let Some((recording_id, generation)) = handler.get_last_recording() {
+                response
+                    .data
+                    .insert(DATA_KEY_LAST_RECORDING_ID.into(), recording_id.to_string());
+                response.data.insert(
+                    DATA_KEY_LAST_RECORDING_GENERATION.into(),
+                    generation.to_string(),
+                );
+            }
+            if let Some((rms, peak)) = handler.get_audio_level() {
+                response
+                    .data
+                    .insert(DATA_KEY_AUDIO_LEVEL_RMS.into(), rms.to_string());
+                response
+                    .data
+                    .insert(DATA_KEY_AUDIO_LEVEL_PEAK.into(), peak.to_string());
+            }
+            if let Some(text) = handler.get_recovered_text() {
+                response.data.insert(DATA_KEY_TEXT.into(), text);
             }
         }
         other => {

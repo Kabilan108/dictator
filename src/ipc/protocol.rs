@@ -76,6 +76,7 @@ pub const ACTION_STOP: &str = "stop";
 pub const ACTION_TOGGLE: &str = "toggle";
 pub const ACTION_CANCEL: &str = "cancel";
 pub const ACTION_STATUS: &str = "status";
+pub const ACTION_RETRY: &str = "retry";
 
 // Socket configuration
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/dictator.sock";
@@ -111,6 +112,11 @@ pub const DATA_KEY_RECORDING_DURATION: &str = "recording_duration";
 pub const DATA_KEY_LAST_ERROR: &str = "last_error";
 pub const DATA_KEY_UPTIME: &str = "uptime";
 pub const DATA_KEY_TEXT: &str = "text";
+pub const DATA_KEY_RECORDING_ID: &str = "recording_id";
+pub const DATA_KEY_LAST_RECORDING_ID: &str = "last_recording_id";
+pub const DATA_KEY_LAST_RECORDING_GENERATION: &str = "last_recording_generation";
+pub const DATA_KEY_AUDIO_LEVEL_RMS: &str = "audio_level_rms";
+pub const DATA_KEY_AUDIO_LEVEL_PEAK: &str = "audio_level_peak";
 
 // Error messages
 pub const ERR_INVALID_COMMAND: &str = "invalid command";

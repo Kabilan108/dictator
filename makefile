@@ -34,3 +34,15 @@ run: build
 	./build/dictator daemon
 
 FORCE:
+
+.PHONY: gui check-gui test-gui
+
+gui:
+	$(CARGO) build --features gui --bin dictator-gui
+
+check-gui:
+	$(CARGO) fmt --check
+	$(CARGO) clippy --features gui --all-targets -- -D warnings
+
+test-gui:
+	$(CARGO) test --features gui

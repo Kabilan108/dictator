@@ -22,7 +22,6 @@ bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
-cpal = "0.16"
 anyhow = "1"
 libc = "0.2"
 regex = "1"
@@ -36,6 +35,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "fmt", "std", "registry"] }
 uuid = { version = "1", features = ["v4"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
+gpui = { version = "=0.2.2", optional = true }
+gpui-component = { version = "=0.5.1", optional = true }
+ksni = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -44,3 +46,12 @@ tempfile = "3"
 strip = true
 lto = true
 codegen-units = 1
+
+[features]
+default = []
+gui = ["dep:gpui", "dep:gpui-component", "dep:ksni"]
+
+[[bin]]
+name = "dictator-gui"
+path = "src/bin/dictator-gui.rs"
+required-features = ["gui"]

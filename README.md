@@ -7,6 +7,52 @@
 
 A voice typing daemon for Linux that enables voice typing anywhere the cursor is positioned. Uses Whisper API for speech recognition and provides seamless integration with any application through keyboard input simulation.
 
+## Desktop app
+
+The optional GPUI desktop app provides transcript history, playback, editing and
+revision comparison, recording controls, statistics, and a system tray popup.
+The daemon continues to own recording, transcription and insertion.
+
+```bash
+# Native development build and launch
+direnv exec "$PWD" cargo run --features gui --bin dictator-gui
+
+# Isolated sample history for UI inspection
+direnv exec "$PWD" cargo run --features gui --bin dictator-gui -- --demo
+
+# Nix GUI package, separate from the headless daemon package
+nix run .#gui
+```
+
+Use `--tray` to start without opening the history window. Left-click the tray
+icon for quick controls; its menu can open history or quit the GUI. Quitting the
+GUI leaves the daemon running. The GUI requires a graphical session and a
+StatusNotifierItem host for tray integration. The main window also works without
+a tray host. Use matching daemon and GUI builds for microphone priorities and
+terminal recording updates. On niri the popup is positioned through compositor
+IPC; other Wayland compositors may need a floating window rule for
+`Dictator quick controls`.
+
+For Home Manager, enable `services.dictator.gui.enable = true` alongside the
+existing daemon configuration. GUI autostart defaults to enabled and can be
+turned off with `services.dictator.gui.autostart = false`. On compositors that do
+not process XDG autostart entries, launch `dictator-gui --tray` from compositor
+startup.
+
+The Settings screen displays daemon configuration read-only. Microphone
+priorities live in a separate app-owned preferences file; Home Manager's
+`config.json` is never rewritten by the GUI. Discovery retains disconnected
+devices and their order, appends new devices, and resolves an input when a new
+recording begins. On PipeWire/PulseAudio, install the PulseAudio client tools
+`pactl` and `parec`; the Nix packages/module provide them.
+
+History keeps a recording's identity and capture time across retries. Attempts
+retain their own outcomes and timing. Transcript edits append revisions and
+restoring an earlier text creates a new revision. Latency statistics cover
+measured transcription requests; older records without measurements do not get
+synthetic latency values. See [desktop validation](docs/gui-validation.md) for
+the local acceptance checks and remaining platform limits.
+
 ## Quick Start
 
 ### Prerequisites
@@ -16,28 +62,28 @@ Make sure you have the following system dependencies installed:
 **For X11:**
 ```bash
 # Ubuntu/Debian
-sudo apt install xdotool xclip libasound2-dev pkg-config
+sudo apt install xdotool xclip pulseaudio-utils pkg-config
 
 # Arch Linux
-sudo pacman -S xdotool xclip alsa-lib
+sudo pacman -S xdotool xclip libpulse
 
 # Fedora
-sudo dnf install xdotool xclip alsa-lib-devel
+sudo dnf install xdotool xclip pulseaudio-utils
 ```
 
 **For Wayland:**
 ```bash
 # Ubuntu/Debian
-sudo apt install wl-clipboard wtype libasound2-dev pkg-config
+sudo apt install wl-clipboard wtype pulseaudio-utils pkg-config
 
 # Arch Linux
-sudo pacman -S wl-clipboard wtype alsa-lib
+sudo pacman -S wl-clipboard wtype libpulse
 
 # Fedora
-sudo dnf install wl-clipboard wtype alsa-lib-devel
+sudo dnf install wl-clipboard wtype pulseaudio-utils
 ```
 
-You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses ALSA and works through PipeWire or PulseAudio via their ALSA plugins.
+You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses `pactl` for discovery and `parec` for capture. Run PipeWire with `pipewire-pulse`, or a PulseAudio server. The GUI also needs `ffplay` from FFmpeg for playback. The Nix development shell supplies the native GUI build dependencies.
 
 ### Installation
 

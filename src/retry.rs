@@ -3,6 +3,7 @@ use std::io::Read;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tokio_util::sync::CancellationToken;
@@ -16,6 +17,7 @@ const MAX_AUDIO_BYTES: u64 = 64 * 1024 * 1024 + 44;
 
 pub struct RetryOutput {
     pub text: String,
+    pub recording_id: i64,
     /// Keep recovered text available even if history could not be saved.
     pub save_error: Option<anyhow::Error>,
 }
@@ -32,6 +34,36 @@ struct LoadedAudio {
 /// Callers should print the text even when saving history failed, and send
 /// diagnostics to stderr so transcripts remain safe to pipe elsewhere.
 pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
+    run_inner(audio_file, None, None, Arc::new(Mutex::new(()))).await
+}
+
+/// Retries one canonical recording by ID. This is used by daemon IPC so a GUI
+/// never needs provider credentials and cannot accidentally retry a newer row.
+pub async fn run_recording(recording_id: i64) -> Result<RetryOutput> {
+    run_inner(None, Some(recording_id), None, Arc::new(Mutex::new(()))).await
+}
+
+pub async fn run_recording_with_cancel(
+    recording_id: i64,
+    cancel: CancellationToken,
+) -> Result<RetryOutput> {
+    run_recording_with_cancel_and_fence(recording_id, cancel, Arc::new(Mutex::new(()))).await
+}
+
+pub(crate) async fn run_recording_with_cancel_and_fence(
+    recording_id: i64,
+    cancel: CancellationToken,
+    persistence_fence: Arc<Mutex<()>>,
+) -> Result<RetryOutput> {
+    run_inner(None, Some(recording_id), Some(cancel), persistence_fence).await
+}
+
+async fn run_inner(
+    audio_file: Option<PathBuf>,
+    requested_recording_id: Option<i64>,
+    external_cancel: Option<CancellationToken>,
+    persistence_fence: Arc<Mutex<()>>,
+) -> Result<RetryOutput> {
     // A process-held advisory lock prevents two terminals from submitting the
     // same pending recording. The OS releases it even if the process crashes.
     let _retry_lock = tokio::task::spawn_blocking(|| {
@@ -41,16 +73,42 @@ pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
     .await
     .context("failed to join retry lock task")??;
     let explicit = audio_file.is_some();
-    let selected = match audio_file {
-        Some(path) => (path, None),
-        None => tokio::task::spawn_blocking(|| {
+    let selected = match (audio_file, requested_recording_id) {
+        (Some(path), None) => (path, None, None),
+        (None, Some(recording_id)) => tokio::task::spawn_blocking(move || {
+            let detail = Db::new()?
+                .get_recording(recording_id)?
+                .ok_or_else(|| anyhow!("recording {recording_id} does not exist"))?;
+            if detail.recording.status != crate::storage::RecordingStatus::Failed {
+                bail!("recording {recording_id} is not failed");
+            }
+            let path = detail
+                .recording
+                .audio_path
+                .ok_or_else(|| anyhow!("recording {recording_id} has no saved audio to retry"))?;
+            Ok::<_, anyhow::Error>((
+                PathBuf::from(path),
+                Some(detail.recording.duration_ms),
+                Some(recording_id),
+            ))
+        })
+        .await
+        .context("failed to join database lookup task")??,
+        (None, None) => tokio::task::spawn_blocking(|| {
             let failed = Db::new()?.get_last_failed_transcription()?;
             failed
-                .map(|entry| (PathBuf::from(entry.audio_path), Some(entry.duration_ms)))
+                .map(|entry| {
+                    (
+                        PathBuf::from(entry.audio_path),
+                        Some(entry.duration_ms),
+                        Some(entry.id),
+                    )
+                })
                 .ok_or_else(|| anyhow!("no failed transcription is available to retry; pass a WAV path to retry an older recording"))
         })
         .await
         .context("failed to join database lookup task")??,
+        (Some(_), Some(_)) => unreachable!("a retry has either a path or recording id"),
     };
 
     let requested_path = selected.0;
@@ -58,6 +116,7 @@ pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
     // symlink here would otherwise leave that entry behind after success.
     let pending_path = (!explicit).then(|| requested_path.to_string_lossy().into_owned());
     let recorded_duration_ms = selected.1;
+    let recording_id = selected.2;
     let loaded = tokio::task::spawn_blocking(move || read_wav(&requested_path))
         .await
         .context("failed to join audio reader task")??;
@@ -90,9 +149,10 @@ pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
         language: String::new(),
     };
 
-    let cancel = CancellationToken::new();
+    let cancel = external_cancel.unwrap_or_default();
     let transcription = client.transcribe(&cancel, &request);
     tokio::pin!(transcription);
+    let request_started = std::time::Instant::now();
     let result = tokio::select! {
         result = &mut transcription => result,
         signal = tokio::signal::ctrl_c() => {
@@ -100,15 +160,43 @@ pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
             signal.context("failed to listen for Ctrl-C")?;
             transcription.await
         }
+        _ = cancel.cancelled() => transcription.await,
     };
+    let latency_ms = i64::try_from(request_started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let response = match result {
         Ok(response) => response,
         Err(err) => {
             let err = err.context(format!("failed to transcribe {}", loaded.path.display()));
-            if explicit && !cancel.is_cancelled() {
+            if !cancel.is_cancelled() {
                 let failure_path = audio_path.clone();
+                let failure_error = format!("{err:#}");
+                let failure_model = model.clone();
+                let failure_cancel = cancel.clone();
+                let failure_fence = Arc::clone(&persistence_fence);
                 let saved = tokio::task::spawn_blocking(move || {
-                    Db::new()?.save_failed_transcription(duration_ms, &failure_path)
+                    let db = Db::new()?;
+                    let _persistence = failure_fence.lock().unwrap();
+                    if failure_cancel.is_cancelled() {
+                        bail!("transcription cancelled");
+                    }
+                    match recording_id {
+                        Some(id) => db.record_retry_failure(
+                            id,
+                            &failure_error,
+                            &failure_model,
+                            Some(latency_ms),
+                        ),
+                        None if explicit => db
+                            .save_failed_attempt(
+                                duration_ms,
+                                Some(&failure_path),
+                                &failure_error,
+                                Some(&failure_model),
+                                Some(latency_ms),
+                            )
+                            .map(|_| ()),
+                        None => Ok(()),
+                    }
                 })
                 .await
                 .context("failed to join retry persistence task")
@@ -123,18 +211,50 @@ pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
         }
     };
 
+    if cancel.is_cancelled() {
+        bail!("transcription cancelled");
+    }
+
     let transcript = response.text;
     let saved_text = transcript.clone();
+    let persistence_cancel = cancel.clone();
+    let success_fence = Arc::clone(&persistence_fence);
     let saved = tokio::task::spawn_blocking(move || {
-        Db::new()?.save_retried_transcript(duration_ms, &saved_text, &audio_path, &model)
+        let db = Db::new()?;
+        let _persistence = success_fence.lock().unwrap();
+        if persistence_cancel.is_cancelled() {
+            bail!("transcription cancelled");
+        }
+        match recording_id {
+            Some(recording_id) => db.save_retried_recording_attempt(
+                recording_id,
+                duration_ms,
+                &saved_text,
+                &audio_path,
+                &model,
+                Some(latency_ms),
+            ),
+            None => db.save_retried_transcript_attempt(
+                duration_ms,
+                &saved_text,
+                &audio_path,
+                &model,
+                Some(latency_ms),
+            ),
+        }
     })
     .await
     .context("failed to join transcript persistence task")
     .and_then(|result| result)
-    .context("transcription succeeded but saving it failed; audio file preserved");
+    .context("failed to save successful transcription; audio file preserved");
 
+    let saved_recording_id = match &saved {
+        Ok(id) => *id,
+        Err(_) => recording_id.unwrap_or_default(),
+    };
     Ok(RetryOutput {
         text: transcript,
+        recording_id: saved_recording_id,
         save_error: saved.err(),
     })
 }

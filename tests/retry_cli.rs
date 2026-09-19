@@ -78,6 +78,9 @@ impl TestEnvironment {
             .env("XDG_DATA_HOME", &self.data_home)
             .env("XDG_STATE_HOME", &self.state_home)
             .env("XDG_RUNTIME_DIR", &self.runtime_dir);
+        if let Some(library_path) = std::env::var_os("LD_LIBRARY_PATH") {
+            command.env("LD_LIBRARY_PATH", library_path);
+        }
         command
     }
 

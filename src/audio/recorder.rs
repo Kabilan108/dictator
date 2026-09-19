@@ -1,19 +1,19 @@
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::OpenOptions, io::Read, io::Write};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Local};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{BufferSize, BuildStreamError, SampleFormat, SampleRate, StreamConfig};
 use tracing::{debug, error, info, warn};
 
+use super::devices::{ResolvedMicrophone, resolve_microphone};
 use crate::utils::{AudioConfig, get_path_to_recording, validate_audio_config};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,12 +41,12 @@ struct Inner {
     state: RecorderState,
     start_instant: Instant,
     start_time: DateTime<Local>,
-    /// Thread that owns the CPAL stream; sending `StreamCommand::Stop` stops and
-    /// closes it.
+    /// Thread that owns the capture process; sending `StreamCommand::Stop`
+    /// stops and closes it.
     stream: Option<StreamHandle>,
 }
 
-/// State shared with the CPAL callback. It deliberately does not own the
+/// State shared with the capture reader. It deliberately does not own the
 /// stream handle, so dropping a live recorder cannot create an ownership cycle.
 struct CaptureState {
     buffer: Vec<f32>,
@@ -61,6 +61,7 @@ struct StreamHandle {
 
 enum StreamCommand {
     LevelReady,
+    CaptureEnded,
     Stop,
 }
 
@@ -90,8 +91,8 @@ impl Drop for OwnerThreadRegistration {
     }
 }
 
-/// Records mono float32 audio from the default input device into memory and
-/// encodes it as 16-bit PCM WAV on stop.
+/// Records mono float32 audio from the highest-priority connected input into
+/// memory and encodes it as 16-bit PCM WAV on stop.
 pub struct Recorder {
     config: AudioConfig,
     control: Mutex<()>,
@@ -106,11 +107,6 @@ impl Recorder {
     pub fn new(config: AudioConfig) -> Result<Self> {
         validate_audio_config(&config)?;
         let max_samples = max_samples(&config)?;
-
-        // Probe the host so that a missing audio backend fails at startup, like
-        // PortAudio initialization did.
-        let host = cpal::default_host();
-        debug!(host = ?host.id(), "audio host initialized");
 
         debug!(
             sr = config.sample_rate,
@@ -220,116 +216,129 @@ impl Recorder {
         Ok(())
     }
 
-    /// Opens the default input stream on a dedicated thread. Retries once after
-    /// re-querying the host if the default device is missing or unavailable.
+    /// Resolves the preferred input once, then opens that exact source on a
+    /// dedicated thread. An active capture never follows later preference or
+    /// system-default changes.
     fn open_stream(&self) -> Result<StreamHandle> {
-        match self.try_open_stream() {
-            Ok(handle) => Ok(handle),
-            Err(err) if is_device_error(&err) => {
-                warn!(err = %err, "refreshing audio host after input device failure");
-                self.try_open_stream()
-            }
-            Err(err) => Err(err),
-        }
+        let microphone = resolve_microphone()?;
+        self.try_open_stream(microphone)
     }
 
-    fn try_open_stream(&self) -> Result<StreamHandle> {
-        let sample_rate = u32::try_from(self.config.sample_rate)
-            .map_err(|_| anyhow!("audio sample rate does not fit u32"))?;
-        let frames_per_block = u32::try_from(self.config.frames_per_block)
-            .map_err(|_| anyhow!("audio frames per block does not fit u32"))?;
-        let config = StreamConfig {
-            channels: 1,
-            sample_rate: SampleRate(sample_rate),
-            buffer_size: BufferSize::Fixed(frames_per_block),
-        };
-
+    fn try_open_stream(&self, microphone: ResolvedMicrophone) -> Result<StreamHandle> {
+        let sample_rate = self.config.sample_rate.to_string();
+        let frames_per_block = usize::try_from(self.config.frames_per_block)
+            .map_err(|_| anyhow!("audio frames per block does not fit usize"))?;
         let capture = Arc::clone(&self.capture);
         let level = Arc::clone(&self.level);
         let stream_error = Arc::clone(&self.stream_error);
         let owner_thread = Arc::clone(&self.owner_thread);
         let level_mailbox = Arc::new(LevelMailbox::default());
-        // At most one coalesced level notification plus one control message.
-        let (command_tx, command_rx) = mpsc::sync_channel::<StreamCommand>(2);
+        // One coalesced level notification, capture completion, and control.
+        let (command_tx, command_rx) = mpsc::sync_channel::<StreamCommand>(3);
         let callback_command_tx = command_tx.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let source_name = microphone.source_name.clone();
+        let microphone_name = microphone.name.clone();
+        let microphone_id = microphone.id.clone();
 
         let thread = std::thread::Builder::new()
             .name("dictator-audio".into())
             .spawn(move || {
                 let _owner_registration = OwnerThreadRegistration::new(owner_thread);
-                let host = cpal::default_host();
-                let Some(device) = host.default_input_device() else {
-                    let _ = ready_tx.send(Err(anyhow!(
-                        "failed to open audio stream: no default input device"
-                    )));
-                    return;
-                };
-
-                let supports_config = match device.supported_input_configs() {
-                    Ok(configs) => configs.into_iter().any(|supported| {
-                        supported.channels() == config.channels
-                            && supported.sample_format() == SampleFormat::F32
-                            && supported.min_sample_rate() <= config.sample_rate
-                            && supported.max_sample_rate() >= config.sample_rate
-                    }),
+                let mut child = match parec_command(&source_name, &sample_rate).spawn() {
+                    Ok(child) => child,
                     Err(err) => {
-                        let _ = ready_tx
-                            .send(Err(anyhow!("failed to query input stream formats: {err}")));
+                        let _ = ready_tx.send(Err(anyhow!(
+                            "failed to open audio stream with parec: {err}"
+                        )));
                         return;
                     }
                 };
-                if !supports_config {
+                let Some(stdout) = child.stdout.take() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     let _ = ready_tx.send(Err(anyhow!(
-                        "input device does not support mono float32 at {} Hz",
-                        config.sample_rate.0
+                        "failed to open audio stream: parec stdout was unavailable"
                     )));
                     return;
+                };
+                let Some(stderr) = child.stderr.take() else {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = ready_tx.send(Err(anyhow!(
+                        "failed to open audio stream: parec stderr was unavailable"
+                    )));
+                    return;
+                };
+                let stderr_reader = match std::thread::Builder::new()
+                    .name("dictator-audio-stderr".into())
+                    .spawn(move || read_stderr_bounded(stderr))
+                {
+                    Ok(reader) => reader,
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = ready_tx
+                            .send(Err(anyhow!("failed to start audio error reader: {err}")));
+                        return;
+                    }
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let detail = join_stderr_reader(stderr_reader);
+                        let _ = ready_tx.send(Err(anyhow!(
+                            "failed to open audio stream: parec exited with {status}{detail}"
+                        )));
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stderr_reader.join();
+                        let _ = ready_tx
+                            .send(Err(anyhow!("failed to inspect parec audio stream: {err}")));
+                        return;
+                    }
                 }
 
-                let data_capture = Arc::clone(&capture);
-                let data_level = Arc::clone(&level);
-                let data_level_mailbox = Arc::clone(&level_mailbox);
-                let data_command_tx = callback_command_tx;
-                let error_state = Arc::clone(&stream_error);
-                let stream = device.build_input_stream(
-                    &config,
-                    move |data: &[f32], _| {
-                        capture_samples(&data_capture, data);
-                        queue_level_sample(
-                            &data_level,
-                            &data_level_mailbox,
-                            &data_command_tx,
-                            data,
+                let reader_capture = Arc::clone(&capture);
+                let reader_level = Arc::clone(&level);
+                let reader_mailbox = Arc::clone(&level_mailbox);
+                let reader = match std::thread::Builder::new()
+                    .name("dictator-audio-reader".into())
+                    .spawn(move || {
+                        read_parec_stream(
+                            stdout,
+                            frames_per_block,
+                            &reader_capture,
+                            &reader_level,
+                            &reader_mailbox,
+                            &callback_command_tx,
                         );
-                    },
-                    move |err| {
-                        let message = err.to_string();
-                        warn!(err = %message, "error reading audio stream");
-                        let mut current = error_state.lock().unwrap();
-                        if current.is_none() {
-                            *current = Some(message);
-                        }
-                    },
-                    None,
+                        let _ = callback_command_tx.send(StreamCommand::CaptureEnded);
+                    }) {
+                    Ok(reader) => reader,
+                    Err(err) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let detail = join_stderr_reader(stderr_reader);
+                        let _ = ready_tx.send(Err(anyhow!(
+                            "failed to start audio stream reader: {err}{detail}"
+                        )));
+                        return;
+                    }
+                };
+                let _ = ready_tx.send(Ok(()));
+                info!(
+                    microphone_id,
+                    microphone = microphone_name,
+                    source = source_name,
+                    "audio input selected"
                 );
 
-                let stream = match stream {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        let _ = ready_tx.send(Err(anyhow!("failed to open audio stream: {err}")));
-                        return;
-                    }
-                };
-
-                if let Err(err) = stream.play() {
-                    let _ = ready_tx.send(Err(anyhow!("failed to start audio stream: {err}")));
-                    return;
-                }
-
-                let _ = ready_tx.send(Ok(()));
-
-                // Deliver level observers away from the real-time callback.
+                let mut stopped = false;
+                let mut capture_ended = false;
                 while let Ok(command) = command_rx.recv() {
                     match command {
                         StreamCommand::LevelReady => {
@@ -339,13 +348,40 @@ impl Recorder {
                             let sample = *level_mailbox.latest.lock().unwrap();
                             deliver_level_sample(&level, sample);
                         }
-                        StreamCommand::Stop => break,
+                        StreamCommand::CaptureEnded => {
+                            capture_ended = true;
+                            break;
+                        }
+                        StreamCommand::Stop => {
+                            stopped = true;
+                            break;
+                        }
                     }
                 }
-                if let Err(err) = stream.pause() {
-                    warn!(err = %err, "failed to stop audio stream");
+                if (stopped || capture_ended)
+                    && let Err(err) = child.kill()
+                    && err.kind() != std::io::ErrorKind::InvalidInput
+                {
+                    warn!(err = %err, "failed to stop parec capture");
                 }
-                drop(stream);
+                let status = child.wait();
+                if reader.join().is_err() {
+                    error!("audio stream reader panicked");
+                }
+                let detail = join_stderr_reader(stderr_reader);
+                if !stopped {
+                    let message = match status {
+                        Ok(status) => {
+                            format!("audio input stopped: parec exited with {status}{detail}")
+                        }
+                        Err(err) => format!("audio input stopped: failed to wait for parec: {err}"),
+                    };
+                    warn!(err = %message, "error reading audio stream");
+                    let mut current = stream_error.lock().unwrap();
+                    if current.is_none() {
+                        *current = Some(message);
+                    }
+                }
             })
             .map_err(|e| anyhow!("failed to spawn audio thread: {e}"))?;
 
@@ -578,14 +614,6 @@ fn max_samples(config: &AudioConfig) -> Result<usize> {
         .ok_or_else(|| anyhow!("maximum audio sample count overflows usize"))
 }
 
-fn is_device_error(err: &anyhow::Error) -> bool {
-    if let Some(build) = err.downcast_ref::<BuildStreamError>() {
-        return matches!(build, BuildStreamError::DeviceNotAvailable);
-    }
-    let msg = err.to_string();
-    msg.contains("no default input device") || msg.contains("no longer available")
-}
-
 /// Converts an owned float32 buffer to little-endian int16 PCM.
 #[cfg(test)]
 fn samples_to_pcm(samples: Vec<f32>) -> Vec<u8> {
@@ -609,6 +637,102 @@ fn capture_samples(capture: &Mutex<CaptureState>, samples: &[f32]) {
     if capture.buffer.len() == capture.max_samples {
         capture.accepting = false;
     }
+}
+
+fn read_parec_stream(
+    mut stdout: impl Read,
+    frames_per_block: usize,
+    capture: &Mutex<CaptureState>,
+    level: &Mutex<LevelState>,
+    mailbox: &LevelMailbox,
+    command_tx: &mpsc::SyncSender<StreamCommand>,
+) {
+    let mut bytes = vec![0; frames_per_block.max(1).saturating_mul(4)];
+    let mut remainder = Vec::with_capacity(3);
+    loop {
+        let read = match stdout.read(&mut bytes) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => {
+                warn!(err = %err, "failed to read parec audio data");
+                break;
+            }
+        };
+        let samples = decode_float32le(&bytes[..read], &mut remainder);
+        if samples.is_empty() {
+            continue;
+        }
+        capture_samples(capture, &samples);
+        queue_level_sample(level, mailbox, command_tx, &samples);
+    }
+}
+
+fn parec_command(source_name: &str, sample_rate: &str) -> Command {
+    let mut command = Command::new("parec");
+    command
+        .args([
+            "--record",
+            "--raw",
+            "--format=float32le",
+            "--channels=1",
+            "--client-name=dictator",
+            "--stream-name=Dictation",
+            "--device",
+            source_name,
+            "--rate",
+            sample_rate,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn decode_float32le(bytes: &[u8], remainder: &mut Vec<u8>) -> Vec<f32> {
+    let mut combined = Vec::with_capacity(remainder.len() + bytes.len());
+    combined.append(remainder);
+    combined.extend_from_slice(bytes);
+    let complete = combined.len() / 4 * 4;
+    let samples = combined[..complete]
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    remainder.extend_from_slice(&combined[complete..]);
+    samples
+}
+
+fn read_stderr_bounded(mut stderr: impl Read) -> String {
+    const LIMIT: usize = 16 * 1024;
+    let mut stored = Vec::new();
+    let mut buffer = [0; 1024];
+    let mut truncated = false;
+    loop {
+        let read = match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let keep = read.min(LIMIT.saturating_sub(stored.len()));
+        stored.extend_from_slice(&buffer[..keep]);
+        truncated |= keep < read;
+    }
+    let detail = String::from_utf8_lossy(&stored);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        String::new()
+    } else if truncated {
+        format!(": {detail} [stderr truncated]")
+    } else {
+        format!(": {detail}")
+    }
+}
+
+fn join_stderr_reader(reader: JoinHandle<String>) -> String {
+    reader
+        .join()
+        .unwrap_or_else(|_| ": failed to read parec stderr".into())
 }
 
 fn queue_level_sample(
@@ -744,6 +868,79 @@ mod tests {
     fn pcm_conversion() {
         let data = samples_to_pcm(vec![0.0, 1.0, -1.0]);
         assert_eq!(data, vec![0, 0, 0xFF, 0x7F, 0x01, 0x80]);
+    }
+
+    #[test]
+    fn parec_float_decoder_preserves_partial_samples_between_reads() {
+        let expected = [0.25f32, -0.75f32];
+        let bytes: Vec<_> = expected
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let mut remainder = Vec::new();
+
+        assert!(decode_float32le(&bytes[..3], &mut remainder).is_empty());
+        assert_eq!(remainder, bytes[..3]);
+        assert_eq!(decode_float32le(&bytes[3..5], &mut remainder), [0.25]);
+        assert_eq!(remainder, bytes[4..5]);
+        assert_eq!(decode_float32le(&bytes[5..], &mut remainder), [-0.75]);
+        assert!(remainder.is_empty());
+    }
+
+    #[test]
+    fn parec_command_captures_the_resolved_source_directly() {
+        let command = parec_command("bluez_input.headset", "16000");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(command.get_program(), "parec");
+        assert_eq!(
+            args,
+            [
+                "--record",
+                "--raw",
+                "--format=float32le",
+                "--channels=1",
+                "--client-name=dictator",
+                "--stream-name=Dictation",
+                "--device",
+                "bluez_input.headset",
+                "--rate",
+                "16000",
+            ]
+        );
+    }
+
+    #[test]
+    fn parec_stderr_is_drained_but_error_text_is_bounded() {
+        let detail = read_stderr_bounded(std::io::Cursor::new(vec![b'x'; 32 * 1024]));
+        assert!(detail.ends_with(" [stderr truncated]"));
+        assert!(detail.len() < 17 * 1024);
+    }
+
+    #[test]
+    #[ignore = "live microphone probe"]
+    fn live_capture_start_cancel_probe() {
+        let recorder = Recorder::for_test(cfg());
+        recorder.start().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let samples_captured = loop {
+            let samples = recorder.capture.lock().unwrap().buffer.len();
+            if samples > 0 || Instant::now() >= deadline {
+                break samples;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let capture_error = recorder.take_error();
+        recorder.cancel().unwrap();
+        assert_eq!(recorder.get_state(), RecorderState::Stopped);
+        assert!(capture_error.is_none(), "capture failed: {capture_error:?}");
+        assert!(
+            samples_captured > 0,
+            "parec produced no float32 PCM samples within 3 seconds"
+        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ let
         pkgs.coreutils
         pkgs.wtype
       ];
-  pathPackages = displayPackages ++ cfg.extraPathPackages;
+  pathPackages = displayPackages ++ [ pkgs.pulseaudio ] ++ cfg.extraPathPackages;
   defaultPassEnvironment = [
     "DISPLAY"
     "XAUTHORITY"
@@ -54,6 +54,21 @@ in
       default = self.packages.${pkgs.system}.default;
       defaultText = "dictator.packages.${pkgs.system}.default";
       description = "Dictator package to use.";
+    };
+
+    gui = {
+      enable = lib.mkEnableOption "Dictator desktop and tray application";
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.system}.gui;
+        defaultText = "dictator.packages.${pkgs.system}.gui";
+        description = "Package providing dictator-gui.";
+      };
+      autostart = lib.mkOption {
+        type = lib.types.bool;
+        default = true;
+        description = "Start the tray application with the graphical session.";
+      };
     };
 
     displayServer = lib.mkOption {
@@ -155,10 +170,18 @@ in
       }
     ];
 
-    home.packages = [ cfg.package ] ++ pathPackages ++ cfg.extraPackages;
+    home.packages = [
+      cfg.package
+    ]
+    ++ lib.optional cfg.gui.enable cfg.gui.package
+    ++ pathPackages
+    ++ cfg.extraPackages;
 
-    xdg.configFile = lib.mkIf (configSource != null) {
-      "dictator/config.json".source = configSource;
+    xdg.configFile = {
+      "dictator/config.json" = lib.mkIf (configSource != null) { source = configSource; };
+      "autostart/dictator.desktop" = lib.mkIf (cfg.gui.enable && cfg.gui.autostart) {
+        text = "[Desktop Entry]\nType=Application\nName=Dictator\nExec=${cfg.gui.package}/bin/dictator-gui --tray\nTerminal=false\n";
+      };
     };
 
     systemd.user.services.dictator = {

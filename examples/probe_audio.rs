@@ -1,47 +1,51 @@
-//! Lists the default input device and captures a short sample to verify the
-//! audio backend works on this machine.
+//! Lists microphone priorities and observes 1.5 seconds of capture without
+//! saving audio or sending it to a transcription provider.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use anyhow::Result;
+use dictator::audio::{Recorder, microphone_preferences};
+use dictator::utils::AudioConfig;
 
-fn main() {
-    let host = cpal::default_host();
-    println!("host: {:?}", host.id());
-    let device = host
-        .default_input_device()
-        .expect("no default input device");
-    println!("default input: {}", device.name().unwrap_or_default());
-    let cfg = device.default_input_config().expect("default input config");
-    println!("default config: {cfg:?}");
-
-    let frames = Arc::new(Mutex::new(0usize));
-    let peak = Arc::new(Mutex::new(0f32));
-    let (f, p) = (frames.clone(), peak.clone());
-    let stream = device
-        .build_input_stream(
-            &cpal::StreamConfig {
-                channels: 1,
-                sample_rate: cpal::SampleRate(16000),
-                buffer_size: cpal::BufferSize::Fixed(1024),
-            },
-            move |data: &[f32], _| {
-                *f.lock().unwrap() += data.len();
-                let mut pk = p.lock().unwrap();
-                for s in data {
-                    *pk = pk.max(s.abs());
-                }
-            },
-            |e| eprintln!("stream error: {e}"),
-            None,
-        )
-        .expect("build stream");
-    stream.play().expect("play");
+fn main() -> Result<()> {
+    for microphone in microphone_preferences()?.microphones {
+        println!(
+            "{}: {} ({})",
+            microphone.id,
+            microphone.name,
+            if microphone.connected {
+                "connected"
+            } else {
+                "disconnected"
+            }
+        );
+    }
+    let recorder = Recorder::new(AudioConfig {
+        sample_rate: 16_000,
+        channels: 1,
+        bit_depth: 16,
+        frames_per_block: 1024,
+        max_duration_min: 5,
+    })?;
+    let peak = Arc::new(Mutex::new(0.0_f64));
+    let observed_peak = Arc::clone(&peak);
+    recorder.set_level_observer(
+        Some(Arc::new(move |sample| {
+            let mut peak = observed_peak.lock().unwrap();
+            *peak = peak.max(sample.peak);
+        })),
+        Duration::from_millis(20),
+    );
+    recorder.start()?;
     std::thread::sleep(Duration::from_millis(1500));
-    drop(stream);
+    let capture_error = recorder.take_error();
+    recorder.cancel()?;
+    if let Some(error) = capture_error {
+        anyhow::bail!("{error}");
+    }
     println!(
-        "captured {} frames in 1.5s, peak {:.4}",
-        frames.lock().unwrap(),
+        "captured for 1.5s, peak {:.4}; audio discarded",
         peak.lock().unwrap()
     );
+    Ok(())
 }

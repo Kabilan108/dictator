@@ -108,6 +108,12 @@ struct MeterPublisher {
     task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Default)]
+struct TerminalRecording {
+    id: Option<i64>,
+    generation: u64,
+}
+
 pub struct Daemon {
     config: Config,
     recorder: Recorder,
@@ -123,6 +129,10 @@ pub struct Daemon {
     stop_notify: Notify,
     shutdown_cancel: CancellationToken,
     notification_tx: watch::Sender<NotificationUpdate>,
+    terminal_recording: Mutex<TerminalRecording>,
+    latest_level: Mutex<LevelSample>,
+    recovered_retry_text: Mutex<Option<String>>,
+    retry_persistence_fence: Arc<Mutex<()>>,
 
     meter: Mutex<Option<MeterPublisher>>,
     recording_timeout: Mutex<Option<(u64, CancellationToken)>>,
@@ -185,6 +195,10 @@ impl Daemon {
             stop_notify: Notify::new(),
             shutdown_cancel: CancellationToken::new(),
             notification_tx,
+            terminal_recording: Mutex::new(TerminalRecording::default()),
+            latest_level: Mutex::new(LevelSample::default()),
+            recovered_retry_text: Mutex::new(None),
+            retry_persistence_fence: Arc::new(Mutex::new(())),
             meter: Mutex::new(None),
             recording_timeout: Mutex::new(None),
             error_timeout: Mutex::new(None),
@@ -514,11 +528,18 @@ impl Daemon {
         if self.current_state() != DaemonState::Recording {
             return;
         }
+        *self.latest_level.lock().unwrap() = sample;
         let guard = self.meter.lock().unwrap();
         let Some(publisher) = guard.as_ref() else {
             return;
         };
         publisher.tx.send_replace(sample);
+    }
+
+    fn record_terminal(&self, recording_id: i64) {
+        let mut terminal = self.terminal_recording.lock().unwrap();
+        terminal.id = Some(recording_id);
+        terminal.generation = terminal.generation.wrapping_add(1).max(1);
     }
 
     // ---- error handling ------------------------------------------------
@@ -607,6 +628,7 @@ impl Daemon {
         let (audio_data, audio_path) = match saved {
             Ok(Ok(value)) => value,
             Ok(Err(err)) => {
+                self.persist_capture_failure(recording_duration, &format!("{err:#}"));
                 self.handle_operation_error(
                     operation_id,
                     format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED),
@@ -615,6 +637,7 @@ impl Daemon {
                 return;
             }
             Err(err) => {
+                self.persist_capture_failure(recording_duration, &format!("{err:#}"));
                 self.handle_operation_error(
                     operation_id,
                     format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED),
@@ -628,6 +651,7 @@ impl Daemon {
             return;
         }
 
+        let request_started = Instant::now();
         let text = match self.transcribe(&cancel, audio_data, &audio_path).await {
             Ok(text) => text,
             Err(err) => {
@@ -641,6 +665,8 @@ impl Daemon {
                         &cancel,
                         recording_duration,
                         &audio_path,
+                        &format!("{err:#}"),
+                        request_started.elapsed(),
                     )
                     .await
                 {
@@ -662,6 +688,7 @@ impl Daemon {
                 &text,
                 recording_duration,
                 &audio_path,
+                request_started.elapsed(),
             )
             .await
             .is_err()
@@ -705,17 +732,48 @@ impl Daemon {
         Ok((audio_data, audio_path))
     }
 
+    fn persist_capture_failure(&self, duration: Duration, error_message: &str) {
+        let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
+        let model = self
+            .config
+            .api
+            .providers
+            .get(&self.config.api.active_provider)
+            .map(|provider| provider.model.as_str());
+        let saved = self
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .ok_or_else(|| anyhow!("database is closed"))
+            .and_then(|db| db.save_failed_attempt(duration_ms, None, error_message, model, None));
+        match saved {
+            Ok(recording_id) => self.record_terminal(recording_id),
+            Err(err) => warn!(err = %err, "failed to save capture failure"),
+        }
+    }
+
     async fn persist_failed_transcription(
         self: &Arc<Self>,
         operation_id: u64,
         cancel: &CancellationToken,
         duration: Duration,
         audio_path: &str,
+        error_message: &str,
+        latency: Duration,
     ) -> bool {
         let daemon = Arc::clone(self);
         let task_cancel = cancel.clone();
         let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
         let audio_path = audio_path.to_owned();
+        let error_message = error_message.to_owned();
+        let latency_ms = i64::try_from(latency.as_millis()).unwrap_or(i64::MAX);
+        let model = self
+            .config
+            .api
+            .providers
+            .get(&self.config.api.active_provider)
+            .map(|provider| provider.model.clone());
         let saved = tokio::task::spawn_blocking(move || {
             let _command = daemon.command_lock.lock().unwrap();
             if task_cancel.is_cancelled() || !daemon.state_matches_operation(operation_id) {
@@ -723,14 +781,21 @@ impl Daemon {
             }
 
             Some(match daemon.db.lock().unwrap().as_ref() {
-                Some(db) => db.save_failed_transcription(duration_ms, &audio_path),
+                Some(db) => db.save_failed_attempt(
+                    duration_ms,
+                    Some(&audio_path),
+                    &error_message,
+                    model.as_deref(),
+                    Some(latency_ms),
+                ),
                 None => Err(anyhow!("database is closed")),
             })
         })
         .await;
 
         match saved {
-            Ok(Some(Ok(()))) => {
+            Ok(Some(Ok(recording_id))) => {
+                self.record_terminal(recording_id);
                 debug!(operation_id, "failed transcription saved for retry");
                 true
             }
@@ -786,6 +851,7 @@ impl Daemon {
         text: &str,
         duration: Duration,
         audio_path: &str,
+        latency: Duration,
     ) -> Result<()> {
         if cancel.is_cancelled() {
             return Ok(());
@@ -841,13 +907,22 @@ impl Daemon {
         let text = text.to_owned();
         let audio_path = audio_path.to_owned();
         let saved = tokio::task::spawn_blocking(move || match daemon.db.lock().unwrap().as_ref() {
-            Some(db) => db.save_transcript(duration_ms, &text, &audio_path, &model),
+            Some(db) => db.save_transcript_attempt(
+                duration_ms,
+                &text,
+                &audio_path,
+                &model,
+                Some(i64::try_from(latency.as_millis()).unwrap_or(i64::MAX)),
+            ),
             None => Err(anyhow!("database is closed")),
         })
         .await
         .map_err(anyhow::Error::from)?;
         match saved {
-            Ok(()) => debug!("transcript saved to database"),
+            Ok(recording_id) => {
+                self.record_terminal(recording_id);
+                debug!(recording_id, "transcript saved to database");
+            }
             Err(err) => warn!(err = %err, "failed to save transcript to database"),
         }
 
@@ -872,7 +947,6 @@ impl Daemon {
         if self.reap_finished_pipeline() {
             bail!("previous dictation operation is still stopping");
         }
-
         {
             let state = self.state.read().unwrap();
             if state.state == DaemonState::Recording {
@@ -886,9 +960,11 @@ impl Daemon {
         debug!("starting recording");
         if let Err(err) = self.recorder.start() {
             error!(err = %err, "failed to start recording");
+            self.persist_capture_failure(Duration::ZERO, &format!("{err:#}"));
             self.handle_error_locked(None, format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED));
             bail!("{}: {err:#}", ipc::ERR_RECORDING_FAILED);
         }
+        self.recovered_retry_text.lock().unwrap().take();
 
         let cancel = self.shutdown_cancel.child_token();
         let (operation_id, revision) = {
@@ -911,6 +987,125 @@ impl Daemon {
         self.start_recording_timeout(operation_id);
         info!(operation_id, "recording started");
         Ok(())
+    }
+
+    fn start_retry_locked(self: &Arc<Self>, requested_id: Option<i64>) -> Result<i64> {
+        if self.shutdown_cancel.is_cancelled() {
+            bail!("daemon is shutting down");
+        }
+        if self.reap_finished_pipeline() {
+            bail!("previous dictation operation is still stopping");
+        }
+        let current_state = self.current_state();
+        if !matches!(current_state, DaemonState::Idle | DaemonState::Error) {
+            bail!("cannot retry in current state: {current_state}");
+        }
+        let (recording_id, initial_attempts) = {
+            let db = self.db.lock().unwrap();
+            let db = db.as_ref().ok_or_else(|| anyhow!("database is closed"))?;
+            let id = match requested_id {
+                Some(id) => id,
+                None => db
+                    .get_last_failed_transcription()?
+                    .map(|recording| recording.id)
+                    .ok_or_else(|| anyhow!("no failed transcription is available to retry"))?,
+            };
+            let detail = db
+                .get_recording(id)?
+                .ok_or_else(|| anyhow!("recording {id} does not exist"))?;
+            if detail.recording.status != crate::storage::RecordingStatus::Failed {
+                bail!("recording {id} is not failed");
+            }
+            if detail.recording.audio_path.is_none() {
+                bail!("recording {id} has no saved audio to retry");
+            }
+            (id, detail.recording.attempt_count)
+        };
+        if current_state == DaemonState::Error {
+            self.cancel_error_timeout(None);
+        }
+        self.recovered_retry_text.lock().unwrap().take();
+        let cancel = self.shutdown_cancel.child_token();
+        let retry_cancel = cancel.clone();
+        let (operation_id, revision) = {
+            let mut state = self.state.write().unwrap();
+            state.next_operation_id = state.next_operation_id.wrapping_add(1).max(1);
+            let operation_id = state.next_operation_id;
+            state.operation = Some(Operation {
+                id: operation_id,
+                cancel,
+            });
+            state.state = DaemonState::Transcribing;
+            state.last_error = None;
+            state.recording_duration = Duration::ZERO;
+            state.revision = state.revision.wrapping_add(1);
+            (operation_id, state.revision)
+        };
+        self.notify_state(DaemonState::Transcribing, revision);
+        let daemon = Arc::clone(self);
+        let persistence_fence = Arc::clone(&self.retry_persistence_fence);
+        let task = self.runtime.spawn(async move {
+            let result = crate::retry::run_recording_with_cancel_and_fence(
+                recording_id,
+                retry_cancel,
+                persistence_fence,
+            )
+            .await;
+            let persisted = match &result {
+                Ok(output) => output.recording_id == recording_id && output.save_error.is_none(),
+                Err(_) => daemon
+                    .db
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|db| db.get_recording(recording_id).ok().flatten())
+                    .is_some_and(|detail| detail.recording.attempt_count > initial_attempts),
+            };
+            if persisted {
+                daemon.record_terminal(recording_id);
+            }
+            match result {
+                Ok(output) if output.save_error.is_none() => {
+                    let finish_daemon = Arc::clone(&daemon);
+                    let finished = tokio::task::spawn_blocking(move || {
+                        let _command = finish_daemon.command_lock.lock().unwrap();
+                        let revision = finish_daemon
+                            .state
+                            .write()
+                            .unwrap()
+                            .finish_operation(operation_id)?;
+                        Some(revision)
+                    })
+                    .await;
+                    if let Ok(Some(revision)) = finished {
+                        daemon.notify_state(DaemonState::Idle, revision);
+                    }
+                }
+                Ok(mut output) => {
+                    *daemon.recovered_retry_text.lock().unwrap() = Some(output.text);
+                    let save_error = output
+                        .save_error
+                        .take()
+                        .expect("guarded by the successful-save branch");
+                    daemon
+                        .handle_operation_error(
+                            operation_id,
+                            format!("failed to save recovered transcription: {save_error:#}"),
+                        )
+                        .await;
+                }
+                Err(err) => {
+                    daemon
+                        .handle_operation_error(
+                            operation_id,
+                            format!("{}: {err:#}", ipc::ERR_TRANSCRIPTION_FAILED),
+                        )
+                        .await;
+                }
+            }
+        });
+        *self.pipeline.lock().unwrap() = Some(PipelineTask { operation_id, task });
+        Ok(recording_id)
     }
 
     fn stop_recording_locked(self: &Arc<Self>, expected_operation_id: Option<u64>) -> Result<()> {
@@ -974,6 +1169,11 @@ impl Daemon {
             state.revision = state.revision.wrapping_add(1);
             (operation_id, state.revision)
         };
+
+        // A retry persistence closure holds this fence across its final
+        // cancellation check and database transaction. Waiting here means no
+        // retry write can begin after cancel returns successfully.
+        drop(self.retry_persistence_fence.lock().unwrap());
 
         self.cancel_recording_timeout(operation_id);
         self.cancel_error_timeout(None);
@@ -1039,6 +1239,10 @@ impl Daemon {
                             {
                                 return;
                             }
+                            daemon.persist_capture_failure(
+                                daemon.recorder.get_recording_duration(),
+                                &recorder_error,
+                            );
                             daemon.handle_error_locked(
                                 Some(operation_id),
                                 format!("{}: {recorder_error}", ipc::ERR_RECORDING_FAILED),
@@ -1113,6 +1317,27 @@ impl CommandHandler for Arc<Daemon> {
     fn handle_cancel(&self) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
         self.cancel_operation_locked()
+    }
+
+    fn handle_retry(&self, recording_id: Option<i64>) -> Result<i64> {
+        let _command = self.command_lock.lock().unwrap();
+        self.start_retry_locked(recording_id)
+    }
+
+    fn get_last_recording(&self) -> Option<(i64, u64)> {
+        let terminal = self.terminal_recording.lock().unwrap();
+        terminal.id.map(|id| (id, terminal.generation))
+    }
+
+    fn get_audio_level(&self) -> Option<(f64, f64)> {
+        (self.current_state() == DaemonState::Recording).then(|| {
+            let level = *self.latest_level.lock().unwrap();
+            (level.rms, level.peak)
+        })
+    }
+
+    fn get_recovered_text(&self) -> Option<String> {
+        self.recovered_retry_text.lock().unwrap().clone()
     }
 
     fn get_status(&self) -> StatusData {
@@ -1214,6 +1439,10 @@ mod tests {
             stop_notify: Notify::new(),
             shutdown_cancel: CancellationToken::new(),
             notification_tx,
+            terminal_recording: Mutex::new(TerminalRecording::default()),
+            latest_level: Mutex::new(LevelSample::default()),
+            recovered_retry_text: Mutex::new(None),
+            retry_persistence_fence: Arc::new(Mutex::new(())),
             meter: Mutex::new(None),
             recording_timeout: Mutex::new(None),
             error_timeout: Mutex::new(None),
@@ -1359,6 +1588,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_start_in_error_keeps_recovered_retry_text() {
+        let (daemon, _dir) = daemon_fixture();
+        *daemon.recovered_retry_text.lock().unwrap() = Some("recovered words".into());
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Error;
+            state.last_error = Some("failed to save recovered transcription".into());
+        }
+
+        assert!(
+            daemon
+                .handle_start()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot start")
+        );
+        assert_eq!(
+            daemon.get_recovered_text().as_deref(),
+            Some("recovered words")
+        );
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settled_error_allows_retry_of_failed_recording() {
+        let (daemon, dir) = daemon_fixture();
+        let audio_path = dir.path().join("retained.wav");
+        std::fs::write(&audio_path, b"invalid wav").unwrap();
+        let recording_id = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .save_failed_attempt(
+                1_000,
+                Some(audio_path.to_str().unwrap()),
+                "provider timeout",
+                Some("test-model"),
+                Some(500),
+            )
+            .unwrap();
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Error;
+            state.last_error = Some("transcription failed".into());
+        }
+        *daemon.recovered_retry_text.lock().unwrap() = Some("older recovered words".into());
+
+        assert_eq!(
+            daemon.handle_retry(Some(recording_id)).unwrap(),
+            recording_id
+        );
+        assert!(daemon.get_recovered_text().is_none());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn canceled_pipeline_cannot_mutate_replacement_operation() {
         let (daemon, _dir) = daemon_fixture();
         let operation_a = daemon.shutdown_cancel.child_token();
@@ -1430,6 +1717,8 @@ mod tests {
                     &operation,
                     Duration::from_millis(4_321),
                     "/tmp/current-failure.wav",
+                    "provider timeout",
+                    Duration::from_millis(812),
                 )
                 .await
         );
@@ -1453,6 +1742,8 @@ mod tests {
                     &operation,
                     Duration::from_secs(5),
                     "/tmp/canceled-failure.wav",
+                    "canceled",
+                    Duration::from_millis(1),
                 )
                 .await
         );
@@ -1463,6 +1754,8 @@ mod tests {
                     &daemon.shutdown_cancel.child_token(),
                     Duration::from_secs(6),
                     "/tmp/stale-failure.wav",
+                    "stale",
+                    Duration::from_millis(1),
                 )
                 .await
         );

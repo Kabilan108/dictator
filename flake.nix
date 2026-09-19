@@ -16,16 +16,17 @@
           pkgs = import nixpkgs { inherit system; };
           lib = pkgs.lib;
         in
-        {
+        rec {
           default = pkgs.rustPlatform.buildRustPackage rec {
             pname = "dictator";
             version = "2.4.0";
             src = ./.;
-            cargoHash = "sha256-ZW9zsroO0oD7euyQQ8kdF4ypBHyqIVRgM1P/7Vv1iqg=";
+            cargoLock.lockFile = ./Cargo.lock;
 
             DICTATOR_VERSION = version;
 
             postInstall = ''
+              wrapProgram $out/bin/dictator --prefix PATH : ${lib.makeBinPath [ pkgs.pulseaudio ]}
               # Shell completions (clap-generated)
               install -d $out/share/bash-completion/completions
               $out/bin/dictator completion bash > $out/share/bash-completion/completions/dictator
@@ -48,9 +49,71 @@
               mainProgram = "dictator";
             };
 
-            buildInputs = with pkgs; [ alsa-lib ];
-            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = [ ];
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              makeWrapper
+            ];
           };
+          gui = default.overrideAttrs (old: {
+            pname = "dictator-gui";
+            cargoBuildFeatures = [ "gui" ];
+            cargoCheckFeatures = [ "gui" ];
+            buildInputs =
+              old.buildInputs
+              ++ (with pkgs; [
+                fontconfig
+                libxcb
+                freetype
+                libxkbcommon
+                wayland
+                libGL
+                vulkan-loader
+                openssl
+              ]);
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ (with pkgs; [
+                cmake
+                ninja
+                clang
+              ]);
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            postInstall = ''
+              rm -f $out/bin/dictator
+              install -Dm644 assets/dictator.svg $out/share/icons/hicolor/scalable/apps/dictator.svg
+              install -Dm644 assets/dictator.desktop $out/share/applications/dictator.desktop
+              wrapProgram $out/bin/dictator-gui \
+                --prefix PATH : ${
+                  lib.makeBinPath [
+                    pkgs.ffmpeg
+                    pkgs.pulseaudio
+                  ]
+                } \
+                --prefix LD_LIBRARY_PATH : ${
+                  lib.makeLibraryPath (
+                    with pkgs;
+                    [
+                      libxkbcommon
+                      wayland
+                      libGL
+                      vulkan-loader
+                      fontconfig
+                      freetype
+                      libx11
+                      libxcb
+                      libxcursor
+                      libxi
+                      libxrandr
+                    ]
+                  )
+                }
+            '';
+            meta = old.meta // {
+              description = "Dictator GPUI desktop and tray application";
+              mainProgram = "dictator-gui";
+            };
+          });
         }
       );
       devShells = forAllSystems (
@@ -64,9 +127,37 @@
             clippy
             rust-analyzer
             ffmpeg
+            pulseaudio
             pkg-config
-            alsa-lib
+            fontconfig
+            freetype
+            libxkbcommon
+            wayland
+            libGL
+            vulkan-loader
+            openssl
+            cmake
+            ninja
+            clang
+            llvmPackages.libclang
           ];
+          guiLibraries = with pkgs; [
+            libxkbcommon
+            wayland
+            libGL
+            vulkan-loader
+            fontconfig
+            freetype
+            libx11
+            libxcb
+            libxcursor
+            libxi
+            libxrandr
+          ];
+          guiEnvironment = {
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibraries;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          };
           x11Packages = with pkgs; [
             xclip
             xdotool
@@ -77,15 +168,24 @@
           ];
         in
         {
-          default = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
-          };
-          wayland = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
-          };
-          x11 = pkgs.mkShell {
-            buildInputs = commonPackages ++ x11Packages;
-          };
+          default = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ waylandPackages;
+            }
+          );
+          wayland = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ waylandPackages;
+            }
+          );
+          x11 = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ x11Packages;
+            }
+          );
         }
       );
       homeManagerModules = {
