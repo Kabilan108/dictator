@@ -393,6 +393,7 @@ impl Db {
     }
 
     pub fn get_last_failed_transcription(&self) -> Result<Option<FailedTranscription>> {
+        self.sync_legacy_writes()?;
         self.conn
             .query_row(
                 "SELECT id, timestamp, duration_ms, audio_path FROM recordings
@@ -1226,6 +1227,24 @@ mod tests {
         let latest = reopened.get_last_failed_transcription().unwrap().unwrap();
         assert_eq!(latest.audio_path, "/tmp/second.wav");
         assert_eq!(latest.duration_ms, 2_500);
+    }
+
+    #[test]
+    fn last_failed_lookup_imports_legacy_write_after_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.db");
+        let db = Db::open(&path).unwrap();
+        let legacy = Connection::open(&path).unwrap();
+        legacy
+            .execute(
+                "INSERT INTO failed_transcriptions (duration_ms, audio_path) VALUES (?, ?)",
+                params![1_750, "/tmp/late-failure.wav"],
+            )
+            .unwrap();
+
+        let failed = db.get_last_failed_transcription().unwrap().unwrap();
+        assert_eq!(failed.duration_ms, 1_750);
+        assert_eq!(failed.audio_path, "/tmp/late-failure.wav");
     }
 
     #[test]

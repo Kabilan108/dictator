@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::audio::{LevelSample, Recorder, TranscriptionRequest, WhisperClient, write_audio_data};
 use crate::ipc::{self, CommandHandler, DaemonState, Server, StatusData};
-use crate::notifier::{DBusNotifier, Notifier};
+use crate::notifier::Notifier;
 use crate::storage::Db;
 use crate::typing::Typer;
 use crate::utils::{Config, NotificationMode};
@@ -153,11 +153,7 @@ impl Daemon {
         let notifier = if cfg.notifications == NotificationMode::Off {
             Notifier::Noop
         } else {
-            Notifier::DBus(
-                DBusNotifier::new()
-                    .await
-                    .map_err(|e| anyhow!("failed to create notifier: {e}"))?,
-            )
+            Notifier::desktop().await
         };
 
         let typer = Typer::new()
@@ -628,7 +624,17 @@ impl Daemon {
         let (audio_data, audio_path) = match saved {
             Ok(Ok(value)) => value,
             Ok(Err(err)) => {
-                self.persist_capture_failure(recording_duration, &format!("{err:#}"));
+                if !self
+                    .persist_operation_capture_failure(
+                        operation_id,
+                        &cancel,
+                        recording_duration,
+                        &format!("{err:#}"),
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.handle_operation_error(
                     operation_id,
                     format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED),
@@ -637,7 +643,17 @@ impl Daemon {
                 return;
             }
             Err(err) => {
-                self.persist_capture_failure(recording_duration, &format!("{err:#}"));
+                if !self
+                    .persist_operation_capture_failure(
+                        operation_id,
+                        &cancel,
+                        recording_duration,
+                        &format!("{err:#}"),
+                    )
+                    .await
+                {
+                    return;
+                }
                 self.handle_operation_error(
                     operation_id,
                     format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED),
@@ -750,6 +766,34 @@ impl Daemon {
         match saved {
             Ok(recording_id) => self.record_terminal(recording_id),
             Err(err) => warn!(err = %err, "failed to save capture failure"),
+        }
+    }
+
+    async fn persist_operation_capture_failure(
+        self: &Arc<Self>,
+        operation_id: u64,
+        cancel: &CancellationToken,
+        duration: Duration,
+        error_message: &str,
+    ) -> bool {
+        let daemon = Arc::clone(self);
+        let task_cancel = cancel.clone();
+        let error_message = error_message.to_owned();
+        let persisted = tokio::task::spawn_blocking(move || {
+            let _command = daemon.command_lock.lock().unwrap();
+            if task_cancel.is_cancelled() || !daemon.state_matches_operation(operation_id) {
+                return false;
+            }
+            daemon.persist_capture_failure(duration, &error_message);
+            true
+        })
+        .await;
+        match persisted {
+            Ok(attempted) => attempted,
+            Err(err) => {
+                error!(operation_id, err = %err, "capture failure persistence task failed");
+                !cancel.is_cancelled() && self.state_matches_operation(operation_id)
+            }
         }
     }
 
@@ -1041,6 +1085,7 @@ impl Daemon {
             state.revision = state.revision.wrapping_add(1);
             (operation_id, state.revision)
         };
+        self.publish_osd_state(DaemonState::Transcribing, None, "");
         self.notify_state(DaemonState::Transcribing, revision);
         let daemon = Arc::clone(self);
         let persistence_fence = Arc::clone(&self.retry_persistence_fence);
@@ -1642,6 +1687,145 @@ mod tests {
             recording_id
         );
         assert!(daemon.get_recovered_text().is_none());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_operation_does_not_persist_capture_failure() {
+        let (daemon, _dir) = daemon_fixture();
+        let cancel = daemon.shutdown_cancel.child_token();
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Transcribing;
+            state.operation = Some(Operation {
+                id: 41,
+                cancel: cancel.clone(),
+            });
+            state.next_operation_id = 41;
+        }
+        cancel.cancel();
+
+        assert!(
+            !daemon
+                .persist_operation_capture_failure(
+                    41,
+                    &cancel,
+                    Duration::from_secs(1),
+                    "recorder is not recording",
+                )
+                .await
+        );
+        assert_eq!(
+            daemon
+                .db
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_history(&crate::storage::HistoryQuery::default())
+                .unwrap()
+                .total,
+            0,
+        );
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn capture_failure_database_wait_does_not_block_runtime() {
+        let (daemon, _dir) = daemon_fixture();
+        let db_path = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_owned();
+        let blocker = rusqlite::Connection::open(db_path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let cancel = daemon.shutdown_cancel.child_token();
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Transcribing;
+            state.operation = Some(Operation {
+                id: 42,
+                cancel: cancel.clone(),
+            });
+            state.next_operation_id = 42;
+        }
+        let persist_daemon = Arc::clone(&daemon);
+        let runtime_probe_started = Instant::now();
+        let task = tokio::spawn(async move {
+            persist_daemon
+                .persist_operation_capture_failure(
+                    42,
+                    &cancel,
+                    Duration::from_secs(1),
+                    "capture failed",
+                )
+                .await
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            runtime_probe_started.elapsed() < Duration::from_millis(500),
+            "SQLite busy timeout blocked the Tokio runtime"
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        assert!(task.await.unwrap());
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_publishes_transcribing_to_osd() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncBufReadExt;
+
+        let (daemon, dir) = daemon_fixture();
+        let audio_path = dir.path().join("retained-invalid.wav");
+        std::fs::write(&audio_path, b"invalid wav").unwrap();
+        let recording_id = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .save_failed_attempt(
+                1_000,
+                Some(audio_path.to_str().unwrap()),
+                "provider timeout",
+                Some("test-model"),
+                Some(500),
+            )
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sink = SocketSink::with_path(None, dir.path().join("private/osd.sock")).unwrap();
+        let stream = tokio::net::UnixStream::connect(sink.socket_path())
+            .await
+            .unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        *daemon.visual_sink.write().unwrap() = Sink::Socket(sink);
+
+        daemon.handle_retry(Some(recording_id)).unwrap();
+        line.clear();
+        tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        let event: visual::Event = serde_json::from_str(&line).unwrap();
+        assert!(matches!(
+            event,
+            visual::Event::State(StateEvent {
+                value: StateValue::Transcribing,
+                ..
+            })
+        ));
         daemon.shutdown().await.unwrap();
     }
 

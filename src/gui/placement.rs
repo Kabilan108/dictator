@@ -1,10 +1,13 @@
 use std::collections::HashMap;
 use std::env;
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
+
+use crate::utils::bounded_output;
 
 const POPUP_TITLE: &str = "Dictator quick controls";
 const POPUP_WIDTH: i32 = 340;
@@ -13,6 +16,8 @@ const EDGE_GAP: i32 = 16;
 const ANCHOR_GAP: i32 = 8;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_NIRI_OUTPUT_BYTES: usize = 1024 * 1024;
+static PLACEMENT_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Places the quick-controls window through Niri after GPUI has created it.
 ///
@@ -24,66 +29,92 @@ pub fn place_popup(anchor: Option<(i32, i32)>) {
     if env::var_os("NIRI_SOCKET").is_none() {
         return;
     }
+    if PLACEMENT_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
 
-    let _ = thread::Builder::new()
+    if thread::Builder::new()
         .name("dictator-popup-placement".to_string())
-        .spawn(move || place_popup_with_niri(anchor));
+        .spawn(move || {
+            let _running = PlacementGuard;
+            place_popup_with_niri(anchor);
+        })
+        .is_err()
+    {
+        PLACEMENT_RUNNING.store(false, Ordering::Release);
+    }
+}
+
+struct PlacementGuard;
+
+impl Drop for PlacementGuard {
+    fn drop(&mut self) {
+        PLACEMENT_RUNNING.store(false, Ordering::Release);
+    }
 }
 
 fn place_popup_with_niri(anchor: Option<(i32, i32)>) {
-    let Some(window_id) = find_popup_window() else {
+    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+    let Some(window_id) = find_popup_window(deadline) else {
         return;
     };
-    let Some(output) = output_for_anchor(anchor) else {
+    let Some(output) = output_for_anchor(anchor, deadline) else {
         return;
     };
     let (x, y) = popup_position(output, anchor);
 
-    if !niri_action(&["move-window-to-floating", "--id", &window_id.to_string()]) {
+    if !niri_action(
+        &["move-window-to-floating", "--id", &window_id.to_string()],
+        deadline,
+    ) {
         return;
     }
-    if !niri_action(&[
-        "set-window-width",
-        "--id",
-        &window_id.to_string(),
-        &POPUP_WIDTH.to_string(),
-    ]) {
+    if !niri_action(
+        &[
+            "set-window-width",
+            "--id",
+            &window_id.to_string(),
+            &POPUP_WIDTH.to_string(),
+        ],
+        deadline,
+    ) {
         return;
     }
-    if !niri_action(&[
-        "set-window-height",
-        "--id",
-        &window_id.to_string(),
-        &POPUP_HEIGHT.to_string(),
-    ]) {
+    if !niri_action(
+        &[
+            "set-window-height",
+            "--id",
+            &window_id.to_string(),
+            &POPUP_HEIGHT.to_string(),
+        ],
+        deadline,
+    ) {
         return;
     }
-    let _ = niri_action(&[
-        "move-floating-window",
-        "--id",
-        &window_id.to_string(),
-        "--x",
-        &x.to_string(),
-        "--y",
-        &y.to_string(),
-    ]);
+    let _ = niri_action(
+        &[
+            "move-floating-window",
+            "--id",
+            &window_id.to_string(),
+            "--x",
+            &x.to_string(),
+            "--y",
+            &y.to_string(),
+        ],
+        deadline,
+    );
 }
 
-fn find_popup_window() -> Option<u64> {
-    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+fn find_popup_window(deadline: Instant) -> Option<u64> {
     let pid = std::process::id();
     loop {
-        if let Some(windows) = niri_json::<Vec<NiriWindow>>(&["windows"]) {
-            // Window IDs increase over a Niri session. Choosing the largest ID
-            // avoids moving a stale duplicate during a rapid popup recreation.
-            if let Some(id) = windows
-                .into_iter()
-                .filter(|window| window.pid == Some(pid) && window.title == POPUP_TITLE)
-                .map(|window| window.id)
-                .max()
-            {
-                return Some(id);
-            }
+        if let Some(windows) = niri_json::<Vec<NiriWindow>>(&["windows"], deadline)
+            && let Some(id) = popup_window_id(windows, pid)
+        {
+            return Some(id);
         }
         if Instant::now() >= deadline {
             return None;
@@ -92,9 +123,19 @@ fn find_popup_window() -> Option<u64> {
     }
 }
 
-fn output_for_anchor(anchor: Option<(i32, i32)>) -> Option<LogicalRect> {
+fn popup_window_id(windows: Vec<NiriWindow>, pid: u32) -> Option<u64> {
+    // Window IDs increase over a Niri session. Choosing the largest ID avoids
+    // moving a stale duplicate during a rapid popup recreation.
+    windows
+        .into_iter()
+        .filter(|window| window.pid == Some(pid) && window.title.as_deref() == Some(POPUP_TITLE))
+        .map(|window| window.id)
+        .max()
+}
+
+fn output_for_anchor(anchor: Option<(i32, i32)>, deadline: Instant) -> Option<LogicalRect> {
     if let Some(anchor) = anchor
-        && let Some(outputs) = niri_json::<HashMap<String, NiriOutput>>(&["outputs"])
+        && let Some(outputs) = niri_json::<HashMap<String, NiriOutput>>(&["outputs"], deadline)
         && let Some(output) = outputs
             .into_values()
             .filter_map(|output| output.logical)
@@ -103,7 +144,7 @@ fn output_for_anchor(anchor: Option<(i32, i32)>) -> Option<LogicalRect> {
         return Some(output);
     }
 
-    niri_json::<NiriOutput>(&["focused-output"]).and_then(|output| output.logical)
+    niri_json::<NiriOutput>(&["focused-output"], deadline).and_then(|output| output.logical)
 }
 
 fn popup_position(output: LogicalRect, anchor: Option<(i32, i32)>) -> (i32, i32) {
@@ -152,37 +193,47 @@ fn clamp_to_output(value: i32, min: i32, max: i32) -> i32 {
     }
 }
 
-fn niri_json<T: for<'de> Deserialize<'de>>(request: &[&str]) -> Option<T> {
-    let output = Command::new("niri")
-        .arg("msg")
-        .arg("--json")
-        .args(request)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !output.status.success() {
+fn niri_json<T: for<'de> Deserialize<'de>>(request: &[&str], deadline: Instant) -> Option<T> {
+    niri_json_with_command(
+        Command::new("niri").arg("msg").arg("--json").args(request),
+        deadline,
+    )
+}
+
+fn niri_json_with_command<T: for<'de> Deserialize<'de>>(
+    command: &mut Command,
+    deadline: Instant,
+) -> Option<T> {
+    let remaining = deadline.checked_duration_since(Instant::now())?;
+    if remaining.is_zero() {
+        return None;
+    }
+    let output = bounded_output(command, remaining, MAX_NIRI_OUTPUT_BYTES).ok()?;
+    if output.timed_out || !output.status.success() || output.stdout_truncated {
         return None;
     }
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn niri_action(action: &[&str]) -> bool {
-    Command::new("niri")
-        .arg("msg")
-        .arg("action")
-        .args(action)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+fn niri_action(action: &[&str], deadline: Instant) -> bool {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        return false;
+    };
+    if remaining.is_zero() {
+        return false;
+    }
+    bounded_output(
+        Command::new("niri").arg("msg").arg("action").args(action),
+        remaining,
+        4096,
+    )
+    .is_ok_and(|output| !output.timed_out && output.status.success())
 }
 
 #[derive(Deserialize)]
 struct NiriWindow {
     id: u64,
-    title: String,
+    title: Option<String>,
     pid: Option<u32>,
 }
 
@@ -238,5 +289,34 @@ mod tests {
             height: 400,
         };
         assert_eq!(popup_position(small, None), (-500, 40));
+    }
+
+    #[test]
+    fn window_list_accepts_null_titles() {
+        let windows: Vec<NiriWindow> = serde_json::from_str(&format!(
+            r#"[
+                {{"id": 1, "title": null, "pid": 12}},
+                {{"id": 2, "title": "{POPUP_TITLE}", "pid": 12}}
+            ]"#
+        ))
+        .unwrap();
+        assert_eq!(windows[0].title, None);
+        assert_eq!(windows[1].title.as_deref(), Some(POPUP_TITLE));
+        assert_eq!(popup_window_id(windows, 12), Some(2));
+    }
+
+    #[test]
+    fn hung_niri_query_stops_at_the_placement_deadline() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exec sleep 10"]);
+
+        let result = niri_json_with_command::<serde_json::Value>(
+            &mut command,
+            started + Duration::from_millis(100),
+        );
+
+        assert!(result.is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

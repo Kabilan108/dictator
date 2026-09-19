@@ -13,11 +13,17 @@ Environment=XDG_RUNTIME_DIR=%t
 Environment=PULSE_RUNTIME_PATH=%t/pulse
 EnvironmentFile=-%h/.config/dictator/environment
 UMask=0077
+ExecStartPre=+/usr/bin/env install -d -m 0700 %h/.config/dictator %h/.local/share/dictator %h/.local/state/dictator
 
 # Security settings
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
+ProtectHome=read-only
+ReadOnlyPaths=%h
+ReadWritePaths=%h/.config/dictator %h/.local/share/dictator %h/.local/state/dictator
+RuntimeDirectory=dictator
+RuntimeDirectoryMode=0700
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true

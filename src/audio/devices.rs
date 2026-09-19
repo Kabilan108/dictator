@@ -6,15 +6,18 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::utils::CONFIG_DIR;
+use crate::utils::{CONFIG_DIR, bounded_output};
 
 const PREFERENCES_VERSION: u32 = 1;
 const PREFERENCES_FILE: &str = "preferences.json";
+const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
+const PACTL_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 static PREFERENCES_LOCK: Mutex<()> = Mutex::new(());
 
 /// One row in the user-controlled microphone priority list.
@@ -35,8 +38,9 @@ pub struct MicrophonePreferences {
 /// Reads the saved order, discovers current inputs, and appends newly seen
 /// microphones. A missing file is seeded once from current discovery.
 pub fn microphone_preferences() -> Result<MicrophonePreferences> {
+    let discovery = discover_microphones()?;
     let _guard = PREFERENCES_LOCK.lock().unwrap();
-    DeviceManager::system().preferences()
+    DeviceManager::system().preferences(&discovery)
 }
 
 /// Replaces the microphone priority order.
@@ -45,8 +49,9 @@ pub fn microphone_preferences() -> Result<MicrophonePreferences> {
 /// stale UI updates fail instead of dropping a disconnected or newly found
 /// device from the preference file.
 pub fn reorder_microphones(ordered_ids: &[String]) -> Result<MicrophonePreferences> {
+    let discovery = discover_microphones()?;
     let _guard = PREFERENCES_LOCK.lock().unwrap();
-    DeviceManager::system().reorder(ordered_ids)
+    DeviceManager::system().reorder(ordered_ids, &discovery)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,8 +64,9 @@ pub(crate) struct ResolvedMicrophone {
 /// Resolves capture once. The returned Pulse source name remains fixed for the
 /// lifetime of the recording, even if preferences or defaults change.
 pub(crate) fn resolve_microphone() -> Result<ResolvedMicrophone> {
+    let discovery = discover_microphones()?;
     let _guard = PREFERENCES_LOCK.lock().unwrap();
-    DeviceManager::system().resolve()
+    DeviceManager::system().resolve(&discovery)
 }
 
 struct DeviceManager {
@@ -79,20 +85,22 @@ impl DeviceManager {
         Self { preferences_path }
     }
 
-    fn preferences(&self) -> Result<MicrophonePreferences> {
+    fn preferences(&self, discovery: &Discovery) -> Result<MicrophonePreferences> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let discovery = discover_microphones()?;
-        let (saved, changed) = self.load_and_reconcile(&discovery)?;
+        let (saved, changed) = self.load_and_reconcile(discovery)?;
         if changed {
             write_preferences(&self.preferences_path, &saved)?;
         }
-        Ok(view_preferences(&saved, &discovery))
+        Ok(view_preferences(&saved, discovery))
     }
 
-    fn reorder(&self, ordered_ids: &[String]) -> Result<MicrophonePreferences> {
+    fn reorder(
+        &self,
+        ordered_ids: &[String],
+        discovery: &Discovery,
+    ) -> Result<MicrophonePreferences> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let discovery = discover_microphones()?;
-        let (mut saved, reconciled) = self.load_and_reconcile(&discovery)?;
+        let (mut saved, reconciled) = self.load_and_reconcile(discovery)?;
         validate_reorder(&saved.microphones, ordered_ids)?;
         let order_changed = saved
             .microphones
@@ -112,18 +120,17 @@ impl DeviceManager {
         if reconciled || order_changed {
             write_preferences(&self.preferences_path, &saved)?;
         }
-        Ok(view_preferences(&saved, &discovery))
+        Ok(view_preferences(&saved, discovery))
     }
 
-    fn resolve(&self) -> Result<ResolvedMicrophone> {
+    fn resolve(&self, discovery: &Discovery) -> Result<ResolvedMicrophone> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let discovery = discover_microphones()?;
-        let (saved, changed) = self.load_and_reconcile(&discovery)?;
+        let (saved, changed) = self.load_and_reconcile(discovery)?;
         if changed {
             write_preferences(&self.preferences_path, &saved)?;
         }
 
-        let selected = select_microphone(&saved, &discovery)
+        let selected = select_microphone(&saved, discovery)
             .ok_or_else(|| anyhow!("failed to open audio stream: no connected input device"))?;
 
         Ok(ResolvedMicrophone {
@@ -202,20 +209,45 @@ struct Discovery {
 }
 
 fn discover_microphones() -> Result<Discovery> {
-    let sources = Command::new("pactl")
-        .args(["--format=json", "list", "sources"])
-        .output()
-        .context("failed to run pactl for microphone discovery")?;
+    discover_microphones_with(|| Command::new("pactl"), PACTL_TIMEOUT)
+}
+
+fn discover_microphones_with(
+    mut new_command: impl FnMut() -> Command,
+    timeout: Duration,
+) -> Result<Discovery> {
+    let mut sources_command = new_command();
+    let sources = bounded_output(
+        sources_command.args(["--format=json", "list", "sources"]),
+        timeout,
+        PACTL_OUTPUT_LIMIT,
+    )
+    .context("failed to run pactl for microphone discovery")?;
+    if sources.timed_out {
+        bail!("microphone discovery timed out after {timeout:?}");
+    }
+    if sources.stdout_truncated {
+        bail!("pactl microphone discovery output exceeded {PACTL_OUTPUT_LIMIT} bytes");
+    }
     if !sources.status.success() {
         bail!(
             "failed to discover microphones with pactl: {}",
             String::from_utf8_lossy(&sources.stderr).trim()
         );
     }
-    let default = Command::new("pactl")
-        .arg("get-default-source")
-        .output()
-        .context("failed to query the default microphone with pactl")?;
+    let mut default_command = new_command();
+    let default = bounded_output(
+        default_command.arg("get-default-source"),
+        timeout,
+        PACTL_OUTPUT_LIMIT,
+    )
+    .context("failed to query the default microphone with pactl")?;
+    if default.timed_out {
+        bail!("default microphone query timed out after {timeout:?}");
+    }
+    if default.stdout_truncated {
+        bail!("pactl default microphone output exceeded {PACTL_OUTPUT_LIMIT} bytes");
+    }
     if !default.status.success() {
         bail!(
             "failed to query the default microphone with pactl: {}",
@@ -769,5 +801,27 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn hung_pactl_command_is_killed_on_the_discovery_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("hung-pactl");
+        fs::write(&executable, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        let started = std::time::Instant::now();
+
+        let error = discover_microphones_with(
+            || {
+                let mut command = Command::new("/bin/sh");
+                command.arg(&executable);
+                command
+            },
+            Duration::from_millis(100),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

@@ -308,14 +308,16 @@ struct MainView {
     status_pending: bool,
     last_status_request: Instant,
     reveal_id: Option<i64>,
+    pin_detail_id: Option<i64>,
     search: Entity<InputState>,
+    search_value: String,
     editor: Entity<InputState>,
     editor_recording: Option<i64>,
     inspected_revision: Option<i64>,
     selection_generation: u64,
     history_requests: VecDeque<u64>,
     detail_requests: VecDeque<(u64, i64)>,
-    save_requests: VecDeque<(i64, String)>,
+    mutation_requests: VecDeque<PendingMutation>,
     drafts: HashMap<i64, String>,
     setting_editor: bool,
     player: AudioPlayer,
@@ -325,6 +327,19 @@ struct MainView {
     _subscriptions: Vec<Subscription>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingMutation {
+    Save { id: i64, text: String },
+    Restore { id: i64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompletedMutation {
+    Save(String),
+    Restore,
+    Unexpected,
+}
+
 impl MainView {
     fn new(demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backend = Backend::new(demo);
@@ -332,19 +347,30 @@ impl MainView {
         let editor = cx.new(|cx| InputState::new(window, cx).multi_line(true));
         let search_subscription =
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
-                if matches!(event, InputEvent::Change) && !this.setting_editor {
+                let value = input.read(cx).value().to_string();
+                if matches!(event, InputEvent::Change)
+                    && let Some(search) = accept_search_change(&mut this.search_value, &value)
+                {
                     this.bump_selection();
                     this.page_index = 0;
-                    this.request_history(input.read(cx).value().to_string());
+                    this.request_history(search);
                     cx.notify();
                 }
             });
         let editor_subscription =
             cx.subscribe_in(&editor, window, |this, input, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) && !this.setting_editor {
-                    if let Some(id) = this.editor_recording {
-                        this.drafts.insert(id, input.read(cx).value().to_string());
-                    }
+                    let editor_text = input.read(cx).value().to_string();
+                    let baseline = this
+                        .detail
+                        .as_ref()
+                        .map(|detail| (detail.recording.id, detail.recording.text.clone()));
+                    track_editor_change(
+                        &mut this.drafts,
+                        this.editor_recording,
+                        baseline.as_ref().map(|(id, text)| (*id, text.as_str())),
+                        &editor_text,
+                    );
                     cx.notify();
                 }
             });
@@ -383,14 +409,16 @@ impl MainView {
             status_pending: true,
             last_status_request: Instant::now(),
             reveal_id: None,
+            pin_detail_id: None,
             search,
+            search_value: String::new(),
             editor,
             editor_recording: None,
             inspected_revision: None,
             selection_generation: 0,
             history_requests: VecDeque::new(),
             detail_requests: VecDeque::new(),
-            save_requests: VecDeque::new(),
+            mutation_requests: VecDeque::new(),
             drafts: HashMap::new(),
             setting_editor: false,
             player: AudioPlayer::default(),
@@ -421,6 +449,8 @@ impl MainView {
 
     fn bump_selection(&mut self) {
         self.selection_generation = self.selection_generation.wrapping_add(1);
+        self.reveal_id = None;
+        self.pin_detail_id = None;
     }
 
     fn apply_detail(
@@ -440,19 +470,25 @@ impl MainView {
                 self.drafts.remove(&id);
             }
         }
+        normalize_draft(&mut self.drafts, id, &detail.recording.text);
         let text = resolved_editor_text(
             self.drafts.get(&id).map(String::as_str),
             &detail.recording.text,
         );
         self.waveform = waveform(&detail.recording.audio_path, 64);
+        let pin_if_missing = self.pin_detail_id == Some(id);
         if self
             .page
             .as_ref()
             .is_some_and(|page| !page.recordings.iter().any(|recording| recording.id == id))
-            && self.reveal_id == Some(id)
+            && pin_if_missing
             && let Some(page) = self.page.as_mut()
         {
             page.recordings.insert(0, detail.recording.clone());
+        }
+        if pin_if_missing {
+            self.pin_detail_id = None;
+            self.reveal_id = None;
         }
         self.detail = Some(detail);
         self.inspected_revision = None;
@@ -476,19 +512,17 @@ impl MainView {
                     }
                     match result {
                         Ok(page) => {
-                            let select = page
+                            let visible_ids = page
                                 .recordings
                                 .iter()
-                                .find(|recording| self.reveal_id == Some(recording.id))
-                                .or_else(|| {
-                                    page.recordings.iter().find(|recording| {
-                                        self.detail.as_ref().is_some_and(|detail| {
-                                            detail.recording.id == recording.id
-                                        })
-                                    })
-                                })
-                                .or_else(|| page.recordings.first())
-                                .map(|recording| recording.id);
+                                .map(|recording| recording.id)
+                                .collect::<Vec<_>>();
+                            let current_id = self.detail.as_ref().map(|detail| detail.recording.id);
+                            let select = choose_history_selection(
+                                &mut self.reveal_id,
+                                &visible_ids,
+                                current_id,
+                            );
                             self.page = Some(page);
                             self.loading = false;
                             if let Some(id) = select {
@@ -497,7 +531,9 @@ impl MainView {
                                 self.detail = None;
                             }
                         }
-                        Err(error) => self.notice = error,
+                        Err(error) => {
+                            apply_history_error(&mut self.loading, &mut self.notice, error)
+                        }
                     }
                 }
                 Reply::Detail(result) => {
@@ -511,27 +547,57 @@ impl MainView {
                         Ok(detail) if detail.recording.id == requested_id => {
                             self.apply_detail(detail, None, window, cx);
                         }
-                        Ok(_) => self.notice = "Received the wrong recording".to_string(),
-                        Err(error) => self.notice = error,
+                        Ok(_) => {
+                            if self.pin_detail_id == Some(requested_id) {
+                                self.pin_detail_id = None;
+                                self.reveal_id = None;
+                            }
+                            self.notice = "Received the wrong recording".to_string();
+                        }
+                        Err(error) => {
+                            if self.pin_detail_id == Some(requested_id) {
+                                self.pin_detail_id = None;
+                                self.reveal_id = None;
+                            }
+                            self.notice = error;
+                        }
                     }
                 }
                 Reply::Saved(result) => {
-                    let submitted = self.save_requests.pop_front();
-                    match (result, submitted) {
-                        (Ok(detail), Some((id, text))) if detail.recording.id == id => {
-                            if self.editor_recording == Some(id) {
-                                self.apply_detail(detail, Some(&text), window, cx);
-                            } else if self.drafts.get(&id).is_some_and(|draft| draft == &text) {
-                                self.drafts.remove(&id);
+                    let pending = self.mutation_requests.pop_front();
+                    match result {
+                        Ok(detail) => match complete_mutation(pending, detail.recording.id) {
+                            CompletedMutation::Save(text) => {
+                                let id = detail.recording.id;
+                                if self.editor_recording == Some(id) {
+                                    self.apply_detail(detail, Some(&text), window, cx);
+                                } else if self.drafts.get(&id).is_some_and(|draft| draft == &text) {
+                                    self.drafts.remove(&id);
+                                }
+                                self.notice = "Saved".to_string();
+                                let search = self.search.read(cx).value().to_string();
+                                self.request_history(search);
                             }
-                            self.notice = "Saved".to_string();
-                            let search = self.search.read(cx).value().to_string();
-                            self.request_history(search);
-                        }
-                        (Ok(_), _) => {
-                            self.notice = "Received the wrong saved recording".to_string()
-                        }
-                        (Err(error), _) => self.notice = error,
+                            CompletedMutation::Restore => {
+                                let id = detail.recording.id;
+                                let preserved_draft =
+                                    normalize_draft(&mut self.drafts, id, &detail.recording.text);
+                                if self.editor_recording == Some(id) {
+                                    self.apply_detail(detail, None, window, cx);
+                                }
+                                self.notice = if preserved_draft {
+                                    "Revision restored; unsaved draft preserved".to_string()
+                                } else {
+                                    "Revision restored".to_string()
+                                };
+                                let search = self.search.read(cx).value().to_string();
+                                self.request_history(search);
+                            }
+                            CompletedMutation::Unexpected => {
+                                self.notice = "Received the wrong saved recording".to_string();
+                            }
+                        },
+                        Err(error) => self.notice = error,
                     }
                 }
                 Reply::Stats(result) => match result {
@@ -553,8 +619,10 @@ impl MainView {
                             if generation_changed && let Some(id) = status.last_recording_id {
                                 self.bump_selection();
                                 self.reveal_id = Some(id);
+                                self.pin_detail_id = Some(id);
                                 self.filter = Filter::All;
                                 self.page_index = 0;
+                                self.search_value.clear();
                                 self.setting_editor = true;
                                 self.search.update(cx, |search, cx| {
                                     search.set_value("", window, cx);
@@ -1119,13 +1187,16 @@ impl MainView {
                             if !should_save(&saved_text, &text, false) {
                                 this.notice = "No unsaved changes".to_string();
                             } else if this
-                                .save_requests
+                                .mutation_requests
                                 .iter()
-                                .any(|(pending_id, _)| *pending_id == id)
+                                .any(|pending| pending_mutation_id(pending) == id)
                             {
                                 this.notice = "Save already in progress".to_string();
                             } else {
-                                this.save_requests.push_back((id, text.clone()));
+                                this.mutation_requests.push_back(PendingMutation::Save {
+                                    id,
+                                    text: text.clone(),
+                                });
                                 this.backend.send(Request::SaveRevision {
                                     id,
                                     expected_revision,
@@ -1369,12 +1440,22 @@ impl MainView {
                 this.child(action_button(
                     "Restore selected revision",
                     cx.listener(move |view, _, _, cx| {
-                        view.backend.send(Request::RestoreRevision {
-                            id: recording_id,
-                            revision,
-                            expected_revision: recording_revision,
-                        });
-                        view.notice = "Restoring revision...".to_string();
+                        if view
+                            .mutation_requests
+                            .iter()
+                            .any(|pending| pending_mutation_id(pending) == recording_id)
+                        {
+                            view.notice = "A transcript change is already in progress".to_string();
+                        } else {
+                            view.mutation_requests
+                                .push_back(PendingMutation::Restore { id: recording_id });
+                            view.backend.send(Request::RestoreRevision {
+                                id: recording_id,
+                                revision,
+                                expected_revision: recording_revision,
+                            });
+                            view.notice = "Restoring revision...".to_string();
+                        }
                         cx.notify();
                     }),
                 ))
@@ -2331,6 +2412,81 @@ fn resolved_editor_text(draft: Option<&str>, server_text: &str) -> String {
     draft.unwrap_or(server_text).to_string()
 }
 
+fn track_editor_change(
+    drafts: &mut HashMap<i64, String>,
+    editor_recording: Option<i64>,
+    baseline: Option<(i64, &str)>,
+    editor_text: &str,
+) {
+    let (Some(editor_id), Some((baseline_id, server_text))) = (editor_recording, baseline) else {
+        return;
+    };
+    if editor_id != baseline_id {
+        return;
+    }
+    if editor_text == server_text {
+        drafts.remove(&editor_id);
+    } else {
+        drafts.insert(editor_id, editor_text.to_string());
+    }
+}
+
+fn normalize_draft(
+    drafts: &mut HashMap<i64, String>,
+    recording_id: i64,
+    server_text: &str,
+) -> bool {
+    if drafts
+        .get(&recording_id)
+        .is_some_and(|draft| draft == server_text)
+    {
+        drafts.remove(&recording_id);
+    }
+    drafts.contains_key(&recording_id)
+}
+
+fn accept_search_change(last_value: &mut String, incoming: &str) -> Option<String> {
+    if *last_value == incoming {
+        return None;
+    }
+    incoming.clone_into(last_value);
+    Some(incoming.to_string())
+}
+
+fn apply_history_error(loading: &mut bool, notice: &mut String, error: String) {
+    *loading = false;
+    *notice = error;
+}
+
+fn choose_history_selection(
+    reveal_id: &mut Option<i64>,
+    visible_ids: &[i64],
+    current_id: Option<i64>,
+) -> Option<i64> {
+    if let Some(id) = reveal_id.take() {
+        return Some(id);
+    }
+    current_id
+        .filter(|id| visible_ids.contains(id))
+        .or_else(|| visible_ids.first().copied())
+}
+
+fn pending_mutation_id(pending: &PendingMutation) -> i64 {
+    match pending {
+        PendingMutation::Save { id, .. } | PendingMutation::Restore { id } => *id,
+    }
+}
+
+fn complete_mutation(pending: Option<PendingMutation>, detail_id: i64) -> CompletedMutation {
+    match pending {
+        Some(PendingMutation::Save { id, text }) if id == detail_id => {
+            CompletedMutation::Save(text)
+        }
+        Some(PendingMutation::Restore { id }) if id == detail_id => CompletedMutation::Restore,
+        _ => CompletedMutation::Unexpected,
+    }
+}
+
 fn disconnected_notice(error: &str) -> String {
     format!("Daemon disconnected: {error}")
 }
@@ -2411,5 +2567,112 @@ mod state_tests {
         // A transport error does not clear the independent checkpoint.
         assert!(observe_recording_generation(&mut last_seen, 9));
         assert!(!observe_recording_generation(&mut last_seen, 9));
+    }
+
+    #[test]
+    fn failed_history_request_finishes_loading_and_surfaces_error() {
+        let mut loading = true;
+        let mut notice = String::new();
+
+        apply_history_error(
+            &mut loading,
+            &mut notice,
+            "database unavailable".to_string(),
+        );
+
+        assert!(!loading);
+        assert_eq!(notice, "database unavailable");
+    }
+
+    #[test]
+    fn terminal_reveal_is_consumed_before_later_history_reload() {
+        let mut reveal_id = Some(99);
+
+        assert_eq!(
+            choose_history_selection(&mut reveal_id, &[1, 2], Some(2)),
+            Some(99)
+        );
+        assert_eq!(reveal_id, None);
+        assert_eq!(
+            choose_history_selection(&mut reveal_id, &[1, 2], Some(2)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn restore_reply_matches_its_pending_mutation() {
+        assert_eq!(
+            complete_mutation(Some(PendingMutation::Restore { id: 12 }), 12),
+            CompletedMutation::Restore
+        );
+        assert_eq!(
+            complete_mutation(Some(PendingMutation::Restore { id: 12 }), 13),
+            CompletedMutation::Unexpected
+        );
+    }
+
+    #[test]
+    fn programmatic_editor_change_does_not_create_a_draft() {
+        let mut drafts = HashMap::new();
+
+        track_editor_change(
+            &mut drafts,
+            Some(7),
+            Some((7, "server transcript")),
+            "server transcript",
+        );
+
+        assert!(!drafts.contains_key(&7));
+    }
+
+    #[test]
+    fn delayed_change_from_previous_selection_is_ignored() {
+        let mut drafts = HashMap::new();
+
+        track_editor_change(
+            &mut drafts,
+            Some(8),
+            Some((7, "old transcript")),
+            "old transcript",
+        );
+
+        assert!(drafts.is_empty());
+    }
+
+    #[test]
+    fn restore_replaces_matching_false_draft_but_preserves_real_edit() {
+        let mut drafts = HashMap::from([(7, "restored transcript".to_string())]);
+        assert!(!normalize_draft(&mut drafts, 7, "restored transcript"));
+        assert!(!drafts.contains_key(&7));
+
+        drafts.insert(7, "typed while restoring".to_string());
+        assert!(normalize_draft(&mut drafts, 7, "restored transcript"));
+        assert_eq!(
+            drafts.get(&7).map(String::as_str),
+            Some("typed while restoring")
+        );
+    }
+
+    #[test]
+    fn delayed_programmatic_search_clear_is_ignored() {
+        let mut accepted_value = String::new();
+
+        assert_eq!(accept_search_change(&mut accepted_value, ""), None);
+        assert_eq!(accepted_value, "");
+    }
+
+    #[test]
+    fn real_search_change_updates_the_accepted_value() {
+        let mut accepted_value = String::new();
+
+        assert_eq!(
+            accept_search_change(&mut accepted_value, "deployment"),
+            Some("deployment".to_string())
+        );
+        assert_eq!(accepted_value, "deployment");
+        assert_eq!(
+            accept_search_change(&mut accepted_value, "deployment"),
+            None
+        );
     }
 }

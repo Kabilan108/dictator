@@ -60,6 +60,17 @@ pub enum Notifier {
 }
 
 impl Notifier {
+    /// Notifications are optional even when enabled in the configuration.
+    pub async fn desktop() -> Self {
+        match DBusNotifier::new().await {
+            Ok(notifier) => Self::DBus(notifier),
+            Err(err) => {
+                warn!(err = %err, "desktop notifications unavailable; continuing without them");
+                Self::Noop
+            }
+        }
+    }
+
     pub async fn update_state(&self, state: DaemonState) -> Result<()> {
         match self {
             Notifier::Noop => Ok(()),
@@ -229,4 +240,44 @@ async fn update_notification(
     state.notification_id = new_id;
     debug!(id = new_id, "notification sent successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "subprocess probe"]
+    async fn missing_notification_bus_probe_child() {
+        let notifier = Notifier::desktop().await;
+        assert!(matches!(notifier, Notifier::Noop));
+        notifier.update_state(DaemonState::Recording).await.unwrap();
+        notifier.update("test", "unavailable bus").await.unwrap();
+        notifier.close().await.unwrap();
+    }
+
+    #[test]
+    fn unavailable_notifications_are_optional() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "notifier::tests::missing_notification_bus_probe_child",
+                "--ignored",
+            ])
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                format!(
+                    "unix:path={}",
+                    directory.path().join("missing-bus").display()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }

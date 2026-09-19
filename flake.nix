@@ -129,6 +129,7 @@
             ffmpeg
             pulseaudio
             pkg-config
+            libxcb
             fontconfig
             freetype
             libxkbcommon

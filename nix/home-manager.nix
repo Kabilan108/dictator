@@ -44,6 +44,22 @@ let
     else
       null;
   extraArgs = lib.escapeShellArgs cfg.extraArgs;
+  xdgRoot = variable: fallback: cfg.environment.${variable} or fallback;
+  configRoot = xdgRoot "XDG_CONFIG_HOME" config.xdg.configHome;
+  dataRoot = xdgRoot "XDG_DATA_HOME" config.xdg.dataHome;
+  stateRoot = xdgRoot "XDG_STATE_HOME" config.xdg.stateHome;
+  writableAppDirectories = [
+    "${configRoot}/dictator"
+    "${dataRoot}/dictator"
+    "${stateRoot}/dictator"
+  ];
+  prepareWritableAppDirectories = lib.escapeShellArgs writableAppDirectories;
+  serviceEnvironment = {
+    XDG_CONFIG_HOME = configRoot;
+    XDG_DATA_HOME = dataRoot;
+    XDG_STATE_HOME = stateRoot;
+  }
+  // cfg.environment;
 in
 {
   options.services.dictator = {
@@ -168,6 +184,14 @@ in
         assertion = configSource != null;
         message = "services.dictator: set settings or configFile when enabling the service.";
       }
+      {
+        assertion = lib.all (path: lib.hasPrefix "/" path) [
+          configRoot
+          dataRoot
+          stateRoot
+        ];
+        message = "services.dictator: XDG config, data, and state roots must be absolute paths.";
+      }
     ];
 
     home.packages = [
@@ -177,11 +201,12 @@ in
     ++ pathPackages
     ++ cfg.extraPackages;
 
-    xdg.configFile = {
-      "dictator/config.json" = lib.mkIf (configSource != null) { source = configSource; };
-      "autostart/dictator.desktop" = lib.mkIf (cfg.gui.enable && cfg.gui.autostart) {
-        text = "[Desktop Entry]\nType=Application\nName=Dictator\nExec=${cfg.gui.package}/bin/dictator-gui --tray\nTerminal=false\n";
-      };
+    home.file."${configRoot}/dictator/config.json" = lib.mkIf (configSource != null) {
+      source = configSource;
+    };
+
+    xdg.configFile."autostart/dictator.desktop" = lib.mkIf (cfg.gui.enable && cfg.gui.autostart) {
+      text = "[Desktop Entry]\nType=Application\nName=Dictator\nExec=${cfg.gui.package}/bin/dictator-gui --tray\nTerminal=false\n";
     };
 
     systemd.user.services.dictator = {
@@ -199,10 +224,17 @@ in
           + lib.optionalString (cfg.extraArgs != [ ]) " ${extraArgs}";
         Restart = "on-failure";
         RestartSec = 5;
+        ExecStartPre = "+${lib.getExe' pkgs.coreutils "install"} -d -m 0700 ${prepareWritableAppDirectories}";
+        UMask = "0077";
+        ProtectHome = "read-only";
+        ReadOnlyPaths = [ config.home.homeDirectory ];
+        ReadWritePaths = writableAppDirectories;
+        RuntimeDirectory = "dictator";
+        RuntimeDirectoryMode = "0700";
         Environment = [
           "PATH=${lib.makeBinPath pathPackages}"
         ]
-        ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
+        ++ lib.mapAttrsToList (name: value: "${name}=${value}") serviceEnvironment;
         EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
         PassEnvironment =
           if cfg.passEnvironment != null then cfg.passEnvironment else defaultPassEnvironment;

@@ -169,6 +169,23 @@ You also need a Rust toolchain (`cargo`, Rust 1.88 or newer). Audio capture uses
    Environment=XDG_CONFIG_HOME=/absolute/path/to/config-root
    ```
 
+   The supplied unit limits home-directory writes to Dictator's default config,
+   data, and state directories. If `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, or
+   `XDG_STATE_HOME` points elsewhere, add every custom app directory to the
+   same drop-in and replace the preparation command with those exact paths:
+   ```ini
+   [Service]
+   Environment=XDG_CONFIG_HOME=/custom/config
+   Environment=XDG_DATA_HOME=/custom/data
+   Environment=XDG_STATE_HOME=/custom/state
+   ExecStartPre=
+   ExecStartPre=+/usr/bin/env install -d -m 0700 /custom/config/dictator /custom/data/dictator /custom/state/dictator
+   ReadWritePaths=
+   ReadWritePaths=/custom/config/dictator /custom/data/dictator /custom/state/dictator
+   ```
+   Keep the paths absolute. Resetting both list directives prevents the base
+   unit from requiring its default directories after the paths change.
+
    After adding any needed drop-in, enable the service. This attaches it to
    `graphical-session.target` without starting it during a headless login:
    ```bash
@@ -257,6 +274,13 @@ Notes:
 - `displayServer` controls the default runtime dependencies and environment (Wayland vs X11).
 - If you already manage a config file, set `services.dictator.configFile = /path/to/config.json;`.
 - To use `${env:VAR}` in the config, set `services.dictator.environmentFile` (supports strings like `${XDG_RUNTIME_DIR}/...`) or `services.dictator.environment`.
+- The service sandbox derives its writable config, data, and state directories
+  from Home Manager's XDG paths, or from absolute `XDG_CONFIG_HOME`,
+  `XDG_DATA_HOME`, and `XDG_STATE_HOME` values in `services.dictator.environment`.
+  If an `environmentFile` is intended to change any XDG root at runtime, add
+  direct `Environment`, `ExecStartPre`, and `ReadWritePaths` service overrides
+  for the resulting `dictator` directories; the unit's direct XDG assignments
+  otherwise take precedence over values from an environment file.
 
 ### Basic Usage
 

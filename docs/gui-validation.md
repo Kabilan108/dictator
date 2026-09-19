@@ -14,8 +14,10 @@ direnv exec "$PWD" cargo build --features gui --bins
 nix build .#gui
 ```
 
-The full GUI-feature test suite passed 138 tests, with 3 opt-in probes ignored.
+The full GUI-feature test suite passed 157 tests, with 4 opt-in probes ignored.
 Formatting and all-target Clippy passed with warnings denied.
+The Nix GUI package also passed its release-profile tests and launched on this
+machine without a development shell or an inherited `LD_LIBRARY_PATH`.
 
 The GUI workflow integration test uses private temporary XDG directories and a
 loopback HTTP provider. It checks failed and successful retries, stable recording
@@ -36,7 +38,8 @@ Tested with real GPUI windows at 1120×700 and the tray popup at 340×510:
 - A provider failure stayed in history. Retrying it retained the ID and capture
   timestamp, added an attempt, and did not paste text again.
 - Editing created a revision while preserving the original model output. The
-  compatibility CLI transcript contained the edited text.
+  compatibility CLI transcript contained the edited text. Restoring revision 0
+  updated the native editor immediately and appended a restore revision.
 - Playback, pause, and waveform seeking controlled a real `ffplay` process.
 - The system tray registered with the session's StatusNotifierWatcher. Repeated
   activation reused the popup. Niri placed it near the activation coordinates.
@@ -51,3 +54,10 @@ intercepted. The installed Home Manager daemon was not replaced or activated.
 GPUI 0.2.2 creates a normal Wayland toplevel for its popup window kind. On niri,
 Dictator uses the compositor's IPC to float, size, and position its own popup.
 Other compositors may need a window rule for `Dictator quick controls`.
+
+Review follow-up checks covered unavailable desktop notifications, stalled Pulse
+and Niri subprocesses, deferred editor/search events, legacy failure discovery,
+and cancellation during capture-failure persistence. A temporary systemd user
+unit could write the exact Dictator app directories while an unrelated home-file
+write was denied. The retry workflow passed 50 consecutive focused runs after
+one unreproduced timeout, followed by a successful full suite.
