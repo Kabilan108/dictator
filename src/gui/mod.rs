@@ -616,6 +616,9 @@ impl MainView {
                     self.status_pending = false;
                     match result {
                         Ok(status) => {
+                            if self.notice.starts_with("Daemon disconnected:") {
+                                self.notice.clear();
+                            }
                             let generation_changed = observe_recording_generation(
                                 &mut self.last_seen_recording_generation,
                                 status.last_recording_generation,
