@@ -624,6 +624,7 @@ impl MainView {
                                 status.last_recording_generation,
                             );
                             if generation_changed && let Some(id) = status.last_recording_id {
+                                self.notice.clear();
                                 self.bump_selection();
                                 self.reveal_id = Some(id);
                                 self.pin_detail_id = Some(id);
@@ -1758,7 +1759,10 @@ impl TrayView {
                     apply_tray_result(&mut self.stats, result, &mut self.notice)
                 }
                 Reply::Action(result) => {
-                    self.notice = action_notice(result);
+                    self.notice = match result {
+                        Ok(()) => String::new(),
+                        Err(error) => action_notice(Err(error)),
+                    };
                     if !self.status_pending {
                         self.backend.send(Request::Status);
                         self.status_pending = true;
