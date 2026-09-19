@@ -209,18 +209,78 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
             return;
         }
     };
-    let db = match Db::new() {
-        Ok(db) => db,
-        Err(error) => {
-            run_failed_worker(requests, replies, error.to_string());
-            return;
-        }
-    };
+    let mut db = None;
+    let mut db_error = String::new();
+    retry_database(&mut db, &mut db_error, open_database);
     while let Ok(request) = requests.recv() {
-        let reply = handle_live(&db, &runtime, request);
+        let kind = live_request_kind(&request);
+        reopen_database_for_request(&request, &mut db, &mut db_error, open_database);
+        let reply = if let Some(db) = db.as_ref() {
+            handle_live(db, &runtime, request)
+        } else if kind == LiveRequestKind::Service {
+            handle_live_service(&runtime, request)
+        } else {
+            failed_reply(request, &db_error)
+        };
         if replies.send(reply).is_err() {
             break;
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveRequestKind {
+    DatabaseRead,
+    DatabaseMutation,
+    Service,
+}
+
+fn live_request_kind(request: &Request) -> LiveRequestKind {
+    match request {
+        Request::History { .. } | Request::Detail(_) | Request::Stats => {
+            LiveRequestKind::DatabaseRead
+        }
+        Request::SaveRevision { .. } | Request::RestoreRevision { .. } => {
+            LiveRequestKind::DatabaseMutation
+        }
+        Request::Microphones
+        | Request::ReorderMicrophones(_)
+        | Request::Status
+        | Request::Toggle
+        | Request::Cancel
+        | Request::Retry(_) => LiveRequestKind::Service,
+    }
+}
+
+fn open_database() -> Result<Db, String> {
+    Db::new().map_err(|error| format!("Database unavailable: {error:#}"))
+}
+
+fn retry_database<T>(
+    database: &mut Option<T>,
+    error: &mut String,
+    open: impl FnOnce() -> Result<T, String>,
+) {
+    match open() {
+        Ok(opened) => {
+            *database = Some(opened);
+            error.clear();
+        }
+        Err(open_error) => {
+            *database = None;
+            *error = open_error;
+        }
+    }
+}
+
+fn reopen_database_for_request<T>(
+    request: &Request,
+    database: &mut Option<T>,
+    error: &mut String,
+    open: impl FnOnce() -> Result<T, String>,
+) {
+    if database.is_none() && live_request_kind(request) == LiveRequestKind::DatabaseRead {
+        retry_database(database, error, open);
     }
 }
 
@@ -323,6 +383,12 @@ fn handle_live(db: &Db, runtime: &tokio::runtime::Runtime, request: Request) -> 
                 .map(map_stats)
                 .map_err(|error| error.to_string()),
         ),
+        request => handle_live_service(runtime, request),
+    }
+}
+
+fn handle_live_service(runtime: &tokio::runtime::Runtime, request: Request) -> Reply {
+    match request {
         Request::Microphones => Reply::Microphones(
             crate::audio::microphone_preferences()
                 .map(|prefs| prefs.microphones.into_iter().map(map_microphone).collect())
@@ -358,6 +424,11 @@ fn handle_live(db: &Db, runtime: &tokio::runtime::Runtime, request: Request) -> 
                 .and_then(response_result)
                 .map_err(|error| error.to_string()),
         ),
+        Request::History { .. }
+        | Request::Detail(_)
+        | Request::SaveRevision { .. }
+        | Request::RestoreRevision { .. }
+        | Request::Stats => unreachable!("database request routed to service handler"),
     }
 }
 
@@ -1151,5 +1222,57 @@ mod tests {
 
         drop(request_tx);
         worker.join().expect("failed worker exits cleanly");
+    }
+
+    #[test]
+    fn database_reopens_only_for_a_later_read() {
+        let mut database = None;
+        let mut error = "Database unavailable: transient".to_string();
+        let mut attempts = 0;
+
+        let mutation = Request::SaveRevision {
+            id: 7,
+            expected_revision: 1,
+            text: "edit".to_string(),
+        };
+        reopen_database_for_request(&mutation, &mut database, &mut error, || {
+            attempts += 1;
+            Ok(41)
+        });
+        assert_eq!(attempts, 0, "mutations must not trigger an implicit retry");
+        assert_eq!(database, None);
+
+        let read = Request::History {
+            search: String::new(),
+            filter: Filter::All,
+            page: 0,
+        };
+        reopen_database_for_request(&read, &mut database, &mut error, || {
+            attempts += 1;
+            Ok(41)
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(database, Some(41));
+        assert!(error.is_empty());
+    }
+
+    #[test]
+    fn service_requests_do_not_require_a_database() {
+        assert_eq!(
+            live_request_kind(&Request::Status),
+            LiveRequestKind::Service
+        );
+        assert_eq!(
+            live_request_kind(&Request::Toggle),
+            LiveRequestKind::Service
+        );
+        assert_eq!(
+            live_request_kind(&Request::Retry(7)),
+            LiveRequestKind::Service
+        );
+        assert_eq!(
+            live_request_kind(&Request::Microphones),
+            LiveRequestKind::Service
+        );
     }
 }

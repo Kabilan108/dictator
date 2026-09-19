@@ -1,7 +1,8 @@
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{
     DateTime, Days, Duration as ChronoDuration, Local, NaiveDate, NaiveDateTime, TimeZone, Utc,
 };
@@ -16,6 +17,7 @@ const DB_FILENAME: &str = "app.db";
 const SCHEMA_VERSION: i64 = 1;
 const MAX_HISTORY_PAGE: usize = 100;
 const RECENT_LATENCY_LIMIT: i64 = 60;
+static DATABASE_CREATION_LOCK: Mutex<()> = Mutex::new(());
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS transcripts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -228,19 +230,34 @@ pub struct Db {
     path: PathBuf,
 }
 
+fn prepare_database_file(path: &Path) -> Result<()> {
+    let _creation = DATABASE_CREATION_LOCK
+        .lock()
+        .map_err(|_| anyhow!("database creation lock is poisoned"))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+    {
+        Ok(file) => drop(file),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to create database file {}", path.display()));
+        }
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to secure database file {}", path.display()))
+}
+
 impl Db {
     pub fn new() -> Result<Self> {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true).mode(0o700).create(&*DATA_DIR)?;
         std::fs::set_permissions(&*DATA_DIR, std::fs::Permissions::from_mode(0o700))?;
         let path = DATA_DIR.join(DB_FILENAME);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(&path)?;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        prepare_database_file(&path)?;
         Self::open(&path)
     }
 
@@ -253,15 +270,18 @@ impl Db {
         )
         .map_err(|e| anyhow!("failed to open database: {e}"))?;
 
-        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .context("failed to configure database busy timeout")?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable WAL journal mode")?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .context("failed to enable database foreign keys")?;
 
         let mut db = Self {
             conn,
             path: path.to_path_buf(),
         };
-        db.init()?;
+        db.init().context("failed to initialize database schema")?;
         Ok(db)
     }
 
@@ -1173,6 +1193,7 @@ fn parse_timestamp(raw: &str) -> rusqlite::Result<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::PermissionsExt;
 
     use chrono::Timelike;
@@ -1478,13 +1499,8 @@ mod tests {
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         drop(legacy);
-        assert!(
-            Db::open(&path)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("newer than supported")
-        );
+        let error = Db::open(&path).err().unwrap();
+        assert!(format!("{error:#}").contains("newer than supported"));
     }
 
     #[test]
@@ -1690,6 +1706,89 @@ mod tests {
                 .unwrap();
 
         assert_eq!(first, date.and_hms_opt(1, 0, 0).unwrap().and_utc());
+    }
+
+    fn try_lock_first_database_byte(file: &std::fs::File) -> std::io::Result<()> {
+        let lock = libc::flock {
+            l_type: libc::F_WRLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 1,
+            l_pid: 0,
+        };
+        // SAFETY: file owns a valid descriptor and lock points to a fully
+        // initialized flock for the duration of this call.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETLK, &lock) } == -1 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess probe"]
+    fn posix_lock_contender_probe_child() {
+        let path = std::env::var_os("DICTATOR_LOCK_PROBE_DB").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let error = try_lock_first_database_byte(&file)
+            .expect_err("another process should still hold the database lock");
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(code) if code == libc::EACCES || code == libc::EAGAIN
+        ));
+    }
+
+    #[test]
+    #[ignore = "subprocess probe"]
+    fn existing_database_open_lock_probe_child() {
+        let first = Db::new().unwrap();
+        let lock_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(first.path())
+            .unwrap();
+        try_lock_first_database_byte(&lock_file).unwrap();
+
+        let second = Db::new().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::posix_lock_contender_probe_child",
+                "--ignored",
+            ])
+            .env("DICTATOR_LOCK_PROBE_DB", second.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "database lock was lost while opening a second connection:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn opening_existing_database_preserves_process_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "storage::tests::existing_database_open_lock_probe_child",
+                "--ignored",
+            ])
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "lock probe failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

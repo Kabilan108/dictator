@@ -14,7 +14,7 @@ direnv exec "$PWD" cargo build --features gui --bins
 nix build .#gui
 ```
 
-The full GUI-feature test suite passed 166 tests, with 4 opt-in probes ignored.
+The full GUI-feature test suite passed 169 tests, with 6 helper/probe entries ignored by default.
 Formatting and all-target Clippy passed with warnings denied.
 The Nix GUI package also passed its release-profile tests and launched on this
 machine without a development shell or an inherited `LD_LIBRARY_PATH`.
@@ -61,3 +61,8 @@ and cancellation during capture-failure persistence. A temporary systemd user
 unit could write the exact Dictator app directories while an unrelated home-file
 write was denied. The retry workflow passed 50 consecutive focused runs after
 one unreproduced timeout, followed by a successful full suite.
+
+A final native lifecycle check reopened the tray five times and then restarted the
+isolated daemon while the main window remained open. History, statistics, and
+recording controls stayed available. A subprocess regression and a negative-control
+probe verified that opening another database connection preserves process locks.

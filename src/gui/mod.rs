@@ -512,6 +512,7 @@ impl MainView {
                     }
                     match result {
                         Ok(page) => {
+                            clear_database_notice(&mut self.notice);
                             let visible_ids = page
                                 .recordings
                                 .iter()
@@ -601,7 +602,10 @@ impl MainView {
                     }
                 }
                 Reply::Stats(result) => match result {
-                    Ok(stats) => self.stats = Some(stats),
+                    Ok(stats) => {
+                        self.stats = Some(stats);
+                        clear_database_notice(&mut self.notice);
+                    }
                     Err(error) => self.notice = error,
                 },
                 Reply::Microphones(result) => match result {
@@ -2496,11 +2500,20 @@ fn can_go_previous(page_index: usize) -> bool {
 
 fn apply_tray_result<T>(slot: &mut Option<T>, result: Result<T, String>, notice: &mut String) {
     match result {
-        Ok(value) => *slot = Some(value),
+        Ok(value) => {
+            *slot = Some(value);
+            clear_database_notice(notice);
+        }
         Err(error) => {
             *slot = None;
             *notice = error;
         }
+    }
+}
+
+fn clear_database_notice(notice: &mut String) {
+    if notice.starts_with("Database unavailable:") {
+        notice.clear();
     }
 }
 
@@ -2749,6 +2762,11 @@ mod state_tests {
 
         assert_eq!(value, None);
         assert_eq!(notice, "history unavailable");
+
+        notice = "Database unavailable: transient WAL error".to_string();
+        apply_tray_result(&mut value, Ok(42), &mut notice);
+        assert_eq!(value, Some(42));
+        assert!(notice.is_empty());
     }
 
     #[test]
