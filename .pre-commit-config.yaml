@@ -6,8 +6,9 @@ repos:
       - id: trailing-whitespace
   - repo: local
     hooks:
-      - id: gofmt
-        name: gofmt
-        entry: gofmt -w
+      - id: rustfmt
+        name: rustfmt
+        entry: cargo fmt --
         language: system
-        types: [go]
+        types: [rust]
+        pass_filenames: false

@@ -1,29 +1,48 @@
-.PHONY: build install deps clean test fmt check run
+.PHONY: build install deps clean test fmt check run release FORCE
 
 VERSION ?= $(shell git describe --tags --always --dirty)
-LDFLAGS := -ldflags "-s -w -X main.version=$(VERSION)"
+CARGO ?= cargo
 
-build/dictator: $(shell find . -name '*.go')
-	go build $(LDFLAGS) -o build/dictator .
+build/dictator: FORCE $(shell find src tests -name '*.rs') Cargo.toml Cargo.lock build.rs
+	DICTATOR_VERSION=$(VERSION) $(CARGO) build --release
+	mkdir -p build
+	cp target/release/dictator build/dictator
 
 build: build/dictator
 
 install:
-	go install
+	DICTATOR_VERSION=$(VERSION) $(CARGO) install --path . --locked
 
 deps:
-	go mod tidy
+	$(CARGO) update
 
 clean:
-	rm -f build/dictator
+	rm -rf build
+	$(CARGO) clean
 
 test:
-	go test -v ./...
+	$(CARGO) test
 
 fmt:
-	go fmt ./...
+	$(CARGO) fmt
 
 check:
-	go vet ./...
+	$(CARGO) fmt --check
+	$(CARGO) clippy --all-targets -- -D warnings
 
 run: build
+	./build/dictator daemon
+
+FORCE:
+
+.PHONY: gui check-gui test-gui
+
+gui:
+	$(CARGO) build --features gui --bin dictator-gui
+
+check-gui:
+	$(CARGO) fmt --check
+	$(CARGO) clippy --features gui --all-targets -- -D warnings
+
+test-gui:
+	$(CARGO) test --features gui

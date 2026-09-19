@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dictator
+Comment=Voice typing and transcript history
+Exec=dictator-gui
+Icon=dictator
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+StartupWMClass=org.dictator.Dictator

@@ -4,33 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Commands
 
-Build and run the project:
+Build and run the project (Rust, `cargo`; `nix develop` provides the toolchain and `alsa-lib`):
 ```bash
-make build         # builds to build/dictator
+make build         # release build, copied to build/dictator
 make run           # build and run daemon
-make install       # install to GOPATH/bin
+make install       # cargo install --path . --locked
+make test          # cargo test (unit + integration tests)
+make check         # cargo fmt --check + cargo clippy -D warnings
 make clean         # remove build artifacts
-make deps          # tidy dependencies
+make deps          # cargo update
 ```
-
-No specific test or lint commands are defined in the makefile.
 
 ## Architecture
 
 Dictator is a voice typing daemon for Linux using a client-server architecture:
 
 - **Binary modes**: Single binary operates as both daemon and CLI client
-- **IPC**: Unix socket communication at `/tmp/dictator.sock`
+- **IPC**: Unix socket communication at `$XDG_RUNTIME_DIR/dictator/dictator.sock`, with a private `/tmp/dictator-$UID/dictator.sock` fallback
 - **State machine**: Daemon manages states: idle → recording → transcribing → typing → idle
 - **Configuration**: JSON config at `~/.config/dictator/config.json`
 
 ### Core Components
 
-- **Daemon** (`internal/daemon/`): Background service managing state transitions and orchestrating audio/transcription/typing
-- **IPC** (`internal/ipc/`): Unix socket protocol for client-daemon communication
-- **Audio** (`internal/audio/`): PortAudio recording and Whisper API transcription
-- **Typing** (`internal/typing/`): Clipboard + paste simulation (X11: xclip/xdotool, Wayland: wl-copy/wtype)
-- **Notifier** (`internal/notifier/`): D-Bus desktop notifications for state changes
+- **Daemon** (`src/daemon.rs`): Background service managing state transitions and orchestrating audio/transcription/typing
+- **IPC** (`src/ipc/`): Unix socket protocol for client-daemon communication
+- **Audio** (`src/audio/`): cpal (ALSA/PipeWire) recording and Whisper API transcription
+- **Typing** (`src/typing.rs`): Clipboard + paste simulation (X11: xclip/xdotool, Wayland: wl-copy/wtype)
+- **Notifier** (`src/notifier.rs`): D-Bus desktop notifications for state changes
+- **Visual** (`src/visual/`): OSD event stream (newline-delimited JSON on a unix socket)
+- **Storage** (`src/storage.rs`): SQLite transcript history
 
 ### State Flow
 
@@ -43,16 +45,21 @@ The daemon implements a linear state machine:
 
 ### Key Dependencies
 
-- **Cobra/Viper**: CLI framework and configuration
-- **PortAudio**: Cross-platform audio I/O
-- **Whisper API**: Speech-to-text transcription
+- **clap**: CLI framework (with `clap_complete` for shell completions)
+- **tokio**: async runtime for IPC, OSD socket, HTTP and subprocesses
+- **cpal**: Cross-platform audio input (ALSA backend on Linux, works through PipeWire)
+- **reqwest** (rustls): Whisper API transcription
+- **zbus**: D-Bus notifications
+- **rusqlite** (bundled): transcript storage
 - **X11**: xclip (clipboard) + xdotool (paste keystroke)
 - **Wayland**: wl-clipboard (clipboard) + wtype (paste keystroke)
 
 ### Project Structure
 
-- `main.go`: CLI command definitions and entry point
-- `internal/daemon/daemon.go`: Core daemon logic and state management
-- `internal/ipc/protocol.go`: IPC message definitions and constants
-- `internal/utils/config.go`: Configuration management
+- `src/main.rs`: CLI command definitions and entry point
+- `src/lib.rs`: library root exposing the modules below
+- `src/daemon.rs`: Core daemon logic and state management
+- `src/ipc/protocol.rs`: IPC message definitions and constants
+- `src/utils/config.rs`: Configuration management
+- `tests/`: integration tests (IPC round trip, OSD socket)
 - `dictator.service`: systemd service template
