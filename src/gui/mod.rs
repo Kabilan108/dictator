@@ -1,10 +1,12 @@
 pub mod backend;
+mod levels;
 mod placement;
 mod playback;
 mod theme;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -26,14 +28,18 @@ use backend::{
     Backend, ConnectionReport, Detail, Filter, Microphone, Page, Recording, Reply, Request, Stats,
     Status,
 };
-use placement::place_popup;
+use levels::LevelFeed;
+use placement::{place_popup, size_main_window};
 use playback::{AudioPlayer, waveform};
 use theme::*;
 
 const APP_ID: &str = "org.dictator.Dictator";
 const RECENT_LIMIT: usize = 6;
-const LEVEL_HISTORY: usize = 48;
+const LEVEL_HISTORY: usize = 64;
 const COLUMN_WIDTH: f32 = 860.;
+const WINDOW_SIZE: (f32, f32) = (924., 740.);
+const FRAME_IDLE: Duration = Duration::from_millis(120);
+const FRAME_RECORDING: Duration = Duration::from_millis(33);
 
 struct GuiAssets;
 
@@ -43,6 +49,8 @@ impl gpui::AssetSource for GuiAssets {
             "icons/arrow-up.svg" => include_bytes!("../../assets/icons/arrow-up.svg"),
             "icons/arrow-down.svg" => include_bytes!("../../assets/icons/arrow-down.svg"),
             "icons/copy.svg" => include_bytes!("../../assets/icons/copy.svg"),
+            "icons/refresh.svg" => include_bytes!("../../assets/icons/refresh.svg"),
+            "icons/x.svg" => include_bytes!("../../assets/icons/x.svg"),
             _ => return Ok(None),
         };
         Ok(Some(Cow::Borrowed(data)))
@@ -53,6 +61,8 @@ impl gpui::AssetSource for GuiAssets {
             "icons/arrow-up.svg",
             "icons/arrow-down.svg",
             "icons/copy.svg",
+            "icons/refresh.svg",
+            "icons/x.svg",
         ]
         .into_iter()
         .filter(|asset| asset.starts_with(path))
@@ -86,6 +96,12 @@ impl Default for GuiOptions {
     }
 }
 
+static EXPLICIT_QUIT: AtomicBool = AtomicBool::new(false);
+
+/// GPUI's Linux backend stops its event loop when the last window closes, so
+/// a closed main window would take the tray with it. In tray mode the process
+/// replaces itself with a tray-only instance instead; only the tray's Quit
+/// item ends the process.
 pub fn run(options: GuiOptions) -> Result<()> {
     Application::new().with_assets(GuiAssets).run(move |cx| {
         gpui_component::init(cx);
@@ -103,6 +119,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
             .add_fonts(vec![
                 Cow::Borrowed(include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf")),
                 Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Medium.ttf")),
+                Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Regular.ttf")),
             ])
             .expect("failed to load Dictator fonts");
 
@@ -125,7 +142,25 @@ pub fn run(options: GuiOptions) -> Result<()> {
         }
         cx.activate(true);
     });
+    if should_relaunch_as_tray(options, EXPLICIT_QUIT.load(Ordering::Acquire)) {
+        relaunch_as_tray(options)?;
+    }
     Ok(())
+}
+
+fn should_relaunch_as_tray(options: GuiOptions, explicit_quit: bool) -> bool {
+    options.tray && !explicit_quit
+}
+
+fn relaunch_as_tray(options: GuiOptions) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = std::env::current_exe().context("failed to locate dictator-gui")?;
+    let mut command = std::process::Command::new(exe);
+    command.arg("--tray");
+    if options.demo {
+        command.arg("--demo");
+    }
+    Err(anyhow::Error::from(command.exec()).context("failed to relaunch tray-only dictator-gui"))
 }
 
 pub fn open_main_window(cx: &mut App, options: GuiOptions) -> Result<()> {
@@ -139,13 +174,13 @@ pub fn open_main_window(cx: &mut App, options: GuiOptions) -> Result<()> {
     {
         return Ok(());
     }
-    let bounds = Bounds::centered(None, size(px(1120.), px(700.)), cx);
+    let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
     let handle = cx
         .open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 app_id: Some(APP_ID.to_string()),
-                window_min_size: Some(size(px(920.), px(620.))),
+                window_min_size: Some(size(px(860.), px(620.))),
                 ..Default::default()
             },
             move |window, cx| {
@@ -156,6 +191,7 @@ pub fn open_main_window(cx: &mut App, options: GuiOptions) -> Result<()> {
         )
         .context("failed to open main window")?;
     cx.global_mut::<WindowRegistry>().main = Some(handle.into());
+    size_main_window(WINDOW_SIZE.0 as i32, WINDOW_SIZE.1 as i32);
     Ok(())
 }
 
@@ -275,7 +311,10 @@ impl HostView {
                     }
                     TrayAction::ToggleRecording => self.backend.send(Request::Toggle),
                     TrayAction::CancelRecording => self.backend.send(Request::Cancel),
-                    TrayAction::Quit => cx.quit(),
+                    TrayAction::Quit => {
+                        EXPLICIT_QUIT.store(true, Ordering::Release);
+                        cx.quit();
+                    }
                 }
             }
         }
@@ -320,6 +359,7 @@ struct MainView {
     confirm_delete: Option<i64>,
     delete_pending: Option<i64>,
     level_history: VecDeque<(f32, f32)>,
+    levels: LevelFeed,
     microphones: Vec<Microphone>,
     status: Option<Status>,
     last_seen_recording_generation: Option<u64>,
@@ -393,19 +433,19 @@ impl MainView {
         let weak = cx.weak_entity();
         window
             .spawn(cx, async move |cx| {
+                let mut interval = FRAME_IDLE;
                 loop {
-                    Timer::after(Duration::from_millis(120)).await;
-                    if !cx
-                        .update(|window, cx| {
-                            let Some(entity) = weak.upgrade() else {
-                                return false;
-                            };
-                            entity.update(cx, |this, cx| this.poll(window, cx));
-                            true
-                        })
-                        .unwrap_or(false)
-                    {
-                        break;
+                    Timer::after(interval).await;
+                    let next = cx.update(|window, cx| {
+                        let entity = weak.upgrade()?;
+                        Some(entity.update(cx, |this, cx| {
+                            this.poll(window, cx);
+                            this.frame_interval()
+                        }))
+                    });
+                    match next {
+                        Ok(Some(next)) => interval = next,
+                        _ => break,
                     }
                 }
             })
@@ -424,6 +464,11 @@ impl MainView {
             confirm_delete: None,
             delete_pending: None,
             level_history: VecDeque::with_capacity(LEVEL_HISTORY),
+            levels: if demo {
+                LevelFeed::default()
+            } else {
+                LevelFeed::start(crate::visual::default_socket_path())
+            },
             microphones: Vec::new(),
             status: None,
             last_seen_recording_generation: None,
@@ -451,7 +496,20 @@ impl MainView {
         this.backend.send(Request::Recent {
             limit: RECENT_LIMIT,
         });
+        this.check_connection();
         this
+    }
+
+    fn frame_interval(&self) -> Duration {
+        let recording = self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.state == DaemonState::Recording);
+        if recording && self.tab == Tab::Dictation {
+            FRAME_RECORDING
+        } else {
+            FRAME_IDLE
+        }
     }
 
     fn request_recent(&mut self) {
@@ -567,6 +625,24 @@ impl MainView {
     }
 
     fn poll(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let update = self.levels.take();
+        for sample in update.samples {
+            push_level(&mut self.level_history, true, sample);
+        }
+        if let Some(state) = update.state
+            && let Some(status) = self.status.as_mut()
+            && status.state != state
+        {
+            status.state = state;
+            if state != DaemonState::Recording {
+                self.level_history.clear();
+            }
+        }
+        if update.state_changed && !self.status_pending {
+            self.backend.send(Request::Status);
+            self.status_pending = true;
+            self.last_status_request = Instant::now();
+        }
         for reply in self.backend.drain() {
             match reply {
                 Reply::History(result) => {
@@ -680,11 +756,9 @@ impl MainView {
                                     self.tab = Tab::Dictation;
                                 }
                             }
-                            push_level(
-                                &mut self.level_history,
-                                status.state == DaemonState::Recording,
-                                (status.audio_level_rms, status.audio_level_peak),
-                            );
+                            if status.state != DaemonState::Recording {
+                                self.level_history.clear();
+                            }
                             self.status = Some(status);
                         }
                         Err(error) => {
@@ -756,16 +830,68 @@ impl MainView {
         self.tab = tab;
         self.confirm_delete = None;
         match tab {
-            Tab::Dictation => {
-                self.request_recent();
+            Tab::Dictation => self.request_recent(),
+            Tab::History => {}
+            Tab::Stats => self.backend.send(Request::Stats),
+            Tab::Settings => {
+                self.backend.send(Request::Microphones);
                 if self.connection.is_none() {
                     self.check_connection();
                 }
             }
-            Tab::History => {}
-            Tab::Stats => self.backend.send(Request::Stats),
-            Tab::Settings => self.backend.send(Request::Microphones),
         }
+    }
+
+    fn health(&self) -> (Option<bool>, String) {
+        let daemon = self.status.is_some();
+        let provider = self
+            .connection
+            .as_ref()
+            .map(|report| report.provider.is_ok());
+        let ok = match (daemon, provider) {
+            (false, _) | (true, Some(false)) => Some(false),
+            (true, Some(true)) => Some(true),
+            (true, None) => None,
+        };
+        let settings = &self.backend.managed_settings;
+        let host = settings_host(&self.connection, &settings.endpoint);
+        let daemon_line = match &self.status {
+            Some(status) => format!("Daemon up {}", format_uptime(status.uptime_seconds)),
+            None => "Daemon not running".to_string(),
+        };
+        let provider_line = match &self.connection {
+            Some(report) => match &report.provider {
+                Ok(detail) => format!("{host} reachable · {detail}"),
+                Err(error) => format!("{host} unreachable · {error}"),
+            },
+            None if self.connection_pending => format!("{host} · checking"),
+            None => format!("{host} · not checked"),
+        };
+        (ok, format!("{daemon_line}\n{provider_line}"))
+    }
+
+    fn render_health_dot(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (ok, summary) = self.health();
+        div()
+            .id("health")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(22.))
+            .mr(px(6.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .hover(|this| this.bg(SURFACE_2))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.check_connection();
+                cx.notify();
+            }))
+            .tooltip(move |window, cx| Tooltip::new(summary.clone()).build(window, cx))
+            .child(div().size(px(8.)).rounded_full().bg(match ok {
+                Some(true) => GREEN,
+                Some(false) => RED,
+                None => LINE_STRONG,
+            }))
     }
 
     fn render_titlebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -807,6 +933,7 @@ impl MainView {
             );
         }
         bar = bar.child(div().flex_1());
+        bar = bar.child(self.render_health_dot(cx));
         if self.tab == Tab::History {
             if let Some(status) = &self.status
                 && matches!(
@@ -920,6 +1047,7 @@ impl MainView {
                                 .justify_between()
                                 .text_size(px(11.))
                                 .text_color(MUTED)
+                                .font_family(FONT_MONO)
                                 .child(format!(
                                     "{}  ·  {}{}",
                                     format_time(recording.timestamp),
@@ -930,6 +1058,7 @@ impl MainView {
                                         ""
                                     }
                                 ))
+                                .font_family(FONT_MONO)
                                 .child(format!("#{}", recording.id)),
                         )
                         .child(
@@ -1225,6 +1354,7 @@ impl MainView {
                             .ml(px(10.))
                             .text_size(px(11.))
                             .text_color(MUTED)
+                            .font_family(FONT_MONO)
                             .child(format!("#{}", recording.id)),
                     )
                     .child(div().flex_1())
@@ -1394,7 +1524,6 @@ impl MainView {
     }
 
     fn render_dictation(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let settings = self.backend.managed_settings.clone();
         let status = self.status.clone();
         let state = status.as_ref().map(|status| status.state);
         let recording = state == Some(DaemonState::Recording);
@@ -1413,79 +1542,13 @@ impl MainView {
             Some(DaemonState::Idle) => None,
             None => Some(("Daemon unavailable".to_string(), MUTED)),
         };
-        let connection = self.connection.clone();
-        let checking = self.connection_pending;
-        let host = settings_host(&connection, &settings.endpoint);
-        let daemon_line = match &status {
-            Some(status) => format!("daemon up {}", format_uptime(status.uptime_seconds)),
-            None => "daemon not running".to_string(),
+        let problem = match (&status, &self.connection) {
+            (None, _) => Some("The daemon is not running. Start it and the controls will return."),
+            (Some(_), Some(report)) if report.provider.is_err() => Some(
+                "The transcription server is unreachable. Recordings will fail until it is back.",
+            ),
+            _ => None,
         };
-        let provider_line = match &connection {
-            Some(report) => match &report.provider {
-                Ok(detail) => format!("{host} · {detail}"),
-                Err(error) => format!("{host} · {error}"),
-            },
-            None if checking => format!("{host} · checking..."),
-            None => format!("{host} · not checked"),
-        };
-        let provider_ok = connection.as_ref().map(|report| report.provider.is_ok());
-        let status_block = div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(18.))
-            .px(px(14.))
-            .py(px(10.))
-            .bg(MANTLE)
-            .border_1()
-            .border_color(LINE)
-            .rounded(px(6.))
-            .text_size(px(12.))
-            .text_color(SUBTEXT)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(18.))
-                            .child(status_pill(daemon_line, Some(connected)))
-                            .child(status_pill(provider_line, provider_ok)),
-                    )
-                    .child(
-                        div()
-                            .pl(px(14.))
-                            .text_size(px(11.))
-                            .text_color(MUTED)
-                            .truncate()
-                            .child(format!("{} · {}", settings.provider, settings.model)),
-                    ),
-            )
-            .child(
-                div()
-                    .id("check-connection")
-                    .flex_none()
-                    .px(px(8.))
-                    .py(px(4.))
-                    .rounded(px(4.))
-                    .text_color(MUTED)
-                    .cursor_pointer()
-                    .hover(|this| this.bg(SURFACE_2).text_color(TEXT))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.check_connection();
-                        cx.notify();
-                    }))
-                    .child(if checking {
-                        "Checking..."
-                    } else {
-                        "Check connection"
-                    }),
-            );
 
         let record_button = div()
             .id("dictation-toggle")
@@ -1537,22 +1600,38 @@ impl MainView {
                             .child(render_waveform(recording, &self.level_history)),
                     )
                     .when(busy, |this| {
-                        this.child(action_button(
-                            "Cancel",
-                            cx.listener(|this, _, _, cx| {
-                                this.backend.send(Request::Cancel);
-                                cx.notify();
-                            }),
-                        ))
+                        this.child(
+                            div()
+                                .id("dictation-cancel")
+                                .size(px(32.))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .border_1()
+                                .border_color(LINE_STRONG)
+                                .text_color(MUTED)
+                                .cursor_pointer()
+                                .hover(|this| this.bg(alpha(RED, 0.15)).text_color(RED))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.backend.send(Request::Cancel);
+                                    cx.notify();
+                                }))
+                                .tooltip(|window, cx| {
+                                    Tooltip::new("Cancel recording").build(window, cx)
+                                })
+                                .child(Icon::empty().path("icons/x.svg").size(px(14.))),
+                        )
                     }),
             )
-            .child(div().h(px(24.)).flex().items_center().when_some(
+            .child(div().h(px(26.)).flex().items_center().when_some(
                 caption,
                 |this, (text, color)| {
                     this.child(
                         div()
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(18.))
+                            .text_size(px(20.))
                             .text_color(color)
                             .child(text),
                     )
@@ -1591,16 +1670,14 @@ impl MainView {
                     this.reveal_recording(id, window, cx);
                     cx.notify();
                 }))
-                .child(div().w(px(28.)).flex_none())
                 .child(
                     div()
                         .id("last-result-text")
                         .flex_1()
                         .min_w_0()
-                        .max_h(px(120.))
+                        .max_h(px(132.))
                         .overflow_y_scroll()
-                        .text_center()
-                        .text_size(px(14.))
+                        .text_size(px(15.))
                         .line_height(gpui::relative(1.6))
                         .text_color(TEXT)
                         .child(text),
@@ -1642,7 +1719,7 @@ impl MainView {
                 .child(
                     div()
                         .id("open-all-history")
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(MUTED)
                         .cursor_pointer()
                         .hover(|this| this.text_color(TEXT))
@@ -1677,7 +1754,7 @@ impl MainView {
                     .items_center()
                     .gap(px(10.))
                     .px(px(8.))
-                    .py(px(7.))
+                    .py(px(9.))
                     .rounded(px(4.))
                     .cursor_pointer()
                     .hover(|this| this.bg(SURFACE))
@@ -1687,10 +1764,11 @@ impl MainView {
                     }))
                     .child(
                         div()
-                            .w(px(44.))
+                            .w(px(48.))
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(MUTED)
+                            .font_family(FONT_MONO)
                             .child(format_time(recording.timestamp)),
                     )
                     .child(
@@ -1698,14 +1776,16 @@ impl MainView {
                             .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_size(px(13.))
                             .text_color(if failed { RED } else { SUBTEXT })
                             .child(body),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(MUTED)
+                            .font_family(FONT_MONO)
                             .child(format_duration(recording.duration_ms)),
                     )
                     .when(!failed, |this| {
@@ -1731,23 +1811,6 @@ impl MainView {
             );
         }
 
-        let mut shortcuts = Vec::new();
-        if !settings.shortcut_toggle.is_empty() {
-            shortcuts.push(format!("{} toggle", settings.shortcut_toggle));
-        }
-        if !settings.shortcut_cancel.is_empty() {
-            shortcuts.push(format!("{} cancel", settings.shortcut_cancel));
-        }
-        let footer = div()
-            .w_full()
-            .flex()
-            .justify_center()
-            .gap(px(18.))
-            .pt(px(10.))
-            .text_size(px(11.))
-            .text_color(MUTED)
-            .children(shortcuts);
-
         div()
             .flex_1()
             .min_h_0()
@@ -1755,7 +1818,7 @@ impl MainView {
             .flex_col()
             .items_center()
             .px(px(28.))
-            .pt(px(22.))
+            .pt(px(26.))
             .pb(px(14.))
             .child(
                 div()
@@ -1766,12 +1829,25 @@ impl MainView {
                     .flex()
                     .flex_col()
                     .gap(px(18.))
-                    .child(status_block)
                     .child(record_panel)
+                    .when_some(problem, |this, problem| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .px(px(14.))
+                                .py(px(10.))
+                                .bg(alpha(RED, 0.08))
+                                .border_l_2()
+                                .border_color(RED)
+                                .rounded(px(4.))
+                                .text_size(px(13.))
+                                .text_color(RED)
+                                .child(problem),
+                        )
+                    })
                     .when_some(last_result, |this, result| this.child(result))
                     .child(div().flex_1())
-                    .child(recent_list)
-                    .child(footer),
+                    .child(recent_list),
             )
             .into_any_element()
     }
@@ -1870,6 +1946,7 @@ impl MainView {
                     .mt(px(4.))
                     .text_size(px(11.))
                     .text_color(MUTED)
+                    .font_family(FONT_MONO)
                     .child(readout),
             )
     }
@@ -2147,6 +2224,52 @@ impl MainView {
             .into_any_element()
     }
 
+    fn render_status_rows(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = &self.backend.managed_settings;
+        let host = settings_host(&self.connection, &settings.endpoint);
+        let checking = self.connection_pending;
+        let daemon = match &self.status {
+            Some(status) => (
+                Some(true),
+                format!("Running · up {}", format_uptime(status.uptime_seconds)),
+            ),
+            None => (Some(false), "Not running".to_string()),
+        };
+        let provider = match &self.connection {
+            Some(report) => match &report.provider {
+                Ok(detail) => (Some(true), format!("Reachable · {detail}")),
+                Err(error) => (Some(false), format!("Unreachable · {error}")),
+            },
+            None if checking => (None, "Checking...".to_string()),
+            None => (None, "Not checked".to_string()),
+        };
+        let checked = self
+            .connection
+            .as_ref()
+            .map(|report| format!("Checked {}", format_time(report.checked_at)))
+            .unwrap_or_default();
+        div()
+            .flex()
+            .flex_col()
+            .child(status_row("Daemon", daemon.1, daemon.0))
+            .child(status_row(&host, provider.1, provider.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .py(px(12.))
+                    .child(action_button(
+                        "Check connection",
+                        cx.listener(|this, _, _, cx| {
+                            this.check_connection();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(div().text_size(px(12.)).text_color(MUTED).child(checked)),
+            )
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let settings = &self.backend.managed_settings;
         let mut microphones = div().flex().flex_col();
@@ -2223,6 +2346,8 @@ impl MainView {
                     .child("Dictator uses the first connected input in this list. Disconnected inputs keep their place. Changes apply to the next recording."),
             )
             .child(microphones)
+            .child(section_title("STATUS"))
+            .child(self.render_status_rows(cx))
             .child(section_title("DAEMON CONFIGURATION"))
             .child(
                 div()
@@ -2272,7 +2397,7 @@ impl Render for MainView {
             .flex_col()
             .bg(BG)
             .text_color(TEXT)
-            .font_family(FONT_MONO)
+            .font_family(FONT_UI)
             .text_size(px(13.))
             .child(self.render_titlebar(cx))
             .when_some(recovery, |this, recovery| this.child(recovery))
@@ -2429,7 +2554,7 @@ impl Render for TrayView {
             .flex_col()
             .bg(BG)
             .text_color(TEXT)
-            .font_family(FONT_MONO)
+            .font_family(FONT_UI)
             .text_size(px(12.))
             .child(
                 div()
@@ -2558,6 +2683,7 @@ impl Render for TrayView {
                                 div()
                                     .w(px(42.))
                                     .text_color(MUTED)
+                                    .font_family(FONT_MONO)
                                     .child(format_time(recording.timestamp)),
                             )
                             .child(
@@ -2575,6 +2701,7 @@ impl Render for TrayView {
                                 div()
                                     .flex_none()
                                     .text_color(MUTED)
+                                    .font_family(FONT_MONO)
                                     .child(format_duration(recording.duration_ms)),
                             )
                     })),
@@ -2621,17 +2748,28 @@ fn card() -> gpui::Div {
         .rounded(px(6.))
 }
 
-fn status_pill(value: String, ok: Option<bool>) -> impl IntoElement {
+fn status_row(label: &str, value: String, ok: Option<bool>) -> impl IntoElement {
     div()
         .flex()
         .items_center()
-        .gap(px(7.))
-        .child(div().size(px(7.)).flex_none().rounded_full().bg(match ok {
+        .gap(px(16.))
+        .py(px(12.))
+        .border_b_1()
+        .border_color(LINE)
+        .child(div().w(px(200.)).flex_none().child(label.to_string()))
+        .child(div().size(px(8.)).flex_none().rounded_full().bg(match ok {
             Some(true) => GREEN,
             Some(false) => RED,
             None => LINE_STRONG,
         }))
-        .child(div().truncate().child(value))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(SUBTEXT)
+                .child(value),
+        )
 }
 
 fn settings_host(connection: &Option<ConnectionReport>, endpoint: &str) -> String {
@@ -2770,7 +2908,13 @@ fn copyable_meta_row(
                 .flex_col()
                 .gap(px(2.))
                 .child(div().text_size(px(10.)).text_color(MUTED).child(label))
-                .child(div().text_color(SUBTEXT).truncate().child(shown)),
+                .child(
+                    div()
+                        .font_family(FONT_MONO)
+                        .text_color(SUBTEXT)
+                        .truncate()
+                        .child(shown),
+                ),
         )
         .child(
             div()
@@ -2940,7 +3084,7 @@ fn push_level(history: &mut VecDeque<(f32, f32)>, recording: bool, sample: (f32,
 
 fn status_interval(recording: bool) -> Duration {
     if recording {
-        Duration::from_millis(150)
+        Duration::from_millis(250)
     } else {
         Duration::from_secs(1)
     }
@@ -2955,26 +3099,41 @@ fn render_waveform(active: bool, history: &VecDeque<(f32, f32)>) -> impl IntoEle
         .items_center()
         .gap(px(3.));
     let missing = LEVEL_HISTORY.saturating_sub(history.len());
-    let levels = std::iter::repeat_n((0.0_f32, 0.0_f32), missing).chain(history.iter().copied());
-    for (index, (rms, peak)) in levels.enumerate() {
-        let level = (rms * 1.6).max(peak * 0.9).clamp(0.0, 1.0);
-        let height = if active {
+    let levels: Vec<f32> = std::iter::repeat_n(0.0_f32, missing)
+        .chain(
+            history
+                .iter()
+                .map(|(rms, peak)| (rms * 1.8).max(peak * 0.9)),
+        )
+        .collect();
+    for index in 0..LEVEL_HISTORY {
+        let level = smoothed(&levels, index);
+        let live = active && index >= missing;
+        let height = if live {
             4. + level.sqrt() * (HEIGHT - 4.)
         } else {
             3.
         };
-        let newest = index + 1 == LEVEL_HISTORY;
-        bars = bars.child(div().flex_1().h(px(height)).rounded_full().bg(
-            if !active || index < missing {
-                alpha(MUTED, 0.3)
-            } else if newest {
-                TEXT
-            } else {
-                heat(level)
-            },
-        ));
+        bars = bars.child(div().flex_1().h(px(height)).rounded_full().bg(if live {
+            BLUE
+        } else {
+            alpha(MUTED, 0.3)
+        }));
     }
     bars
+}
+
+/// Three-tap average so neighbouring bars move together instead of jittering.
+fn smoothed(levels: &[f32], index: usize) -> f32 {
+    let get = |i: isize| -> f32 {
+        if i < 0 || i as usize >= levels.len() {
+            0.0
+        } else {
+            levels[i as usize]
+        }
+    };
+    let i = index as isize;
+    ((get(i - 1) + 2.0 * get(i) + get(i + 1)) / 4.0).clamp(0.0, 1.0)
 }
 
 fn render_meter(active: bool, rms: f32, peak: f32) -> impl IntoElement {
@@ -3263,9 +3422,9 @@ fn table_row(a: &str, b: &str, c: &str, d: &str, heading: bool) -> impl IntoElem
         .text_size(px(12.))
         .text_color(if heading { MUTED } else { SUBTEXT })
         .child(div().w_2_5().truncate().child(a.to_string()))
-        .child(div().w_1_5().child(b.to_string()))
-        .child(div().w_1_5().child(c.to_string()))
-        .child(div().w_1_5().child(d.to_string()))
+        .child(div().w_1_5().font_family(FONT_MONO).child(b.to_string()))
+        .child(div().w_1_5().font_family(FONT_MONO).child(c.to_string()))
+        .child(div().w_1_5().font_family(FONT_MONO).child(d.to_string()))
 }
 
 fn stat_tile(value: String, label: &'static str, note: String) -> impl IntoElement {
@@ -3719,6 +3878,26 @@ mod state_tests {
             word_diff("x  y", "x y"),
             vec![Same("x".into()), Removed("␣␣".into()), Same("y".into())]
         );
+    }
+
+    #[test]
+    fn closing_the_last_window_keeps_the_tray_unless_quit_was_chosen() {
+        let with_tray = GuiOptions::default();
+        let without_tray = GuiOptions {
+            tray: false,
+            ..GuiOptions::default()
+        };
+        assert!(should_relaunch_as_tray(with_tray, false));
+        assert!(!should_relaunch_as_tray(with_tray, true));
+        assert!(!should_relaunch_as_tray(without_tray, false));
+    }
+
+    #[test]
+    fn smoothing_averages_neighbours_and_clamps() {
+        let levels = [0.0, 1.0, 0.0, 2.0];
+        assert!((smoothed(&levels, 1) - 0.5).abs() < f32::EPSILON);
+        assert!((smoothed(&levels, 0) - 0.25).abs() < f32::EPSILON);
+        assert_eq!(smoothed(&levels, 3), 1.0);
     }
 
     #[test]

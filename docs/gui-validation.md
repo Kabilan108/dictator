@@ -61,9 +61,16 @@ Desktop test audio, history, preferences, and provider configuration were isolat
 from the user's data. Clipboard/paste commands from the test daemon were
 intercepted. The installed Home Manager daemon was not replaced or activated.
 
-GPUI 0.2.2 creates a normal Wayland toplevel for its popup window kind. On niri,
-Dictator uses the compositor's IPC to float, size, and position its own popup.
-Other compositors may need a window rule for `Dictator quick controls`.
+GPUI 0.2.2 creates a normal Wayland toplevel for its popup window kind and does
+not request an initial size for any window. On niri, Dictator uses the
+compositor's IPC to float, size, and position its own popup, and to size the
+main window to 924×740 after it opens. Other compositors may need window rules
+for `Dictator` and `Dictator quick controls`.
+
+GPUI's Linux backend stops its event loop when the last window closes. With the
+tray enabled, closing the main window therefore replaces the process with a
+tray-only instance (`dictator-gui --tray`); the tray item re-registers and can
+reopen the window. Only the tray's Quit item ends the process.
 
 Review follow-up checks covered unavailable desktop notifications, stalled Pulse
 and Niri subprocesses, deferred editor/search events, legacy failure discovery,

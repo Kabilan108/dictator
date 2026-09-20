@@ -109,7 +109,7 @@ impl Typer {
         }
         let mut app_id = None;
         if self.backend == Backend::Wayland && !self.config.niri_app_shortcuts.is_empty() {
-            for socket in niri_socket_candidates() {
+            for socket in crate::utils::niri_socket_candidates() {
                 match focused_app_id(&socket, cancel).await {
                     Ok(app) => {
                         app_id = app;
@@ -157,45 +157,6 @@ impl Typer {
             .copied()
             .unwrap_or(self.config.shortcut)
     }
-}
-
-/// Prefers `$NIRI_SOCKET`. The daemon usually runs as a systemd user service
-/// without that variable, so fall back to niri's socket naming scheme
-/// `$XDG_RUNTIME_DIR/niri.<WAYLAND_DISPLAY>.<pid>.sock`. Stale sockets from an
-/// earlier compositor instance are tolerated because callers try each in turn.
-fn niri_socket_candidates() -> Vec<std::path::PathBuf> {
-    if let Some(socket) = std::env::var_os("NIRI_SOCKET") {
-        return vec![std::path::PathBuf::from(socket)];
-    }
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
-    let display = std::env::var("WAYLAND_DISPLAY").ok();
-    discover_niri_sockets(runtime_dir.as_deref(), display.as_deref())
-}
-
-fn discover_niri_sockets(
-    runtime_dir: Option<&std::path::Path>,
-    display: Option<&str>,
-) -> Vec<std::path::PathBuf> {
-    let (Some(runtime_dir), Some(display)) = (runtime_dir, display.filter(|d| !d.is_empty()))
-    else {
-        return Vec::new();
-    };
-    let prefix = format!("niri.{display}.");
-    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
-        return Vec::new();
-    };
-    let mut sockets: Vec<_> = entries
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".sock"))
-        })
-        .collect();
-    sockets.sort();
-    sockets.reverse();
-    sockets
 }
 
 /// One read-only Niri IPC request. Never subscribe or retain a connection. Bound
@@ -361,30 +322,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
-
-    #[test]
-    fn niri_socket_discovery_matches_the_current_display_only() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in [
-            "niri.wayland-1.3652.sock",
-            "niri.wayland-1.100.sock",
-            "niri.wayland-2.777.sock",
-            "niri.wayland-1.3652.lock",
-        ] {
-            std::fs::write(dir.path().join(name), b"").unwrap();
-        }
-        let found = discover_niri_sockets(Some(dir.path()), Some("wayland-1"));
-        assert_eq!(
-            found,
-            vec![
-                dir.path().join("niri.wayland-1.3652.sock"),
-                dir.path().join("niri.wayland-1.100.sock"),
-            ]
-        );
-        assert!(discover_niri_sockets(Some(dir.path()), Some("")).is_empty());
-        assert!(discover_niri_sockets(None, Some("wayland-1")).is_empty());
-        assert!(discover_niri_sockets(Some(dir.path()), None).is_empty());
-    }
 
     #[test]
     fn app_override_preserves_default_for_other_windows() {

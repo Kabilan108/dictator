@@ -105,8 +105,6 @@ pub struct ManagedSettings {
     pub max_duration_minutes: i64,
     pub paste_shortcut: String,
     pub notifications: String,
-    pub shortcut_toggle: String,
-    pub shortcut_cancel: String,
 }
 
 #[derive(Clone, Debug)]
@@ -764,8 +762,6 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
-            shortcut_toggle: "Super+Shift+D".to_string(),
-            shortcut_cancel: "Super+Shift+Escape".to_string(),
         };
     }
     let config_path = crate::utils::CONFIG_DIR.join("config.json");
@@ -787,8 +783,6 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
-            shortcut_toggle: String::new(),
-            shortcut_cancel: String::new(),
         })
 }
 
@@ -806,8 +800,6 @@ fn parse_managed_settings(
         audio: ReadOnlyAudio,
         #[serde(default)]
         typing: ReadOnlyTyping,
-        #[serde(default)]
-        shortcuts: crate::utils::ShortcutHints,
     }
     #[derive(Default, serde::Deserialize)]
     struct ReadOnlyApi {
@@ -874,8 +866,6 @@ fn parse_managed_settings(
         } else {
             config.notifications
         },
-        shortcut_toggle: config.shortcuts.toggle,
-        shortcut_cancel: config.shortcuts.cancel,
     })
 }
 
@@ -1350,8 +1340,7 @@ mod tests {
                 }
             },
             "audio": { "max_duration_min": 9 },
-            "typing": { "shortcut": "ctrl_v" },
-            "shortcuts": { "toggle": "Super+D" }
+            "typing": { "shortcut": "ctrl_v" }
         }"#;
 
         let settings = parse_managed_settings(&json[..], true).expect("valid projection");
@@ -1364,8 +1353,6 @@ mod tests {
         assert_eq!(settings.max_duration_minutes, 9);
         assert_eq!(settings.paste_shortcut, "ctrl_v");
         assert_eq!(settings.notifications, "all");
-        assert_eq!(settings.shortcut_toggle, "Super+D");
-        assert_eq!(settings.shortcut_cancel, "");
         assert!(!format!("{settings:?}").contains("must-not-enter-gui-state"));
     }
 

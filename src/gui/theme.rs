@@ -32,4 +32,5 @@ pub const TEAL: Rgba = rgb(0x94e2d5);
 pub const MAUVE: Rgba = rgb(0xcba6f7);
 
 pub const FONT_MONO: &str = "IBM Plex Mono";
+pub const FONT_UI: &str = "Geist";
 pub const FONT_DISPLAY: &str = "Geist";

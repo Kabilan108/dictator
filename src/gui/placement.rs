@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::env;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use crate::utils::bounded_output;
+use crate::utils::{bounded_output, live_niri_socket};
 
 const POPUP_TITLE: &str = "Dictator quick controls";
+const MAIN_TITLE: &str = "Dictator";
 const POPUP_WIDTH: i32 = 340;
 const POPUP_HEIGHT: i32 = 510;
 const EDGE_GAP: i32 = 16;
@@ -26,9 +27,9 @@ static PLACEMENT_RUNNING: AtomicBool = AtomicBool::new(false);
 /// performs the compositor-specific correction on a bounded background thread.
 /// Other compositors keep GPUI's default behavior.
 pub fn place_popup(anchor: Option<(i32, i32)>) {
-    if env::var_os("NIRI_SOCKET").is_none() {
+    let Some(socket) = live_niri_socket() else {
         return;
-    }
+    };
     if PLACEMENT_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -40,12 +41,44 @@ pub fn place_popup(anchor: Option<(i32, i32)>) {
         .name("dictator-popup-placement".to_string())
         .spawn(move || {
             let _running = PlacementGuard;
-            place_popup_with_niri(anchor);
+            place_popup_with_niri(&socket, anchor);
         })
         .is_err()
     {
         PLACEMENT_RUNNING.store(false, Ordering::Release);
     }
+}
+
+/// Sizes the main window through Niri after GPUI has created it.
+///
+/// GPUI does not request an initial size on Wayland, and Niri hands a new
+/// floating toplevel its tiled column size even when a window rule sets a
+/// fixed size. Correct it once from a bounded background thread.
+pub fn size_main_window(width: i32, height: i32) {
+    let Some(socket) = live_niri_socket() else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("dictator-main-placement".to_string())
+        .spawn(move || {
+            let deadline = Instant::now() + DISCOVERY_TIMEOUT;
+            let Some(window_id) = find_window(&socket, MAIN_TITLE, deadline) else {
+                return;
+            };
+            let id = window_id.to_string();
+            if !niri_action(
+                &socket,
+                &["set-window-width", "--id", &id, &width.to_string()],
+                deadline,
+            ) {
+                return;
+            }
+            let _ = niri_action(
+                &socket,
+                &["set-window-height", "--id", &id, &height.to_string()],
+                deadline,
+            );
+        });
 }
 
 struct PlacementGuard;
@@ -56,23 +89,25 @@ impl Drop for PlacementGuard {
     }
 }
 
-fn place_popup_with_niri(anchor: Option<(i32, i32)>) {
+fn place_popup_with_niri(socket: &Path, anchor: Option<(i32, i32)>) {
     let deadline = Instant::now() + DISCOVERY_TIMEOUT;
-    let Some(window_id) = find_popup_window(deadline) else {
+    let Some(window_id) = find_window(socket, POPUP_TITLE, deadline) else {
         return;
     };
-    let Some(output) = output_for_anchor(anchor, deadline) else {
+    let Some(output) = output_for_anchor(socket, anchor, deadline) else {
         return;
     };
     let (x, y) = popup_position(output, anchor);
 
     if !niri_action(
+        socket,
         &["move-window-to-floating", "--id", &window_id.to_string()],
         deadline,
     ) {
         return;
     }
     if !niri_action(
+        socket,
         &[
             "set-window-width",
             "--id",
@@ -84,6 +119,7 @@ fn place_popup_with_niri(anchor: Option<(i32, i32)>) {
         return;
     }
     if !niri_action(
+        socket,
         &[
             "set-window-height",
             "--id",
@@ -95,6 +131,7 @@ fn place_popup_with_niri(anchor: Option<(i32, i32)>) {
         return;
     }
     let _ = niri_action(
+        socket,
         &[
             "move-floating-window",
             "--id",
@@ -108,11 +145,11 @@ fn place_popup_with_niri(anchor: Option<(i32, i32)>) {
     );
 }
 
-fn find_popup_window(deadline: Instant) -> Option<u64> {
+fn find_window(socket: &Path, title: &str, deadline: Instant) -> Option<u64> {
     let pid = std::process::id();
     loop {
-        if let Some(windows) = niri_json::<Vec<NiriWindow>>(&["windows"], deadline)
-            && let Some(id) = popup_window_id(windows, pid)
+        if let Some(windows) = niri_json::<Vec<NiriWindow>>(socket, &["windows"], deadline)
+            && let Some(id) = window_id_for(windows, pid, title)
         {
             return Some(id);
         }
@@ -123,19 +160,24 @@ fn find_popup_window(deadline: Instant) -> Option<u64> {
     }
 }
 
-fn popup_window_id(windows: Vec<NiriWindow>, pid: u32) -> Option<u64> {
+fn window_id_for(windows: Vec<NiriWindow>, pid: u32, title: &str) -> Option<u64> {
     // Window IDs increase over a Niri session. Choosing the largest ID avoids
-    // moving a stale duplicate during a rapid popup recreation.
+    // moving a stale duplicate during a rapid window recreation.
     windows
         .into_iter()
-        .filter(|window| window.pid == Some(pid) && window.title.as_deref() == Some(POPUP_TITLE))
+        .filter(|window| window.pid == Some(pid) && window.title.as_deref() == Some(title))
         .map(|window| window.id)
         .max()
 }
 
-fn output_for_anchor(anchor: Option<(i32, i32)>, deadline: Instant) -> Option<LogicalRect> {
+fn output_for_anchor(
+    socket: &Path,
+    anchor: Option<(i32, i32)>,
+    deadline: Instant,
+) -> Option<LogicalRect> {
     if let Some(anchor) = anchor
-        && let Some(outputs) = niri_json::<HashMap<String, NiriOutput>>(&["outputs"], deadline)
+        && let Some(outputs) =
+            niri_json::<HashMap<String, NiriOutput>>(socket, &["outputs"], deadline)
         && let Some(output) = outputs
             .into_values()
             .filter_map(|output| output.logical)
@@ -144,7 +186,7 @@ fn output_for_anchor(anchor: Option<(i32, i32)>, deadline: Instant) -> Option<Lo
         return Some(output);
     }
 
-    niri_json::<NiriOutput>(&["focused-output"], deadline).and_then(|output| output.logical)
+    niri_json::<NiriOutput>(socket, &["focused-output"], deadline).and_then(|output| output.logical)
 }
 
 fn popup_position(output: LogicalRect, anchor: Option<(i32, i32)>) -> (i32, i32) {
@@ -193,9 +235,17 @@ fn clamp_to_output(value: i32, min: i32, max: i32) -> i32 {
     }
 }
 
-fn niri_json<T: for<'de> Deserialize<'de>>(request: &[&str], deadline: Instant) -> Option<T> {
+fn niri_json<T: for<'de> Deserialize<'de>>(
+    socket: &Path,
+    request: &[&str],
+    deadline: Instant,
+) -> Option<T> {
     niri_json_with_command(
-        Command::new("niri").arg("msg").arg("--json").args(request),
+        Command::new("niri")
+            .env("NIRI_SOCKET", socket)
+            .arg("msg")
+            .arg("--json")
+            .args(request),
         deadline,
     )
 }
@@ -215,7 +265,7 @@ fn niri_json_with_command<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&output.stdout).ok()
 }
 
-fn niri_action(action: &[&str], deadline: Instant) -> bool {
+fn niri_action(socket: &Path, action: &[&str], deadline: Instant) -> bool {
     let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
         return false;
     };
@@ -223,7 +273,11 @@ fn niri_action(action: &[&str], deadline: Instant) -> bool {
         return false;
     }
     bounded_output(
-        Command::new("niri").arg("msg").arg("action").args(action),
+        Command::new("niri")
+            .env("NIRI_SOCKET", socket)
+            .arg("msg")
+            .arg("action")
+            .args(action),
         remaining,
         4096,
     )
@@ -302,7 +356,7 @@ mod tests {
         .unwrap();
         assert_eq!(windows[0].title, None);
         assert_eq!(windows[1].title.as_deref(), Some(POPUP_TITLE));
-        assert_eq!(popup_window_id(windows, 12), Some(2));
+        assert_eq!(window_id_for(windows, 12, POPUP_TITLE), Some(2));
     }
 
     #[test]
