@@ -35,6 +35,7 @@ let
     "DBUS_SESSION_BUS_ADDRESS"
     "WAYLAND_DISPLAY"
     "XDG_RUNTIME_DIR"
+    "NIRI_SOCKET"
   ];
   configSource =
     if cfg.configFile != null then

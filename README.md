@@ -427,7 +427,7 @@ Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be 
 
 The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails. The supplied systemd user service loads variables from `~/.config/dictator/environment` when that file exists.
 
-The `typing.shortcut` field selects the default simulated paste shortcut. It accepts `"ctrl_v"` or `"ctrl_shift_v"` and defaults to `"ctrl_shift_v"`. Under Niri, `typing.niri_app_shortcuts` can override that shortcut for the focused application's Niri `app_id`; the example uses Ctrl+V for T3 Code. Applications without an override use `typing.shortcut`, and X11 always uses `typing.shortcut`.
+The `typing.shortcut` field selects the default simulated paste shortcut. It accepts `"ctrl_v"` or `"ctrl_shift_v"` and defaults to `"ctrl_shift_v"`. Under Niri, `typing.niri_app_shortcuts` can override that shortcut for the focused application's Niri `app_id`; the example uses Ctrl+V for T3 Code, where Ctrl+Shift+V pastes twice. Applications without an override use `typing.shortcut`, and X11 always uses `typing.shortcut`. The daemon finds the compositor through `NIRI_SOCKET` when set, otherwise through `$XDG_RUNTIME_DIR/niri.<WAYLAND_DISPLAY>.*.sock`, so the override also works from a systemd service that does not import `NIRI_SOCKET`.
 
 The `notifications` field controls desktop notifications:
 
