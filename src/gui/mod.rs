@@ -20,12 +20,16 @@ use gpui_component::{Icon, IconName, Root, Theme, ThemeMode};
 use crate::ipc::DaemonState;
 use crate::tray::{TrayAction, TrayHandle};
 
-use backend::{Backend, Detail, Filter, Microphone, Page, Reply, Request, Stats, Status};
+use backend::{
+    Backend, ConnectionReport, Detail, Filter, Microphone, Page, Recording, Reply, Request, Stats,
+    Status,
+};
 use placement::place_popup;
 use playback::{AudioPlayer, waveform};
 use theme::*;
 
 const APP_ID: &str = "org.dictator.Dictator";
+const RECENT_LIMIT: usize = 6;
 
 struct GuiAssets;
 
@@ -289,6 +293,7 @@ impl HostView {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Tab {
     #[default]
+    Dictation,
     History,
     Stats,
     Settings,
@@ -302,6 +307,11 @@ struct MainView {
     page: Option<Page>,
     detail: Option<Detail>,
     stats: Option<Stats>,
+    recent: Vec<Recording>,
+    connection: Option<ConnectionReport>,
+    connection_pending: bool,
+    confirm_delete: Option<i64>,
+    delete_pending: Option<i64>,
     microphones: Vec<Microphone>,
     status: Option<Status>,
     last_seen_recording_generation: Option<u64>,
@@ -313,7 +323,6 @@ struct MainView {
     search_value: String,
     editor: Entity<InputState>,
     editor_recording: Option<i64>,
-    inspected_revision: Option<i64>,
     selection_generation: u64,
     history_requests: VecDeque<u64>,
     detail_requests: VecDeque<(u64, i64)>,
@@ -330,13 +339,11 @@ struct MainView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PendingMutation {
     Save { id: i64, text: String },
-    Restore { id: i64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CompletedMutation {
     Save(String),
-    Restore,
     Unexpected,
 }
 
@@ -344,7 +351,7 @@ impl MainView {
     fn new(demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let backend = Backend::new(demo);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("search recordings"));
-        let editor = cx.new(|cx| InputState::new(window, cx).multi_line(true));
+        let editor = cx.new(|cx| InputState::new(window, cx).auto_grow(3, 16));
         let search_subscription =
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
                 let value = input.read(cx).value().to_string();
@@ -397,12 +404,17 @@ impl MainView {
             .detach();
         let mut this = Self {
             backend,
-            tab: Tab::History,
+            tab: Tab::Dictation,
             filter: Filter::All,
             page_index: 0,
             page: None,
             detail: None,
             stats: None,
+            recent: Vec::new(),
+            connection: None,
+            connection_pending: false,
+            confirm_delete: None,
+            delete_pending: None,
             microphones: Vec::new(),
             status: None,
             last_seen_recording_generation: None,
@@ -414,7 +426,6 @@ impl MainView {
             search_value: String::new(),
             editor,
             editor_recording: None,
-            inspected_revision: None,
             selection_generation: 0,
             history_requests: VecDeque::new(),
             detail_requests: VecDeque::new(),
@@ -428,7 +439,52 @@ impl MainView {
             _subscriptions: vec![search_subscription, editor_subscription],
         };
         this.request_history(String::new());
+        this.backend.send(Request::Recent {
+            limit: RECENT_LIMIT,
+        });
         this
+    }
+
+    fn request_recent(&mut self) {
+        self.backend.send(Request::Recent {
+            limit: RECENT_LIMIT,
+        });
+    }
+
+    fn check_connection(&mut self) {
+        if !self.connection_pending {
+            self.connection_pending = true;
+            self.backend.send(Request::CheckConnection);
+        }
+    }
+
+    fn reveal_recording(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = Tab::History;
+        self.notice.clear();
+        self.bump_selection();
+        self.reveal_id = Some(id);
+        self.pin_detail_id = Some(id);
+        self.filter = Filter::All;
+        self.page_index = 0;
+        self.search_value.clear();
+        self.setting_editor = true;
+        self.search.update(cx, |search, cx| {
+            search.set_value("", window, cx);
+        });
+        self.setting_editor = false;
+        self.request_history(String::new());
+        self.request_detail(id);
+    }
+
+    fn request_delete(&mut self, id: i64) {
+        if self.delete_pending.is_some() {
+            self.notice = "A deletion is already in progress".to_string();
+            return;
+        }
+        self.confirm_delete = None;
+        self.delete_pending = Some(id);
+        self.backend.send(Request::Delete(id));
+        self.notice = "Deleting...".to_string();
     }
 
     fn request_history(&mut self, search: String) {
@@ -491,7 +547,6 @@ impl MainView {
             self.reveal_id = None;
         }
         self.detail = Some(detail);
-        self.inspected_revision = None;
         if self.editor_recording != Some(id) || self.editor.read(cx).value().as_ref() != text {
             self.setting_editor = true;
             self.editor.update(cx, |editor, cx| {
@@ -579,21 +634,6 @@ impl MainView {
                                 let search = self.search.read(cx).value().to_string();
                                 self.request_history(search);
                             }
-                            CompletedMutation::Restore => {
-                                let id = detail.recording.id;
-                                let preserved_draft =
-                                    normalize_draft(&mut self.drafts, id, &detail.recording.text);
-                                if self.editor_recording == Some(id) {
-                                    self.apply_detail(detail, None, window, cx);
-                                }
-                                self.notice = if preserved_draft {
-                                    "Revision restored; unsaved draft preserved".to_string()
-                                } else {
-                                    "Revision restored".to_string()
-                                };
-                                let search = self.search.read(cx).value().to_string();
-                                self.request_history(search);
-                            }
                             CompletedMutation::Unexpected => {
                                 self.notice = "Received the wrong saved recording".to_string();
                             }
@@ -624,20 +664,12 @@ impl MainView {
                                 status.last_recording_generation,
                             );
                             if generation_changed && let Some(id) = status.last_recording_id {
-                                self.notice.clear();
-                                self.bump_selection();
-                                self.reveal_id = Some(id);
-                                self.pin_detail_id = Some(id);
-                                self.filter = Filter::All;
-                                self.page_index = 0;
-                                self.search_value.clear();
-                                self.setting_editor = true;
-                                self.search.update(cx, |search, cx| {
-                                    search.set_value("", window, cx);
-                                });
-                                self.setting_editor = false;
-                                self.request_history(String::new());
-                                self.request_detail(id);
+                                self.request_recent();
+                                let stay = self.tab;
+                                self.reveal_recording(id, window, cx);
+                                if stay == Tab::Dictation {
+                                    self.tab = Tab::Dictation;
+                                }
                             }
                             self.status = Some(status);
                         }
@@ -655,6 +687,42 @@ impl MainView {
                         self.last_status_request = Instant::now();
                     }
                 }
+                Reply::Deleted(result) => {
+                    let pending = self.delete_pending.take();
+                    match result {
+                        Ok(id) => {
+                            if pending != Some(id) {
+                                self.notice = "Received the wrong deleted recording".to_string();
+                                continue;
+                            }
+                            self.drafts.remove(&id);
+                            if self.detail.as_ref().is_some_and(|d| d.recording.id == id) {
+                                self.player.stop();
+                                self.detail = None;
+                                self.editor_recording = None;
+                            }
+                            self.recent.retain(|recording| recording.id != id);
+                            self.notice = "Recording deleted".to_string();
+                            let search = self.search.read(cx).value().to_string();
+                            self.request_history(search);
+                        }
+                        Err(error) => self.notice = format!("Delete failed: {error}"),
+                    }
+                }
+                Reply::Connection(result) => {
+                    self.connection_pending = false;
+                    match result {
+                        Ok(report) => self.connection = Some(report),
+                        Err(error) => self.notice = error,
+                    }
+                }
+                Reply::Recent(result) => match result {
+                    Ok(recent) => {
+                        self.recent = recent;
+                        clear_database_notice(&mut self.notice);
+                    }
+                    Err(error) => self.notice = error,
+                },
             }
         }
         if !self.status_pending && self.last_status_request.elapsed() >= Duration::from_secs(1) {
@@ -667,7 +735,14 @@ impl MainView {
 
     fn set_tab(&mut self, tab: Tab) {
         self.tab = tab;
+        self.confirm_delete = None;
         match tab {
+            Tab::Dictation => {
+                self.request_recent();
+                if self.connection.is_none() {
+                    self.check_connection();
+                }
+            }
             Tab::History => {}
             Tab::Stats => self.backend.send(Request::Stats),
             Tab::Settings => self.backend.send(Request::Microphones),
@@ -693,6 +768,7 @@ impl MainView {
                     .child("Dictator"),
             );
         for (tab, label) in [
+            (Tab::Dictation, "Dictation"),
             (Tab::History, "History"),
             (Tab::Stats, "Stats"),
             (Tab::Settings, "Settings"),
@@ -732,7 +808,7 @@ impl MainView {
                         .flex()
                         .items_center()
                         .gap(px(6.))
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(color)
                         .child(div().size(px(6.)).rounded_full().bg(color))
                         .child(status.state.as_str()),
@@ -780,17 +856,33 @@ impl MainView {
                     }),
             );
         } else {
+            let mut last_date = None;
             for recording in &page.recordings {
                 let id = recording.id;
                 let selected = self
                     .detail
                     .as_ref()
                     .is_some_and(|detail| detail.recording.id == id);
+                let date = recording.timestamp.with_timezone(&Local).date_naive();
+                if last_date != Some(date) {
+                    last_date = Some(date);
+                    list = list.child(
+                        div()
+                            .px(px(14.))
+                            .pt(px(14.))
+                            .pb(px(4.))
+                            .font_family(FONT_DISPLAY)
+                            .text_size(px(16.))
+                            .text_color(TEXT)
+                            .child(format_date(recording.timestamp)),
+                    );
+                }
                 let text = if recording.failed {
                     recording.error.clone()
                 } else {
                     recording.text.clone()
                 };
+                let empty = text.trim().is_empty();
                 list = list.child(
                     div()
                         .id(("recording", id as u64))
@@ -810,7 +902,7 @@ impl MainView {
                             div()
                                 .flex()
                                 .justify_between()
-                                .text_size(px(10.))
+                                .text_size(px(11.))
                                 .text_color(MUTED)
                                 .child(format!(
                                     "{}  ·  {}{}",
@@ -827,11 +919,21 @@ impl MainView {
                         .child(
                             div()
                                 .mt(px(5.))
-                                .text_size(px(12.))
-                                .text_color(if recording.failed { RED } else { SUBTEXT })
-                                .max_h(px(36.))
-                                .overflow_hidden()
-                                .child(text),
+                                .text_size(px(13.))
+                                .line_clamp(2)
+                                .text_color(if recording.failed {
+                                    RED
+                                } else if empty {
+                                    MUTED
+                                } else {
+                                    SUBTEXT
+                                })
+                                .when(empty, |this| this.italic())
+                                .child(if empty {
+                                    "No speech was transcribed".to_string()
+                                } else {
+                                    text
+                                }),
                         ),
                 );
             }
@@ -858,7 +960,7 @@ impl MainView {
                             .p(px(10.))
                             .border_t_1()
                             .border_color(LINE)
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(MUTED)
                             .child(self.page_button(
                                 "Previous",
@@ -881,7 +983,7 @@ impl MainView {
             .p(px(10.))
             .border_b_1()
             .border_color(LINE)
-            .text_size(px(10.))
+            .text_size(px(11.))
             .text_color(MUTED)
             .child(format!("{total} recordings"))
             .child(div().flex_1());
@@ -967,7 +1069,7 @@ impl MainView {
                     div()
                         .p(px(8.))
                         .bg(MANTLE)
-                        .text_size(px(10.))
+                        .text_size(px(11.))
                         .child(format!(
                             "Attempt {} · {} · {} · {}",
                             attempt.number,
@@ -1014,7 +1116,7 @@ impl MainView {
                         .when(!retained_audio, |this| {
                             this.child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(11.))
                                     .text_color(MUTED)
                                     .child("Retry unavailable"),
                             )
@@ -1028,7 +1130,7 @@ impl MainView {
                             .bg(SURFACE)
                             .border_l_2()
                             .border_color(LINE_STRONG)
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(SUBTEXT)
                             .child(notice),
                     )
@@ -1056,7 +1158,8 @@ impl MainView {
                         .flex()
                         .items_center()
                         .gap(px(10.))
-                        .text_size(px(10.))
+                        .text_size(px(11.))
+                        .children(self.render_delete_controls(id, cx))
                         .child(div().flex_1())
                         .child(action_button(
                             "Copy JSON",
@@ -1077,19 +1180,15 @@ impl MainView {
         let saved_text = recording.text.clone();
         let audio_path = recording.audio_path.clone();
         let metadata_json = detail_json(&detail);
-        let baseline_revision = self
-            .inspected_revision
-            .and_then(|number| {
-                detail
-                    .revisions
-                    .iter()
-                    .find(|revision| revision.number == number)
-            })
-            .or_else(|| detail.revisions.first());
-        let original = baseline_revision
+        let original = detail
+            .revisions
+            .first()
             .map(|revision| revision.text.as_str())
             .unwrap_or(recording.text.as_str());
         let current_text = self.editor.read(cx).value();
+        let changed = original
+            .split_whitespace()
+            .ne(current_text.split_whitespace());
         div()
             .flex_1()
             .min_w_0()
@@ -1110,16 +1209,16 @@ impl MainView {
                     .child(
                         div()
                             .ml(px(10.))
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(MUTED)
                             .child(format!("#{}", recording.id)),
                     )
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(MUTED)
-                            .child(format!("{} attempts", recording.attempts)),
+                            .child(plural(recording.attempts, "attempt")),
                     ),
             )
             .child(self.render_player(audio_path, recording.duration_ms, cx))
@@ -1140,28 +1239,28 @@ impl MainView {
                             .gap(px(12.))
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(11.))
                                     .text_color(MUTED)
                                     .child("TRANSCRIPT"),
                             )
                             .child(
                                 div()
-                                    .h(px(176.))
                                     .text_size(px(17.))
                                     .line_height(gpui::relative(1.5))
-                                    .child(Input::new(&self.editor).h_full().appearance(false)),
+                                    .child(Input::new(&self.editor).appearance(false)),
                             )
-                            .when_some(baseline_revision, |this, revision| {
-                                this.child(div().text_size(px(10.)).text_color(MUTED).child(
-                                    format!(
-                                        "Comparing revision {} with the editable transcript",
-                                        revision.number
-                                    ),
-                                ))
-                            })
-                            .child(self.render_diff(original, current_text.as_ref())),
+                            .when(changed, |this| {
+                                this.child(
+                                    div()
+                                        .mt(px(6.))
+                                        .text_size(px(11.))
+                                        .text_color(MUTED)
+                                        .child("Changes from the model transcript"),
+                                )
+                                .child(self.render_diff(original, current_text.as_ref()))
+                            }),
                     )
-                    .child(self.render_metadata(&detail, cx)),
+                    .child(self.render_metadata(&detail)),
             )
             .child(
                 div()
@@ -1173,8 +1272,9 @@ impl MainView {
                     .bg(MANTLE)
                     .border_t_1()
                     .border_color(LINE)
-                    .text_size(px(10.))
+                    .text_size(px(11.))
                     .text_color(if self.notice == "Saved" { GREEN } else { MUTED })
+                    .children(self.render_delete_controls(id, cx))
                     .child(self.notice.clone())
                     .child(div().flex_1())
                     .child(action_button(
@@ -1198,7 +1298,7 @@ impl MainView {
                         }),
                     ))
                     .child(action_button(
-                        "Save revision",
+                        "Save",
                         cx.listener(move |this, _, _, cx| {
                             let text = this.editor.read(cx).value().to_string();
                             if !should_save(&saved_text, &text, false) {
@@ -1228,6 +1328,436 @@ impl MainView {
             .into_any_element()
     }
 
+    fn render_delete_controls(&self, id: i64, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        if self.confirm_delete == Some(id) {
+            return vec![
+                div()
+                    .text_color(RED)
+                    .child("Delete this recording and its audio?")
+                    .into_any_element(),
+                danger_button(
+                    "Delete",
+                    cx.listener(move |this, _, _, cx| {
+                        this.request_delete(id);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                action_button(
+                    "Keep",
+                    cx.listener(|this, _, _, cx| {
+                        this.confirm_delete = None;
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+            ];
+        }
+        vec![
+            div()
+                .id(("delete-recording", id as u64))
+                .px(px(10.))
+                .py(px(6.))
+                .rounded(px(4.))
+                .text_color(MUTED)
+                .cursor_pointer()
+                .hover(|this| this.bg(alpha(RED, 0.12)).text_color(RED))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.confirm_delete = Some(id);
+                    cx.notify();
+                }))
+                .child("Delete")
+                .into_any_element(),
+        ]
+    }
+
+    fn render_dictation(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let settings = self.backend.managed_settings.clone();
+        let status = self.status.clone();
+        let state = status.as_ref().map(|status| status.state);
+        let recording = state == Some(DaemonState::Recording);
+        let transcribing = state == Some(DaemonState::Transcribing);
+        let busy = recording || transcribing;
+        let connected = status.is_some();
+        let (rms, peak) = status
+            .as_ref()
+            .map(|status| (status.audio_level_rms, status.audio_level_peak))
+            .unwrap_or((0.0, 0.0));
+        let elapsed = status
+            .as_ref()
+            .map(|status| status.duration_ms)
+            .unwrap_or(0);
+        let state_label = match state {
+            Some(DaemonState::Recording) => format!("Recording · {}", format_duration(elapsed)),
+            Some(DaemonState::Transcribing) => "Transcribing...".to_string(),
+            Some(DaemonState::Typing) => "Pasting...".to_string(),
+            Some(DaemonState::Error) => "Last recording failed".to_string(),
+            Some(DaemonState::Idle) => "Ready".to_string(),
+            None => "Daemon unavailable".to_string(),
+        };
+        let state_color = match state {
+            Some(DaemonState::Recording) => RED,
+            Some(DaemonState::Transcribing) | Some(DaemonState::Typing) => BLUE,
+            Some(DaemonState::Error) => RED,
+            Some(DaemonState::Idle) => GREEN,
+            None => MUTED,
+        };
+        let toggle_hint = if settings.shortcut_toggle.is_empty() {
+            "No shortcut configured".to_string()
+        } else {
+            settings.shortcut_toggle.clone()
+        };
+        let cancel_hint = if settings.shortcut_cancel.is_empty() {
+            None
+        } else {
+            Some(settings.shortcut_cancel.clone())
+        };
+        let latest = self
+            .recent
+            .iter()
+            .find(|recording| !recording.failed)
+            .cloned();
+        let recent = self.recent.clone();
+        let connection = self.connection.clone();
+        let checking = self.connection_pending;
+        let notice = self.notice.clone();
+
+        let record_card = card()
+            .flex_1()
+            .min_w_0()
+            .child(section_heading("RECORD"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(div().size(px(8.)).rounded_full().bg(state_color))
+                    .child(
+                        div()
+                            .font_family(FONT_DISPLAY)
+                            .text_size(px(24.))
+                            .child(state_label),
+                    ),
+            )
+            .child(render_meter(recording, rms, peak))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .id("dictation-toggle")
+                            .px(px(14.))
+                            .py(px(8.))
+                            .rounded(px(4.))
+                            .bg(if recording { SURFACE_2 } else { BLUE })
+                            .text_color(if recording { TEXT } else { BG })
+                            .when(!connected || transcribing, |this| this.opacity(0.5))
+                            .when(connected && !transcribing, |this| {
+                                this.cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.backend.send(Request::Toggle);
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(if recording {
+                                "Stop and transcribe"
+                            } else {
+                                "Start recording"
+                            }),
+                    )
+                    .when(busy, |this| {
+                        this.child(action_button(
+                            "Cancel",
+                            cx.listener(|this, _, _, cx| {
+                                this.backend.send(Request::Cancel);
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_end()
+                            .text_size(px(11.))
+                            .text_color(MUTED)
+                            .child(div().flex().gap(px(6.)).child("toggle").child(key_hint(toggle_hint)))
+                            .when_some(cancel_hint, |this, hint| {
+                                this.child(div().flex().gap(px(6.)).mt(px(4.)).child("cancel").child(key_hint(hint)))
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(gpui::relative(1.6))
+                    .text_color(SUBTEXT)
+                    .child("Press the toggle shortcut, speak, press it again. The transcript is pasted into the focused window, copied to the clipboard, and saved to history. Recordings started from this window are saved the same way."),
+            );
+
+        let daemon_line = match &status {
+            Some(status) => format!("Connected · up {}", format_uptime(status.uptime_seconds)),
+            None => "Not running".to_string(),
+        };
+        let provider_line = match &connection {
+            Some(report) => match &report.provider {
+                Ok(detail) => format!("Reachable · {detail}"),
+                Err(error) => format!("Unreachable · {error}"),
+            },
+            None if checking => "Checking...".to_string(),
+            None => "Not checked yet".to_string(),
+        };
+        let provider_ok = connection.as_ref().map(|report| report.provider.is_ok());
+        let checked_line = connection
+            .as_ref()
+            .map(|report| format!("Checked {}", format_time(report.checked_at)))
+            .unwrap_or_default();
+        let status_card = card()
+            .w(px(340.))
+            .flex_none()
+            .child(section_heading("STATUS"))
+            .child(status_row("Daemon", daemon_line, Some(connected)))
+            .child(status_row(
+                "Provider",
+                format!("{} · {}", settings.provider, settings.model),
+                None,
+            ))
+            .child(status_row(
+                &settings_host(&connection, &settings.endpoint),
+                provider_line,
+                provider_ok,
+            ))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(action_button(
+                        "Check connection",
+                        cx.listener(|this, _, _, cx| {
+                            this.check_connection();
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(MUTED)
+                            .child(checked_line),
+                    ),
+            );
+
+        let mut recent_list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
+        if recent.is_empty() {
+            recent_list = recent_list.child(div().text_color(MUTED).child("No recordings yet."));
+        }
+        for recording in recent {
+            let id = recording.id;
+            let copy_text = recording.text.clone();
+            let failed = recording.failed;
+            let body = if failed {
+                recording.error.clone()
+            } else if recording.text.trim().is_empty() {
+                "No speech was transcribed".to_string()
+            } else {
+                recording.text.clone()
+            };
+            recent_list = recent_list.child(
+                div()
+                    .id(("recent", id as u64))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .px(px(8.))
+                    .py(px(7.))
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|this| this.bg(SURFACE))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.reveal_recording(id, window, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(MUTED)
+                            .child(format_time(recording.timestamp)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(if failed { RED } else { SUBTEXT })
+                            .child(body),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.))
+                            .text_color(MUTED)
+                            .child(format_duration(recording.duration_ms)),
+                    )
+                    .when(!failed, |this| {
+                        this.child(
+                            div()
+                                .id(("recent-copy", id as u64))
+                                .flex_none()
+                                .p(px(4.))
+                                .rounded(px(3.))
+                                .text_color(MUTED)
+                                .hover(|this| this.bg(SURFACE_2).text_color(TEXT))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ));
+                                    this.notice = format!("Copied #{id}");
+                                    cx.stop_propagation();
+                                    cx.notify();
+                                }))
+                                .child(Icon::new(IconName::Copy).size(px(13.))),
+                        )
+                    }),
+            );
+        }
+        let recent_card = card()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .child(section_heading("RECENT DICTATIONS"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("open-all-history")
+                            .text_size(px(11.))
+                            .text_color(MUTED)
+                            .cursor_pointer()
+                            .hover(|this| this.text_color(TEXT))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_tab(Tab::History);
+                                cx.notify();
+                            }))
+                            .child("Open history"),
+                    ),
+            )
+            .child(recent_list);
+
+        let latest_card = card()
+            .w(px(340.))
+            .flex_none()
+            .min_h_0()
+            .child(section_heading("LAST RESULT"))
+            .child(match &latest {
+                Some(recording) => div()
+                    .id("latest-result")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .text_size(px(15.))
+                    .line_height(gpui::relative(1.5))
+                    .text_color(TEXT)
+                    .child(if recording.text.trim().is_empty() {
+                        "No speech was transcribed.".to_string()
+                    } else {
+                        recording.text.clone()
+                    })
+                    .into_any_element(),
+                None => div()
+                    .flex_1()
+                    .text_color(MUTED)
+                    .child("Record something to see the transcript here.")
+                    .into_any_element(),
+            })
+            .when_some(latest, |this, recording| {
+                let copy_text = recording.text.clone();
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.))
+                        .text_size(px(11.))
+                        .text_color(MUTED)
+                        .child(format!(
+                            "#{} · {} · {} words",
+                            recording.id,
+                            format_time(recording.timestamp),
+                            recording.text.split_whitespace().count()
+                        ))
+                        .child(div().flex_1())
+                        .child(action_button(
+                            "Copy",
+                            cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    copy_text.clone(),
+                                ));
+                                this.notice = "Copied".to_string();
+                                cx.notify();
+                            }),
+                        )),
+                )
+            });
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap(px(14.))
+            .px(px(28.))
+            .py(px(18.))
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .child(
+                        div()
+                            .font_family(FONT_DISPLAY)
+                            .text_size(px(27.))
+                            .child("Dictation"),
+                    )
+                    .child(div().flex_1())
+                    .when(!notice.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(if notice.starts_with("Copied") {
+                                    GREEN
+                                } else {
+                                    MUTED
+                                })
+                                .child(notice),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(14.))
+                    .child(record_card)
+                    .child(status_card),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .gap(px(14.))
+                    .child(recent_card)
+                    .child(latest_card),
+            )
+            .into_any_element()
+    }
+
     fn render_player(
         &mut self,
         path: std::path::PathBuf,
@@ -1238,7 +1768,7 @@ impl MainView {
         let paused = self.player.is_paused();
         let position = self.player.position();
         let total = Duration::from_millis(duration_ms.max(0) as u64);
-        let mut bars = div().flex_1().h(px(44.)).flex().items_center().gap(px(2.));
+        let mut bars = div().flex_1().h(px(44.)).flex().items_center().gap(px(3.));
         let bucket_count = self.waveform.len().max(1);
         for (index, peak) in self.waveform.iter().enumerate() {
             let target = total.mul_f64(index as f64 / bucket_count as f64);
@@ -1247,8 +1777,8 @@ impl MainView {
                 div()
                     .id(("waveform", index))
                     .flex_1()
-                    .h(px(3. + peak * 37.))
-                    .rounded(px(1.))
+                    .h(px(4. + peak * 36.))
+                    .rounded_full()
                     .bg(if target <= position {
                         BLUE
                     } else {
@@ -1269,47 +1799,61 @@ impl MainView {
             );
         }
         let button_path = path.clone();
+        let readout = format!(
+            "{} / {}{}",
+            format_duration(position.as_millis() as i64),
+            format_duration(duration_ms),
+            if paused { " · paused" } else { "" }
+        );
         div()
             .flex()
-            .items_center()
-            .gap(px(12.))
+            .flex_col()
             .mx(px(24.))
             .mt(px(10.))
             .child(
                 div()
-                    .id("play-audio")
-                    .size(px(34.))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(BLUE)
-                    .text_color(BG)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let result = if this.player.path() != Some(button_path.as_path()) {
-                            this.player.play(&button_path, Duration::ZERO)
-                        } else if this.player.is_playing() {
-                            this.player.pause()
-                        } else if this.player.is_paused() {
-                            this.player.resume()
-                        } else {
-                            this.player.play(&button_path, Duration::ZERO)
-                        };
-                        if let Err(error) = result {
-                            this.notice = error.to_string();
-                        }
-                        cx.notify();
-                    }))
-                    .child(if playing { "Ⅱ" } else { "▶" }),
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .id("play-audio")
+                            .size(px(34.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(BLUE)
+                            .text_color(BG)
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let result = if this.player.path() != Some(button_path.as_path()) {
+                                    this.player.play(&button_path, Duration::ZERO)
+                                } else if this.player.is_playing() {
+                                    this.player.pause()
+                                } else if this.player.is_paused() {
+                                    this.player.resume()
+                                } else {
+                                    this.player.play(&button_path, Duration::ZERO)
+                                };
+                                if let Err(error) = result {
+                                    this.notice = error.to_string();
+                                }
+                                cx.notify();
+                            }))
+                            .child(if playing { "Ⅱ" } else { "▶" }),
+                    )
+                    .child(bars),
             )
-            .child(bars)
-            .child(div().text_size(px(11.)).text_color(MUTED).child(format!(
-                "{} / {}{}",
-                format_duration(position.as_millis() as i64),
-                format_duration(duration_ms),
-                if paused { " paused" } else { "" }
-            )))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .mt(px(4.))
+                    .text_size(px(11.))
+                    .text_color(MUTED)
+                    .child(readout),
+            )
     }
 
     fn render_diff(&self, original: &str, current: &str) -> impl IntoElement {
@@ -1335,7 +1879,7 @@ impl MainView {
             .border_1()
             .border_color(LINE)
             .rounded(px(4.))
-            .text_size(px(11.));
+            .text_size(px(12.));
         for word in &original_words[..prefix] {
             diff = diff.child(div().text_color(SUBTEXT).child((*word).to_string()));
         }
@@ -1363,72 +1907,59 @@ impl MainView {
         diff
     }
 
-    fn render_metadata(&self, detail: &Detail, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_metadata(&self, detail: &Detail) -> impl IntoElement {
         let recording = &detail.recording;
-        let recording_id = recording.id;
-        let recording_revision = recording.revision;
-        let mut revisions = div().flex().flex_col().gap(px(2.));
-        for revision in detail.revisions.iter().rev() {
-            let number = revision.number;
-            revisions = revisions.child(
-                div()
-                    .id(("revision", number as u64))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(7.))
-                    .py(px(5.))
-                    .rounded(px(4.))
-                    .hover(|this| this.bg(SURFACE))
-                    .cursor_pointer()
-                    .when(self.inspected_revision == Some(number), |this| {
-                        this.bg(SURFACE)
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.inspected_revision = Some(number);
-                        cx.notify();
-                    }))
-                    .child(div().size(px(7.)).rounded_full().bg(BLUE))
-                    .child(div().flex_1().child(format!("Revision {number}")).child(
-                        div().text_size(px(9.)).text_color(MUTED).child(format!(
-                            "{} · {} · {} words",
-                            format_time(revision.timestamp),
-                            revision.source,
-                            revision.text.split_whitespace().count()
-                        )),
-                    )),
-            );
-        }
         let mut attempts = div().flex().flex_col().gap(px(6.));
         for attempt in detail.attempts.iter().rev().take(4) {
-            attempts =
-                attempts.child(
-                    div()
-                        .px(px(7.))
-                        .py(px(5.))
-                        .bg(MANTLE)
-                        .child(
-                            div()
-                                .flex()
-                                .justify_between()
-                                .child(format!("Attempt {} · {}", attempt.number, attempt.status))
-                                .child(format_latency(attempt.latency_ms)),
-                        )
-                        .child(div().mt(px(3.)).text_size(px(9.)).text_color(MUTED).child(
-                            format!(
-                                "{} · {} → {}{}",
-                                attempt.model,
+            attempts = attempts.child(
+                div()
+                    .px(px(8.))
+                    .py(px(6.))
+                    .bg(MANTLE)
+                    .rounded(px(4.))
+                    .child(
+                        div()
+                            .flex()
+                            .justify_between()
+                            .child(format!("Attempt {} · {}", attempt.number, attempt.status))
+                            .child(format_latency(attempt.latency_ms)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(3.))
+                            .text_size(px(10.))
+                            .text_color(MUTED)
+                            .truncate()
+                            .child(attempt.model.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(MUTED)
+                            .whitespace_nowrap()
+                            .child(format!(
+                                "{} → {}",
                                 format_time(attempt.started_at),
-                                format_time(attempt.finished_at),
-                                if attempt.error.is_empty() {
-                                    String::new()
-                                } else {
-                                    format!(" · {}", attempt.error)
-                                }
-                            ),
-                        )),
-                );
+                                format_time(attempt.finished_at)
+                            )),
+                    )
+                    .when(!attempt.error.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .mt(px(3.))
+                                .text_size(px(10.))
+                                .text_color(RED)
+                                .line_clamp(3)
+                                .child(attempt.error.clone()),
+                        )
+                    }),
+            );
         }
+        let audio = recording
+            .audio_path
+            .file_name()
+            .map(|name| middle_ellipsis(&name.to_string_lossy(), 28))
+            .unwrap_or_else(|| "Not available".to_string());
         div()
             .id("metadata-scroll")
             .w(px(220.))
@@ -1437,46 +1968,33 @@ impl MainView {
             .flex()
             .flex_col()
             .gap(px(18.))
-            .text_size(px(11.))
-            .child(section_heading("RECORDING"))
-            .child(meta_row("Duration", format_duration(recording.duration_ms)))
-            .child(meta_row("Model", recording.model.clone()))
-            .child(meta_row(
-                "Audio",
-                recording
-                    .audio_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Not available".to_string()),
-            ))
-            .child(section_heading("ATTEMPTS"))
-            .child(attempts)
-            .child(section_heading("REVISIONS"))
-            .child(revisions)
-            .when_some(self.inspected_revision, |this, revision| {
-                this.child(action_button(
-                    "Restore selected revision",
-                    cx.listener(move |view, _, _, cx| {
-                        if view
-                            .mutation_requests
-                            .iter()
-                            .any(|pending| pending_mutation_id(pending) == recording_id)
-                        {
-                            view.notice = "A transcript change is already in progress".to_string();
+            .text_size(px(12.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.))
+                    .child(section_heading("RECORDING"))
+                    .child(meta_row("Duration", format_duration(recording.duration_ms)))
+                    .child(meta_row("Model", recording.model.clone()))
+                    .child(meta_row("Audio", audio))
+                    .child(meta_row(
+                        "Revision",
+                        if recording.revision > 0 {
+                            format!("Edited · revision {}", recording.revision)
                         } else {
-                            view.mutation_requests
-                                .push_back(PendingMutation::Restore { id: recording_id });
-                            view.backend.send(Request::RestoreRevision {
-                                id: recording_id,
-                                revision,
-                                expected_revision: recording_revision,
-                            });
-                            view.notice = "Restoring revision...".to_string();
-                        }
-                        cx.notify();
-                    }),
-                ))
-            })
+                            "Model transcript".to_string()
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.))
+                    .child(section_heading("ATTEMPTS"))
+                    .child(attempts),
+            )
     }
 
     fn render_stats(&self) -> gpui::AnyElement {
@@ -1489,58 +2007,159 @@ impl MainView {
         } else {
             0.0
         };
+        let week_delta = stats.this_week_words - stats.last_week_words;
+        let week_note = if stats.last_week_words == 0 {
+            "no words the week before".to_string()
+        } else {
+            format!(
+                "{}{:.0}% vs previous week",
+                if week_delta >= 0 { "+" } else { "−" },
+                (week_delta.unsigned_abs() as f64 / stats.last_week_words as f64) * 100.0
+            )
+        };
+        let active_days = stats
+            .daily_last_30
+            .iter()
+            .filter(|day| day.recordings > 0)
+            .count();
+        let streak = stats
+            .daily_last_30
+            .iter()
+            .rev()
+            .take_while(|day| day.recordings > 0)
+            .count();
+        let success_rate = if stats.total > 0 {
+            format!(
+                "{:.1}%",
+                stats.successful as f64 / stats.total as f64 * 100.0
+            )
+        } else {
+            "—".to_string()
+        };
+        let tiles = div()
+            .flex()
+            .border_y_1()
+            .border_color(LINE)
+            .child(stat_tile(
+                format_count(stats.words),
+                "words transcribed",
+                format!("{} today", format_count(stats.today_words)),
+            ))
+            .child(stat_tile(
+                format_count(stats.this_week_words),
+                "words this week",
+                week_note,
+            ))
+            .child(stat_tile(
+                format!("{wpm:.0}"),
+                "words per minute",
+                format!("{} recorded", format_hours(stats.duration_ms)),
+            ))
+            .child(stat_tile(
+                format_count(stats.total),
+                "recordings",
+                format!("{success_rate} succeeded · {} edited", stats.edited),
+            ))
+            .child(stat_tile(
+                format_latency(stats.p50),
+                "median latency",
+                format!(
+                    "p95 {} · p99 {}",
+                    format_latency(stats.p95),
+                    format_latency(stats.p99)
+                ),
+            ));
+
         div()
             .id("stats-scroll")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .px(px(28.))
-            .py(px(18.))
+            .py(px(14.))
+            .flex()
+            .flex_col()
+            .gap(px(12.))
             .child(
                 div()
-                    .font_family(FONT_DISPLAY)
-                    .text_size(px(27.))
-                    .child("Your dictation"),
+                    .flex()
+                    .items_end()
+                    .child(
+                        div()
+                            .font_family(FONT_DISPLAY)
+                            .text_size(px(24.))
+                            .child("Your dictation"),
+                    )
+                    .child(div().flex_1())
+                    .child(div().text_size(px(11.)).text_color(MUTED).child(format!(
+                        "{active_days} active days in the last 30 · {streak} day streak"
+                    ))),
             )
+            .child(tiles)
             .child(
                 div()
-                    .mt(px(3.))
-                    .text_size(px(11.))
-                    .text_color(MUTED)
-                    .child(format!(
-                        "All history · {} recordings · {} failed · {} edited",
-                        stats.total, stats.failed, stats.edited
-                    )),
+                    .flex()
+                    .gap(px(14.))
+                    .child(
+                        card()
+                            .flex_1()
+                            .min_w_0()
+                            .child(chart_heading(
+                                "Daily activity",
+                                "Last 30 days · words per day",
+                            ))
+                            .child(render_activity_chart(stats)),
+                    )
+                    .child(
+                        card()
+                            .w(px(330.))
+                            .flex_none()
+                            .child(chart_heading("Time of day", "Recordings by hour"))
+                            .child(render_hour_chart(stats)),
+                    ),
             )
             .child(
                 div()
                     .flex()
-                    .my(px(14.))
-                    .border_y_1()
-                    .border_color(LINE)
-                    .child(metric(stats.words.to_string(), "words transcribed"))
-                    .child(metric(format!("{wpm:.0}"), "words per minute"))
-                    .child(metric(
-                        format!("{:.1} h", stats.duration_ms as f64 / 3_600_000.0),
-                        "recorded audio",
-                    ))
-                    .child(metric(format_latency(stats.p95), "server p95 latency")),
+                    .gap(px(14.))
+                    .child(
+                        card()
+                            .flex_1()
+                            .min_w_0()
+                            .child(chart_heading("Server latency", "Recent completed attempts"))
+                            .child(render_latency_chart(stats)),
+                    )
+                    .child(
+                        card()
+                            .flex_1()
+                            .min_w_0()
+                            .child(chart_heading("Recording length", "Completed recordings"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(18.))
+                                    .child(mini_stat(
+                                        format_duration(stats.median_duration_ms.unwrap_or(0)),
+                                        "median",
+                                    ))
+                                    .child(mini_stat(
+                                        format_duration(stats.average_duration_ms.unwrap_or(0)),
+                                        "average",
+                                    ))
+                                    .child(mini_stat(
+                                        format_hours(stats.today_duration_ms),
+                                        "today",
+                                    )),
+                            )
+                            .child(render_model_table(stats)),
+                    ),
             )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(24.))
-                    .h(px(190.))
-                    .child(render_daily_chart(stats))
-                    .child(render_latency_chart(stats)),
-            )
-            .child(render_model_table(stats))
             .into_any_element()
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let settings = &self.backend.managed_settings;
-        let mut microphones = div().flex().flex_col().max_w(px(850.));
+        let mut microphones = div().flex().flex_col();
         for (index, microphone) in self.microphones.iter().enumerate() {
             let up_ids = moved_ids(&self.microphones, index, -1);
             let down_ids = moved_ids(&self.microphones, index, 1);
@@ -1563,7 +2182,7 @@ impl MainView {
                         div().flex_1().child(microphone.name.clone()).child(
                             div()
                                 .mt(px(4.))
-                                .text_size(px(10.))
+                                .text_size(px(11.))
                                 .text_color(if microphone.connected { GREEN } else { MUTED })
                                 .child(if microphone.connected {
                                     if microphone.is_default {
@@ -1592,7 +2211,14 @@ impl MainView {
             .overflow_y_scroll()
             .px(px(36.))
             .py(px(24.))
+            .flex()
+            .flex_col()
+            .items_center()
             .child(
+                div()
+                    .w_full()
+                    .max_w(px(820.))
+                    .child(
                 div()
                     .font_family(FONT_DISPLAY)
                     .text_size(px(28.))
@@ -1601,8 +2227,7 @@ impl MainView {
             .child(section_title("MICROPHONE"))
             .child(
                 div()
-                    .max_w(px(850.))
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .line_height(gpui::relative(1.6))
                     .text_color(MUTED)
                     .child("Dictator uses the first connected input in this list. Disconnected inputs keep their place. Changes apply to the next recording."),
@@ -1611,7 +2236,7 @@ impl MainView {
             .child(section_title("DAEMON CONFIGURATION"))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(MUTED)
                     .child(if settings.managed_by_home_manager {
                         "Managed by Home Manager. Configuration is read-only here. Provider keys are hidden."
@@ -1640,6 +2265,7 @@ impl MainView {
             ))
             .child(setting_row("Paste shortcut", &settings.paste_shortcut))
             .child(setting_row("Notifications", &settings.notifications))
+            )
             .into_any_element()
     }
 }
@@ -1657,10 +2283,11 @@ impl Render for MainView {
             .bg(BG)
             .text_color(TEXT)
             .font_family(FONT_MONO)
-            .text_size(px(12.))
+            .text_size(px(13.))
             .child(self.render_titlebar(cx))
             .when_some(recovery, |this, recovery| this.child(recovery))
             .child(match self.tab {
+                Tab::Dictation => self.render_dictation(cx),
                 Tab::History => self.render_history(cx),
                 Tab::Stats => self.render_stats(),
                 Tab::Settings => self.render_settings(cx),
@@ -1813,7 +2440,7 @@ impl Render for TrayView {
             .bg(BG)
             .text_color(TEXT)
             .font_family(FONT_MONO)
-            .text_size(px(11.))
+            .text_size(px(12.))
             .child(
                 div()
                     .flex()
@@ -1845,7 +2472,7 @@ impl Render for TrayView {
                         .bg(SURFACE)
                         .border_l_2()
                         .border_color(LINE_STRONG)
-                        .text_size(px(10.))
+                        .text_size(px(11.))
                         .text_color(SUBTEXT)
                         .child(notice),
                 )
@@ -1918,7 +2545,7 @@ impl Render for TrayView {
                     .px(px(16.))
                     .pt(px(12.))
                     .pb(px(5.))
-                    .text_size(px(9.))
+                    .text_size(px(10.))
                     .text_color(MUTED)
                     .child("RECENT"),
             )
@@ -1992,6 +2619,94 @@ impl Render for TrayView {
     }
 }
 
+fn card() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.))
+        .p(px(14.))
+        .bg(MANTLE)
+        .border_1()
+        .border_color(LINE)
+        .rounded(px(6.))
+}
+
+fn key_hint(label: String) -> impl IntoElement {
+    div()
+        .px(px(6.))
+        .py(px(1.))
+        .rounded(px(3.))
+        .bg(SURFACE_2)
+        .text_color(TEXT)
+        .child(label)
+}
+
+fn status_row(label: &str, value: String, ok: Option<bool>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_start()
+        .gap(px(10.))
+        .text_size(px(12.))
+        .child(
+            div()
+                .mt(px(5.))
+                .size(px(7.))
+                .flex_none()
+                .rounded_full()
+                .bg(match ok {
+                    Some(true) => GREEN,
+                    Some(false) => RED,
+                    None => LINE_STRONG,
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_color(MUTED)
+                        .text_size(px(10.))
+                        .child(label.to_string()),
+                )
+                .child(div().text_color(SUBTEXT).line_clamp(2).child(value)),
+        )
+}
+
+fn settings_host(connection: &Option<ConnectionReport>, endpoint: &str) -> String {
+    connection
+        .as_ref()
+        .map(|report| report.endpoint_host.clone())
+        .filter(|host| !host.is_empty())
+        .or_else(|| {
+            endpoint
+                .split("//")
+                .nth(1)
+                .and_then(|rest| rest.split('/').next())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "Endpoint".to_string())
+}
+
+fn danger_button(
+    label: &'static str,
+    listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label)
+        .px(px(10.))
+        .py(px(6.))
+        .bg(alpha(RED, 0.15))
+        .border_1()
+        .border_color(RED)
+        .rounded(px(4.))
+        .text_color(RED)
+        .cursor_pointer()
+        .hover(|this| this.bg(alpha(RED, 0.3)))
+        .on_click(listener)
+        .child(label)
+}
+
 fn action_button(
     label: &'static str,
     listener: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -2042,7 +2757,7 @@ fn recovery_banner(status: &Status, compact: bool) -> Option<gpui::AnyElement> {
                     .child(
                         div()
                             .mt(px(3.))
-                            .text_size(px(10.))
+                            .text_size(px(11.))
                             .text_color(MUTED)
                             .child(error),
                     )
@@ -2072,14 +2787,14 @@ fn recovery_banner(status: &Status, compact: bool) -> Option<gpui::AnyElement> {
 }
 
 fn section_heading(label: &'static str) -> impl IntoElement {
-    div().text_size(px(9.)).text_color(MUTED).child(label)
+    div().text_size(px(10.)).text_color(MUTED).child(label)
 }
 
 fn section_title(label: &'static str) -> impl IntoElement {
     div()
         .mt(px(24.))
         .mb(px(8.))
-        .text_size(px(10.))
+        .text_size(px(11.))
         .text_color(MUTED)
         .child(label)
 }
@@ -2087,37 +2802,30 @@ fn section_title(label: &'static str) -> impl IntoElement {
 fn meta_row(label: &'static str, value: String) -> impl IntoElement {
     div()
         .flex()
-        .gap(px(8.))
-        .child(div().w(px(62.)).text_color(MUTED).child(label))
-        .child(
-            div()
-                .flex_1()
-                .overflow_hidden()
-                .text_color(SUBTEXT)
-                .child(value),
-        )
+        .flex_col()
+        .gap(px(2.))
+        .child(div().text_size(px(10.)).text_color(MUTED).child(label))
+        .child(div().text_color(SUBTEXT).truncate().child(value))
 }
 
-fn metric(value: String, label: &'static str) -> impl IntoElement {
-    div()
-        .flex_1()
-        .px(px(16.))
-        .py(px(12.))
-        .border_r_1()
-        .border_color(LINE)
-        .child(
-            div()
-                .font_family(FONT_DISPLAY)
-                .text_size(px(27.))
-                .child(value),
-        )
-        .child(
-            div()
-                .mt(px(3.))
-                .text_size(px(10.))
-                .text_color(MUTED)
-                .child(label),
-        )
+fn middle_ellipsis(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars || max_chars < 5 {
+        return value.to_string();
+    }
+    let keep_end = max_chars / 3;
+    let keep_start = max_chars - keep_end - 1;
+    let start: String = value.chars().take(keep_start).collect();
+    let end: String = value.chars().skip(count - keep_end).collect();
+    format!("{start}…{end}")
+}
+
+fn plural(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 fn tray_metric(value: String, label: &'static str) -> impl IntoElement {
@@ -2133,7 +2841,7 @@ fn tray_metric(value: String, label: &'static str) -> impl IntoElement {
                 .text_size(px(18.))
                 .child(value),
         )
-        .child(div().text_size(px(8.)).text_color(MUTED).child(label))
+        .child(div().text_size(px(9.)).text_color(MUTED).child(label))
 }
 
 fn render_meter(active: bool, rms: f32, peak: f32) -> impl IntoElement {
@@ -2154,55 +2862,112 @@ fn render_meter(active: bool, rms: f32, peak: f32) -> impl IntoElement {
     meter
 }
 
-fn render_daily_chart(stats: &Stats) -> impl IntoElement {
-    let max = stats
-        .daily
+fn render_activity_chart(stats: &Stats) -> impl IntoElement {
+    let max_words = stats
+        .daily_last_30
         .iter()
-        .map(|(_, count)| *count)
+        .map(|day| day.words)
         .max()
-        .unwrap_or(1) as f32;
+        .unwrap_or(0)
+        .max(1) as f32;
     let mut bars = div()
-        .flex_1()
-        .h(px(130.))
+        .h(px(88.))
         .flex()
         .items_end()
-        .gap(px(7.))
+        .gap(px(3.))
         .border_b_1()
         .border_color(LINE);
-    for (date, count) in &stats.daily {
+    let count = stats.daily_last_30.len();
+    for (index, day) in stats.daily_last_30.iter().enumerate() {
+        let is_today = index + 1 == count;
+        let height = if day.words > 0 {
+            (day.words as f32 / max_words * 82.).max(3.)
+        } else {
+            2.
+        };
+        bars = bars.child(
+            div()
+                .id(("activity-day", index))
+                .flex_1()
+                .h(px(height))
+                .rounded_t(px(2.))
+                .bg(if day.words == 0 {
+                    alpha(MUTED, 0.25)
+                } else if is_today {
+                    BLUE
+                } else {
+                    alpha(BLUE, 0.6)
+                })
+                .hover(|this| this.bg(TEXT)),
+        );
+    }
+    let first = stats.daily_last_30.first().map(|day| day.date);
+    let last = stats.daily_last_30.last().map(|day| day.date);
+    let label = |date: Option<chrono::NaiveDate>| {
+        date.map(|date| date.format("%b %-d").to_string())
+            .unwrap_or_default()
+    };
+    div().flex().flex_col().gap(px(6.)).child(bars).child(
+        div()
+            .flex()
+            .justify_between()
+            .text_size(px(10.))
+            .text_color(MUTED)
+            .child(label(first))
+            .child(format!("peak {} words", format_count(max_words as i64)))
+            .child(label(last)),
+    )
+}
+
+fn render_hour_chart(stats: &Stats) -> impl IntoElement {
+    let max = stats.by_hour.iter().copied().max().unwrap_or(0).max(1) as f32;
+    let peak_hour = stats
+        .by_hour
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| **count)
+        .filter(|(_, count)| **count > 0)
+        .map(|(hour, _)| hour);
+    let mut bars = div()
+        .h(px(88.))
+        .flex()
+        .items_end()
+        .gap(px(2.))
+        .border_b_1()
+        .border_color(LINE);
+    for (hour, count) in stats.by_hour.iter().enumerate() {
         bars = bars.child(
             div()
                 .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .justify_end()
-                .items_center()
-                .gap(px(4.))
-                .child(
-                    div()
-                        .text_size(px(9.))
-                        .text_color(MUTED)
-                        .child(count.to_string()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(((*count as f32 / max) * 92.).max(2.)))
-                        .bg(alpha(BLUE, 0.65)),
-                )
-                .child(
-                    div()
-                        .text_size(px(8.))
-                        .text_color(MUTED)
-                        .child(date.format("%m-%d").to_string()),
-                ),
+                .h(px(if *count > 0 {
+                    (*count as f32 / max * 82.).max(3.)
+                } else {
+                    2.
+                }))
+                .rounded_t(px(2.))
+                .bg(if Some(hour) == peak_hour {
+                    BLUE
+                } else if *count > 0 {
+                    alpha(BLUE, 0.5)
+                } else {
+                    alpha(MUTED, 0.25)
+                }),
         );
     }
-    div()
-        .w_1_2()
-        .child(chart_heading("Recording count", "Last seven days"))
-        .child(bars)
+    div().flex().flex_col().gap(px(6.)).child(bars).child(
+        div()
+            .flex()
+            .justify_between()
+            .text_size(px(10.))
+            .text_color(MUTED)
+            .child("00")
+            .child(
+                peak_hour
+                    .map(|hour| format!("busiest {hour:02}:00–{:02}:00", (hour + 1) % 24))
+                    .unwrap_or_default(),
+            )
+            .child("23"),
+    )
 }
 
 fn render_latency_chart(stats: &Stats) -> impl IntoElement {
@@ -2213,65 +2978,60 @@ fn render_latency_chart(stats: &Stats) -> impl IntoElement {
         .max()
         .unwrap_or(1)
         .max(1);
-    let mut bins = [0_i64; 8];
+    let mut bins = [0_i64; 12];
     for sample in &stats.latency_samples {
         let index = ((*sample * bins.len() as i64) / (max_value + 1)) as usize;
         bins[index.min(bins.len() - 1)] += 1;
     }
     let max_bin = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
     let mut bars = div()
-        .h(px(102.))
+        .h(px(64.))
         .flex()
         .items_end()
         .gap(px(3.))
         .border_b_1()
         .border_color(LINE);
-    for (index, bin) in bins.into_iter().enumerate() {
-        let upper_ms = max_value * (index as i64 + 1) / 8;
+    for bin in bins {
         bars = bars.child(
             div()
                 .flex_1()
-                .h_full()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_end()
-                .gap(px(2.))
-                .child(
-                    div()
-                        .text_size(px(8.))
-                        .text_color(MUTED)
-                        .child(bin.to_string()),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(((bin as f32 / max_bin) * 72.).max(2.)))
-                        .bg(alpha(BLUE, 0.55)),
-                )
-                .child(
-                    div()
-                        .text_size(px(7.))
-                        .text_color(MUTED)
-                        .child(format!("{upper_ms}ms")),
-                ),
+                .h(px(if bin > 0 {
+                    (bin as f32 / max_bin * 58.).max(3.)
+                } else {
+                    2.
+                }))
+                .rounded_t(px(2.))
+                .bg(if bin > 0 {
+                    alpha(BLUE, 0.6)
+                } else {
+                    alpha(MUTED, 0.25)
+                }),
         );
     }
     div()
-        .w_1_2()
-        .child(chart_heading("Server latency", "Recent completed attempts"))
+        .flex()
+        .flex_col()
+        .gap(px(6.))
         .child(bars)
         .child(
             div()
                 .flex()
                 .justify_between()
-                .mt(px(8.))
-                .text_size(px(9.))
+                .text_size(px(10.))
                 .text_color(MUTED)
-                .child(format!("p50 {}", format_latency(stats.p50)))
-                .child(format!("p95 {}", format_latency(stats.p95)))
-                .child(format!("p99 {}", format_latency(stats.p99)))
-                .child(format!("max {}", format_latency(stats.max))),
+                .child("0 s")
+                .child(format!("{} samples", stats.latency_samples.len()))
+                .child(format_latency(Some(max_value))),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(18.))
+                .mt(px(4.))
+                .child(mini_stat(format_latency(stats.p50), "p50"))
+                .child(mini_stat(format_latency(stats.p95), "p95"))
+                .child(mini_stat(format_latency(stats.p99), "p99"))
+                .child(mini_stat(format_latency(stats.max), "max")),
         )
 }
 
@@ -2280,64 +3040,109 @@ fn chart_heading(title: &'static str, note: &'static str) -> impl IntoElement {
         .flex()
         .justify_between()
         .items_center()
-        .mb(px(8.))
-        .child(div().text_size(px(12.)).child(title))
-        .child(div().text_size(px(9.)).text_color(MUTED).child(note))
+        .child(div().text_size(px(13.)).child(title))
+        .child(div().text_size(px(10.)).text_color(MUTED).child(note))
 }
 
 fn render_model_table(stats: &Stats) -> impl IntoElement {
-    let mut table = div().mt(px(10.)).border_t_1().border_color(LINE);
-    table = table.child(table_row(
-        "Model",
-        "Recordings",
-        "Audio",
-        "p95 latency",
-        true,
-    ));
-    for (model, recordings, duration_ms, p95) in &stats.models {
+    let mut table = div().mt(px(4.)).border_t_1().border_color(LINE);
+    table = table.child(table_row("Model", "Recordings", "Audio", "p95", true));
+    for (model, recordings, duration_ms, p95) in stats.models.iter().take(3) {
         table = table.child(table_row(
             model,
             &recordings.to_string(),
-            &format!("{:.1} h", *duration_ms as f64 / 3_600_000.0),
+            &format_hours(*duration_ms),
             &format_latency(*p95),
             false,
         ));
     }
-    table.child(
-        div()
-            .mt(px(8.))
-            .text_size(px(9.))
-            .text_color(MUTED)
-            .child(format!("{} successful recordings", stats.successful)),
-    )
+    table
 }
 
 fn table_row(a: &str, b: &str, c: &str, d: &str, heading: bool) -> impl IntoElement {
     div()
         .flex()
-        .py(px(8.))
+        .py(px(5.))
         .border_b_1()
         .border_color(LINE)
-        .text_size(px(10.))
+        .text_size(px(11.))
         .text_color(if heading { MUTED } else { SUBTEXT })
-        .child(div().w_2_5().child(a.to_string()))
+        .child(div().w_2_5().truncate().child(a.to_string()))
         .child(div().w_1_5().child(b.to_string()))
         .child(div().w_1_5().child(c.to_string()))
         .child(div().w_1_5().child(d.to_string()))
 }
 
+fn stat_tile(value: String, label: &'static str, note: String) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .px(px(14.))
+        .py(px(8.))
+        .border_r_1()
+        .border_color(LINE)
+        .child(
+            div()
+                .font_family(FONT_DISPLAY)
+                .text_size(px(24.))
+                .child(value),
+        )
+        .child(div().mt(px(2.)).text_size(px(11.)).child(label))
+        .child(
+            div()
+                .mt(px(2.))
+                .text_size(px(10.))
+                .text_color(MUTED)
+                .truncate()
+                .child(note),
+        )
+}
+
+fn mini_stat(value: String, label: &'static str) -> impl IntoElement {
+    div()
+        .child(
+            div()
+                .font_family(FONT_DISPLAY)
+                .text_size(px(19.))
+                .child(value),
+        )
+        .child(div().text_size(px(10.)).text_color(MUTED).child(label))
+}
+
+fn format_count(value: i64) -> String {
+    let digits = value.abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if value < 0 { format!("−{out}") } else { out }
+}
+
+fn format_hours(milliseconds: i64) -> String {
+    let minutes = milliseconds.max(0) as f64 / 60_000.0;
+    if minutes >= 90.0 {
+        format!("{:.1} h", minutes / 60.0)
+    } else {
+        format!("{minutes:.0} min")
+    }
+}
+
 fn setting_row(label: &str, value: &str) -> impl IntoElement {
     div()
-        .max_w(px(850.))
         .flex()
         .items_center()
+        .gap(px(16.))
         .py(px(12.))
         .border_b_1()
         .border_color(LINE)
-        .child(div().flex_1().child(label.to_string()))
+        .child(div().w(px(200.)).flex_none().child(label.to_string()))
         .child(
             div()
-                .w(px(360.))
+                .flex_1()
+                .min_w_0()
                 .p(px(7.))
                 .bg(SURFACE)
                 .border_1()
@@ -2546,7 +3351,7 @@ fn choose_history_selection(
 
 fn pending_mutation_id(pending: &PendingMutation) -> i64 {
     match pending {
-        PendingMutation::Save { id, .. } | PendingMutation::Restore { id } => *id,
+        PendingMutation::Save { id, .. } => *id,
     }
 }
 
@@ -2555,7 +3360,6 @@ fn complete_mutation(pending: Option<PendingMutation>, detail_id: i64) -> Comple
         Some(PendingMutation::Save { id, text }) if id == detail_id => {
             CompletedMutation::Save(text)
         }
-        Some(PendingMutation::Restore { id }) if id == detail_id => CompletedMutation::Restore,
         _ => CompletedMutation::Unexpected,
     }
 }
@@ -2673,15 +3477,43 @@ mod state_tests {
     }
 
     #[test]
-    fn restore_reply_matches_its_pending_mutation() {
+    fn save_reply_matches_its_pending_mutation() {
+        let pending = || {
+            Some(PendingMutation::Save {
+                id: 12,
+                text: "edited".to_string(),
+            })
+        };
         assert_eq!(
-            complete_mutation(Some(PendingMutation::Restore { id: 12 }), 12),
-            CompletedMutation::Restore
+            complete_mutation(pending(), 12),
+            CompletedMutation::Save("edited".to_string())
         );
         assert_eq!(
-            complete_mutation(Some(PendingMutation::Restore { id: 12 }), 13),
+            complete_mutation(pending(), 13),
             CompletedMutation::Unexpected
         );
+    }
+
+    #[test]
+    fn counts_and_hours_are_human_readable() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(598_702), "598,702");
+        assert_eq!(format_count(1_000_000), "1,000,000");
+        assert_eq!(format_hours(45 * 60_000), "45 min");
+        assert_eq!(format_hours(321_480_000), "89.3 h");
+    }
+
+    #[test]
+    fn middle_ellipsis_keeps_both_ends() {
+        assert_eq!(middle_ellipsis("short.wav", 28), "short.wav");
+        let long = "09192026-194510-f5913661-a7fe-4cfa-b27c-a944fc5d9c20.wav";
+        let shortened = middle_ellipsis(long, 28);
+        assert_eq!(shortened.chars().count(), 28);
+        assert!(shortened.starts_with("09192026-194510"));
+        assert!(shortened.ends_with("c20.wav"));
+        assert_eq!(plural(1, "attempt"), "1 attempt");
+        assert_eq!(plural(3, "attempt"), "3 attempts");
     }
 
     #[test]
@@ -2713,7 +3545,7 @@ mod state_tests {
     }
 
     #[test]
-    fn restore_replaces_matching_false_draft_but_preserves_real_edit() {
+    fn matching_false_draft_is_dropped_but_real_edit_is_preserved() {
         let mut drafts = HashMap::from([(7, "restored transcript".to_string())]);
         assert!(!normalize_draft(&mut drafts, 7, "restored transcript"));
         assert!(!drafts.contains_key(&7));

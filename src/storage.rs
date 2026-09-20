@@ -17,6 +17,7 @@ const DB_FILENAME: &str = "app.db";
 const SCHEMA_VERSION: i64 = 1;
 const MAX_HISTORY_PAGE: usize = 100;
 const RECENT_LATENCY_LIMIT: i64 = 60;
+const ACTIVITY_DAYS: u64 = 30;
 static DATABASE_CREATION_LOCK: Mutex<()> = Mutex::new(());
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS transcripts (
@@ -193,6 +194,14 @@ pub struct DailyRecordingCount {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DailyActivity {
+    pub date: NaiveDate,
+    pub recordings: i64,
+    pub words: i64,
+    pub duration_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelRecordingStats {
     pub model: String,
     pub recordings: i64,
@@ -221,6 +230,12 @@ pub struct RecordingStats {
     pub today_words: i64,
     pub today_duration_ms: i64,
     pub daily_last_7: Vec<DailyRecordingCount>,
+    pub daily_last_30: Vec<DailyActivity>,
+    pub by_hour: [i64; 24],
+    pub average_duration_ms: Option<i64>,
+    pub median_duration_ms: Option<i64>,
+    pub this_week_words: i64,
+    pub last_week_words: i64,
     pub by_model: Vec<ModelRecordingStats>,
     pub latency: LatencyStats,
 }
@@ -842,6 +857,20 @@ impl Db {
                 day.count = count;
             }
         }
+        let daily_last_30 = self.daily_activity(today)?;
+        let by_hour = self.recordings_by_local_hour()?;
+        let durations = self
+            .conn
+            .prepare("SELECT duration_ms FROM recordings WHERE status = 'complete'")?
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let average_duration_ms =
+            (!durations.is_empty()).then(|| durations.iter().sum::<i64>() / durations.len() as i64);
+        let median_duration_ms = percentile(&durations, 0.5);
+        let words_in = |days: &[DailyActivity]| days.iter().map(|day| day.words).sum::<i64>();
+        let split = daily_last_30.len().saturating_sub(7);
+        let this_week_words = words_in(&daily_last_30[split..]);
+        let last_week_words = words_in(&daily_last_30[split.saturating_sub(7)..split]);
         let mut models = self.conn.prepare(
             "SELECT COALESCE(NULLIF(model, ''), 'unknown'), COUNT(*), SUM(duration_ms)
              FROM recordings WHERE status = 'complete'
@@ -879,9 +908,117 @@ impl Db {
             today_words,
             today_duration_ms,
             daily_last_7,
+            daily_last_30,
+            by_hour,
+            average_duration_ms,
+            median_duration_ms,
+            this_week_words,
+            last_week_words,
             by_model,
             latency,
         })
+    }
+
+    fn daily_activity(&self, today: NaiveDate) -> Result<Vec<DailyActivity>> {
+        let start = today
+            .checked_sub_days(Days::new(ACTIVITY_DAYS - 1))
+            .unwrap_or(today);
+        let mut days = (0..ACTIVITY_DAYS)
+            .filter_map(|offset| start.checked_add_days(Days::new(offset)))
+            .map(|date| DailyActivity {
+                date,
+                recordings: 0,
+                words: 0,
+                duration_ms: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut rows = self.conn.prepare(
+            "SELECT date(timestamp, 'localtime'), text, duration_ms FROM recordings
+             WHERE status = 'complete' AND date(timestamp, 'localtime') >= ?",
+        )?;
+        for row in rows.query_map(params![start.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })? {
+            let (date, text, duration_ms) = row?;
+            if let Ok(date) = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+                && let Some(day) = days.iter_mut().find(|day| day.date == date)
+            {
+                day.recordings += 1;
+                day.words += text.split_whitespace().count() as i64;
+                day.duration_ms += duration_ms;
+            }
+        }
+        Ok(days)
+    }
+
+    fn recordings_by_local_hour(&self) -> Result<[i64; 24]> {
+        let mut by_hour = [0; 24];
+        let mut rows = self.conn.prepare(
+            "SELECT CAST(strftime('%H', timestamp, 'localtime') AS INTEGER), COUNT(*)
+             FROM recordings WHERE status = 'complete'
+             GROUP BY 1",
+        )?;
+        for row in rows.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))? {
+            let (hour, count) = row?;
+            if let Some(bucket) = usize::try_from(hour).ok().and_then(|h| by_hour.get_mut(h)) {
+                *bucket = count;
+            }
+        }
+        Ok(by_hour)
+    }
+
+    /// Deletes a recording with its revisions, attempts, and the legacy rows
+    /// that would otherwise recreate it on the next legacy sync. Returns the
+    /// audio path when the recording existed and had one.
+    pub fn delete_recording(&self, recording_id: i64) -> Result<Option<PathBuf>> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| anyhow!("failed to start delete transaction: {e}"))?;
+        backfill_recordings(&tx)?;
+        let Some((audio_path, legacy_transcript_id, legacy_failed_id)) = tx
+            .query_row(
+                "SELECT audio_path, legacy_transcript_id, legacy_failed_id
+                 FROM recordings WHERE id = ?",
+                params![recording_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM transcripts WHERE id = ?",
+            params![legacy_transcript_id],
+        )?;
+        tx.execute(
+            "DELETE FROM failed_transcriptions WHERE id = ?",
+            params![legacy_failed_id],
+        )?;
+        tx.execute(
+            "DELETE FROM transcript_revisions WHERE recording_id = ?",
+            params![recording_id],
+        )?;
+        tx.execute(
+            "DELETE FROM transcription_attempts WHERE recording_id = ?",
+            params![recording_id],
+        )?;
+        tx.execute("DELETE FROM recordings WHERE id = ?", params![recording_id])?;
+        tx.commit()
+            .map_err(|e| anyhow!("failed to delete recording {recording_id}: {e}"))?;
+        Ok(audio_path
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from))
     }
 
     fn recording_summary(&self, id: i64) -> Result<Option<RecordingSummary>> {
@@ -1698,6 +1835,137 @@ mod tests {
         assert_eq!(stats.daily_last_7.last().unwrap().count, 4);
     }
 
+    fn local_instant(date: NaiveDate, hour: u32, minute: u32) -> DateTime<Utc> {
+        let naive = date.and_hms_opt(hour, minute, 0).unwrap();
+        Local
+            .from_local_datetime(&naive)
+            .earliest()
+            .expect("test hour exists in local time")
+            .with_timezone(&Utc)
+    }
+
+    fn set_timestamp(db: &Db, id: i64, at: DateTime<Utc>) {
+        db.conn
+            .execute(
+                "UPDATE recordings SET timestamp = ? WHERE id = ?",
+                params![sql_timestamp(at), id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stats_bucket_activity_by_local_day_and_hour() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        let today = Local::now().date_naive();
+        let day = |back: u64| today.checked_sub_days(Days::new(back)).unwrap();
+        struct Fixture {
+            days_back: u64,
+            hour: u32,
+            text: &'static str,
+            duration_ms: i64,
+        }
+        let fixtures = [
+            Fixture {
+                days_back: 0,
+                hour: 9,
+                text: "one two three",
+                duration_ms: 1_000,
+            },
+            Fixture {
+                days_back: 0,
+                hour: 14,
+                text: "four",
+                duration_ms: 3_000,
+            },
+            Fixture {
+                days_back: 1,
+                hour: 9,
+                text: "five six",
+                duration_ms: 5_000,
+            },
+            Fixture {
+                days_back: 8,
+                hour: 21,
+                text: "seven eight nine ten",
+                duration_ms: 7_000,
+            },
+            Fixture {
+                days_back: 29,
+                hour: 21,
+                text: "eleven",
+                duration_ms: 9_000,
+            },
+            Fixture {
+                days_back: 30,
+                hour: 21,
+                text: "outside window",
+                duration_ms: 11_000,
+            },
+        ];
+        for (index, fixture) in fixtures.iter().enumerate() {
+            let id = db
+                .save_transcript_attempt(
+                    fixture.duration_ms,
+                    fixture.text,
+                    &format!("/tmp/{index}.wav"),
+                    "m",
+                    Some(10),
+                )
+                .unwrap();
+            set_timestamp(
+                &db,
+                id,
+                local_instant(day(fixture.days_back), fixture.hour, 30),
+            );
+        }
+        let failed = db
+            .save_failed_attempt(99_000, Some("/tmp/failed.wav"), "boom", Some("m"), None)
+            .unwrap();
+        set_timestamp(&db, failed, local_instant(today, 9, 45));
+
+        let stats = db.get_stats().unwrap();
+
+        assert_eq!(stats.daily_last_30.len(), 30);
+        assert_eq!(stats.daily_last_30[0].date, day(29));
+        assert_eq!(stats.daily_last_30[29].date, today);
+        let expected = [
+            (0, 2, 4, 4_000),
+            (1, 1, 2, 5_000),
+            (8, 1, 4, 7_000),
+            (29, 1, 1, 9_000),
+            (2, 0, 0, 0),
+        ];
+        for (back, recordings, words, duration_ms) in expected {
+            let activity = &stats.daily_last_30[29 - back];
+            assert_eq!(activity.date, day(back as u64), "{back} days back");
+            assert_eq!(activity.recordings, recordings, "{back} days back");
+            assert_eq!(activity.words, words, "{back} days back");
+            assert_eq!(activity.duration_ms, duration_ms, "{back} days back");
+        }
+        assert_eq!(stats.by_hour.iter().sum::<i64>(), 6);
+        assert_eq!(stats.by_hour[9], 2);
+        assert_eq!(stats.by_hour[14], 1);
+        assert_eq!(stats.by_hour[21], 3);
+        assert_eq!(stats.this_week_words, 6);
+        assert_eq!(stats.last_week_words, 4);
+        assert_eq!(stats.average_duration_ms, Some(6_000));
+        assert_eq!(stats.median_duration_ms, Some(7_000));
+    }
+
+    #[test]
+    fn stats_duration_summary_is_empty_without_completed_recordings() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_failed_attempt(5_000, None, "boom", None, None)
+            .unwrap();
+        let stats = db.get_stats().unwrap();
+        assert_eq!(stats.average_duration_ms, None);
+        assert_eq!(stats.median_duration_ms, None);
+        assert_eq!(stats.by_hour, [0; 24]);
+        assert!(stats.daily_last_30.iter().all(|day| day.recordings == 0));
+    }
+
     #[test]
     fn local_day_start_skips_a_nonexistent_midnight() {
         let date = NaiveDate::from_ymd_opt(2026, 9, 18).unwrap();
@@ -1803,6 +2071,146 @@ mod tests {
             std::fs::metadata(db.path()).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    fn count(db: &Db, table: &str, column: &str, id: i64) -> i64 {
+        db.conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE {column} = ?"),
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn deletes_recordings_with_related_rows() {
+        struct Case {
+            name: &'static str,
+            save: fn(&Db) -> i64,
+            legacy_table: &'static str,
+        }
+        let cases = [
+            Case {
+                name: "complete recording",
+                save: |db| {
+                    let id = db
+                        .save_transcript_attempt(
+                            1_500,
+                            "hello",
+                            "/tmp/delete-me.wav",
+                            "m",
+                            Some(10),
+                        )
+                        .unwrap();
+                    db.append_revision(id, 0, "edited", "user").unwrap();
+                    id
+                },
+                legacy_table: "transcripts",
+            },
+            Case {
+                name: "failed recording",
+                save: |db| {
+                    let id = db
+                        .save_failed_attempt(
+                            1_500,
+                            Some("/tmp/delete-me.wav"),
+                            "boom",
+                            Some("m"),
+                            Some(10),
+                        )
+                        .unwrap();
+                    db.record_retry_failure(id, "boom again", "m", Some(20))
+                        .unwrap();
+                    id
+                },
+                legacy_table: "failed_transcriptions",
+            },
+        ];
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("app.db")).unwrap();
+            let keep = db
+                .save_transcript_attempt(900, "keep", "/tmp/keep.wav", "m", Some(5))
+                .unwrap();
+            let id = (case.save)(&db);
+            assert!(
+                count(&db, "transcript_revisions", "recording_id", id) > 0
+                    || count(&db, "transcription_attempts", "recording_id", id) > 0
+            );
+            let legacy_rows: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", case.legacy_table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let removed = db.delete_recording(id).unwrap();
+
+            assert_eq!(
+                removed,
+                Some(PathBuf::from("/tmp/delete-me.wav")),
+                "{}",
+                case.name
+            );
+            assert_eq!(count(&db, "recordings", "id", id), 0, "{}", case.name);
+            assert_eq!(
+                count(&db, "transcript_revisions", "recording_id", id),
+                0,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                count(&db, "transcription_attempts", "recording_id", id),
+                0,
+                "{}",
+                case.name
+            );
+            let remaining_legacy: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {}", case.legacy_table),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(remaining_legacy, legacy_rows - 1, "{}", case.name);
+            assert!(db.get_recording(keep).unwrap().is_some(), "{}", case.name);
+
+            let page = db.get_history(&HistoryQuery::default()).unwrap();
+            assert_eq!(page.total, 1, "{}", case.name);
+            assert_eq!(page.recordings[0].id, keep, "{}", case.name);
+            assert!(
+                db.get_recording(id).unwrap().is_none(),
+                "{}: legacy sync must not recreate the deleted recording",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_missing_recording_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        db.save_transcript(1_500, "hello", "/tmp/a.wav", "m")
+            .unwrap();
+        for id in [0, 42, -1] {
+            assert_eq!(db.delete_recording(id).unwrap(), None, "id {id}");
+        }
+        assert_eq!(db.get_history(&HistoryQuery::default()).unwrap().total, 1);
+    }
+
+    #[test]
+    fn deletion_returns_no_path_for_recordings_without_audio() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        let id = db
+            .save_failed_attempt(500, None, "capture failed", None, None)
+            .unwrap();
+        assert_eq!(db.delete_recording(id).unwrap(), None);
+        assert!(db.get_recording(id).unwrap().is_none());
     }
 
     #[test]

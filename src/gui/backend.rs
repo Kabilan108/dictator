@@ -2,12 +2,14 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::Instant;
 
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use crate::ipc::{Client, DaemonState};
 use crate::storage::{
-    Db, HistoryFilter, HistoryQuery, RecordingDetail, RecordingStats, RecordingStatus,
+    DailyActivity, Db, HistoryFilter, HistoryQuery, RecordingDetail, RecordingStats,
+    RecordingStatus,
 };
 
 const PAGE_SIZE: usize = 50;
@@ -71,6 +73,12 @@ pub struct Stats {
     pub today_words: i64,
     pub today_duration_ms: i64,
     pub daily: Vec<(NaiveDate, i64)>,
+    pub daily_last_30: Vec<DailyActivity>,
+    pub by_hour: [i64; 24],
+    pub average_duration_ms: Option<i64>,
+    pub median_duration_ms: Option<i64>,
+    pub this_week_words: i64,
+    pub last_week_words: i64,
     pub models: Vec<(String, i64, i64, Option<i64>)>,
     pub latency_samples: Vec<i64>,
     pub p50: Option<i64>,
@@ -97,6 +105,8 @@ pub struct ManagedSettings {
     pub max_duration_minutes: i64,
     pub paste_shortcut: String,
     pub notifications: String,
+    pub shortcut_toggle: String,
+    pub shortcut_cancel: String,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +127,14 @@ pub struct Status {
     pub last_recording_generation: u64,
     pub audio_level_rms: f32,
     pub audio_level_peak: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectionReport {
+    pub daemon: Result<(), String>,
+    pub provider: Result<String, String>,
+    pub endpoint_host: String,
+    pub checked_at: DateTime<Utc>,
 }
 
 #[derive(Debug)]
@@ -144,8 +162,16 @@ pub enum Request {
     Toggle,
     Cancel,
     Retry(i64),
+    Delete(i64),
+    CheckConnection,
+    Recent {
+        limit: usize,
+    },
 }
 
+/// Replies cross an mpsc channel a few times per second, so the size spread
+/// between `Stats` and the small variants does not matter.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Reply {
     History(Result<Page, String>),
@@ -155,6 +181,9 @@ pub enum Reply {
     Microphones(Result<Vec<Microphone>, String>),
     Status(Result<Status, String>),
     Action(Result<(), String>),
+    Deleted(Result<i64, String>),
+    Connection(Result<ConnectionReport, String>),
+    Recent(Result<Vec<Recording>, String>),
 }
 
 pub struct Backend {
@@ -168,13 +197,14 @@ impl Backend {
         let (request_tx, request_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let managed_settings = read_managed_settings(demo);
+        let endpoint = managed_settings.endpoint.clone();
         thread::Builder::new()
             .name("dictator-gui-backend".to_string())
             .spawn(move || {
                 if demo {
                     run_demo_worker(request_rx, reply_tx);
                 } else {
-                    run_live_worker(request_rx, reply_tx);
+                    run_live_worker(request_rx, reply_tx, endpoint);
                 }
             })
             .expect("failed to start GUI backend worker");
@@ -198,7 +228,7 @@ impl Backend {
     }
 }
 
-fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
+fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, endpoint: String) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -216,9 +246,9 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
         let kind = live_request_kind(&request);
         reopen_database_for_request(&request, &mut db, &mut db_error, open_database);
         let reply = if let Some(db) = db.as_ref() {
-            handle_live(db, &runtime, request)
+            handle_live(db, &runtime, &endpoint, request)
         } else if kind == LiveRequestKind::Service {
-            handle_live_service(&runtime, request)
+            handle_live_service(&runtime, &endpoint, request)
         } else {
             failed_reply(request, &db_error)
         };
@@ -237,10 +267,10 @@ enum LiveRequestKind {
 
 fn live_request_kind(request: &Request) -> LiveRequestKind {
     match request {
-        Request::History { .. } | Request::Detail(_) | Request::Stats => {
+        Request::History { .. } | Request::Detail(_) | Request::Stats | Request::Recent { .. } => {
             LiveRequestKind::DatabaseRead
         }
-        Request::SaveRevision { .. } | Request::RestoreRevision { .. } => {
+        Request::SaveRevision { .. } | Request::RestoreRevision { .. } | Request::Delete(_) => {
             LiveRequestKind::DatabaseMutation
         }
         Request::Microphones
@@ -248,7 +278,8 @@ fn live_request_kind(request: &Request) -> LiveRequestKind {
         | Request::Status
         | Request::Toggle
         | Request::Cancel
-        | Request::Retry(_) => LiveRequestKind::Service,
+        | Request::Retry(_)
+        | Request::CheckConnection => LiveRequestKind::Service,
     }
 }
 
@@ -300,6 +331,7 @@ fn failed_reply(request: Request, message: &str) -> Reply {
             Reply::Saved(Err(message.to_string()))
         }
         Request::Stats => Reply::Stats(Err(message.to_string())),
+        Request::Recent { .. } => Reply::Recent(Err(message.to_string())),
         Request::Microphones | Request::ReorderMicrophones(_) => {
             Reply::Microphones(Err(message.to_string()))
         }
@@ -307,10 +339,17 @@ fn failed_reply(request: Request, message: &str) -> Reply {
         Request::Toggle | Request::Cancel | Request::Retry(_) => {
             Reply::Action(Err(message.to_string()))
         }
+        Request::Delete(_) => Reply::Deleted(Err(message.to_string())),
+        Request::CheckConnection => Reply::Connection(Err(message.to_string())),
     }
 }
 
-fn handle_live(db: &Db, runtime: &tokio::runtime::Runtime, request: Request) -> Reply {
+fn handle_live(
+    db: &Db,
+    runtime: &tokio::runtime::Runtime,
+    endpoint: &str,
+    request: Request,
+) -> Reply {
     match request {
         Request::History {
             search,
@@ -383,11 +422,86 @@ fn handle_live(db: &Db, runtime: &tokio::runtime::Runtime, request: Request) -> 
                 .map(map_stats)
                 .map_err(|error| error.to_string()),
         ),
-        request => handle_live_service(runtime, request),
+        Request::Recent { limit } => Reply::Recent(
+            db.get_history(&HistoryQuery {
+                limit: limit.max(1),
+                ..HistoryQuery::default()
+            })
+            .map(|page| page.recordings.into_iter().map(map_recording).collect())
+            .map_err(|error| error.to_string()),
+        ),
+        Request::Delete(id) => Reply::Deleted(
+            db.delete_recording(id)
+                .map(|audio_path| {
+                    if let Some(path) = audio_path {
+                        remove_audio_file(&path);
+                    }
+                    id
+                })
+                .map_err(|error| error.to_string()),
+        ),
+        request => handle_live_service(runtime, endpoint, request),
     }
 }
 
-fn handle_live_service(runtime: &tokio::runtime::Runtime, request: Request) -> Reply {
+fn remove_audio_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to remove recording audio");
+        }
+    }
+}
+
+async fn probe_provider(endpoint: &str) -> Result<String, String> {
+    if endpoint.trim().is_empty() {
+        return Err("no provider endpoint configured".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let started = Instant::now();
+    match client.get(endpoint.trim()).send().await {
+        Ok(response) => Ok(format!(
+            "HTTP {} in {} ms",
+            response.status().as_u16(),
+            started.elapsed().as_millis()
+        )),
+        Err(error) => Err(short_request_error(&error)),
+    }
+}
+
+fn endpoint_host(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint.trim())
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+fn short_request_error(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_builder() {
+        "invalid endpoint"
+    } else {
+        "request failed"
+    };
+    let mut source: &dyn std::error::Error = error;
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    format!("{kind}: {source}")
+}
+
+fn handle_live_service(
+    runtime: &tokio::runtime::Runtime,
+    endpoint: &str,
+    request: Request,
+) -> Reply {
     match request {
         Request::Microphones => Reply::Microphones(
             crate::audio::microphone_preferences()
@@ -424,10 +538,27 @@ fn handle_live_service(runtime: &tokio::runtime::Runtime, request: Request) -> R
                 .and_then(response_result)
                 .map_err(|error| error.to_string()),
         ),
+        Request::CheckConnection => Reply::Connection(Ok(runtime.block_on(async {
+            let daemon = Client::new()
+                .status()
+                .await
+                .and_then(parse_status)
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+            let provider = probe_provider(endpoint).await;
+            ConnectionReport {
+                daemon,
+                provider,
+                endpoint_host: endpoint_host(endpoint),
+                checked_at: Utc::now(),
+            }
+        }))),
         Request::History { .. }
         | Request::Detail(_)
         | Request::SaveRevision { .. }
         | Request::RestoreRevision { .. }
+        | Request::Delete(_)
+        | Request::Recent { .. }
         | Request::Stats => unreachable!("database request routed to service handler"),
     }
 }
@@ -587,6 +718,12 @@ fn map_stats(stats: RecordingStats) -> Stats {
             .into_iter()
             .map(|day| (day.date, day.count))
             .collect(),
+        daily_last_30: stats.daily_last_30,
+        by_hour: stats.by_hour,
+        average_duration_ms: stats.average_duration_ms,
+        median_duration_ms: stats.median_duration_ms,
+        this_week_words: stats.this_week_words,
+        last_week_words: stats.last_week_words,
         models: stats
             .by_model
             .into_iter()
@@ -627,6 +764,8 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
+            shortcut_toggle: "Super+Shift+D".to_string(),
+            shortcut_cancel: "Super+Shift+Escape".to_string(),
         };
     }
     let config_path = crate::utils::CONFIG_DIR.join("config.json");
@@ -648,6 +787,8 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
+            shortcut_toggle: String::new(),
+            shortcut_cancel: String::new(),
         })
 }
 
@@ -665,6 +806,8 @@ fn parse_managed_settings(
         audio: ReadOnlyAudio,
         #[serde(default)]
         typing: ReadOnlyTyping,
+        #[serde(default)]
+        shortcuts: crate::utils::ShortcutHints,
     }
     #[derive(Default, serde::Deserialize)]
     struct ReadOnlyApi {
@@ -731,6 +874,8 @@ fn parse_managed_settings(
         } else {
             config.notifications
         },
+        shortcut_toggle: config.shortcuts.toggle,
+        shortcut_cancel: config.shortcuts.cancel,
     })
 }
 
@@ -882,6 +1027,9 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
                 Reply::Saved(result)
             }
             Request::Stats => Reply::Stats(Ok(demo_stats(&recordings))),
+            Request::Recent { limit } => {
+                Reply::Recent(Ok(recordings.iter().take(limit).cloned().collect()))
+            }
             Request::Microphones => Reply::Microphones(Ok(microphones.clone())),
             Request::ReorderMicrophones(ids) => {
                 microphones.sort_by_key(|microphone| {
@@ -911,6 +1059,23 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
                 Reply::Action(Ok(()))
             }
             Request::Retry(_) => Reply::Action(Ok(())),
+            Request::Delete(id) => {
+                let position = recordings.iter().position(|recording| recording.id == id);
+                Reply::Deleted(match position {
+                    Some(index) => {
+                        recordings.remove(index);
+                        revision_history.remove(&id);
+                        Ok(id)
+                    }
+                    None => Err("recording not found".to_string()),
+                })
+            }
+            Request::CheckConnection => Reply::Connection(Ok(ConnectionReport {
+                daemon: Ok(()),
+                provider: Ok("HTTP 405 in 84 ms".to_string()),
+                endpoint_host: "siren.example.test".to_string(),
+                checked_at: Utc::now(),
+            })),
         };
         if replies.send(reply).is_err() {
             break;
@@ -1049,6 +1214,25 @@ fn demo_stats(recordings: &[Recording]) -> Stats {
             .rev()
             .map(|days| (today - Duration::days(days), 16 + days * 7))
             .collect(),
+        daily_last_30: (0..30)
+            .rev()
+            .map(|days| DailyActivity {
+                date: today - Duration::days(days),
+                recordings: 12 + (days * 5) % 17,
+                words: 180 + (days * 71) % 260,
+                duration_ms: 90_000 + (days * 13_000) % 120_000,
+            })
+            .collect(),
+        by_hour: std::array::from_fn(|hour| match hour {
+            9..=11 => 140 + hour as i64 * 9,
+            12..=17 => 90 + hour as i64 * 4,
+            18..=21 => 30,
+            _ => 4,
+        }),
+        average_duration_ms: Some(9_800),
+        median_duration_ms: Some(8_400),
+        this_week_words: 2_140,
+        last_week_words: 1_870,
         models: vec![
             (
                 "whisper-large-v3-turbo".to_string(),
@@ -1166,7 +1350,8 @@ mod tests {
                 }
             },
             "audio": { "max_duration_min": 9 },
-            "typing": { "shortcut": "ctrl_v" }
+            "typing": { "shortcut": "ctrl_v" },
+            "shortcuts": { "toggle": "Super+D" }
         }"#;
 
         let settings = parse_managed_settings(&json[..], true).expect("valid projection");
@@ -1179,6 +1364,8 @@ mod tests {
         assert_eq!(settings.max_duration_minutes, 9);
         assert_eq!(settings.paste_shortcut, "ctrl_v");
         assert_eq!(settings.notifications, "all");
+        assert_eq!(settings.shortcut_toggle, "Super+D");
+        assert_eq!(settings.shortcut_cancel, "");
         assert!(!format!("{settings:?}").contains("must-not-enter-gui-state"));
     }
 
@@ -1274,5 +1461,190 @@ mod tests {
             live_request_kind(&Request::Microphones),
             LiveRequestKind::Service
         );
+    }
+
+    #[tokio::test]
+    async fn provider_probe_counts_any_http_response_as_reachable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!(
+            "http://{}/v1/audio/transcriptions",
+            listener.local_addr().unwrap()
+        );
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 1024];
+            let _ = stream.read(&mut buffer).await;
+            stream
+                .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let report = probe_provider(&endpoint).await.expect("405 is reachable");
+        assert!(report.starts_with("HTTP 405 in "), "{report}");
+        assert!(report.ends_with(" ms"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn provider_probe_reports_closed_port_and_missing_endpoint() {
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}/v1", closed.local_addr().unwrap());
+        drop(closed);
+
+        let error = probe_provider(&endpoint).await.unwrap_err();
+        assert!(error.starts_with("connection failed: "), "{error}");
+        assert_eq!(
+            probe_provider("  ").await.unwrap_err(),
+            "no provider endpoint configured"
+        );
+    }
+
+    #[test]
+    fn delete_and_connection_requests_route_like_their_peers() {
+        assert_eq!(
+            live_request_kind(&Request::Delete(7)),
+            LiveRequestKind::DatabaseMutation
+        );
+        assert_eq!(
+            live_request_kind(&Request::CheckConnection),
+            LiveRequestKind::Service
+        );
+        assert!(matches!(
+            failed_reply(Request::Delete(7), "down"),
+            Reply::Deleted(Err(error)) if error == "down"
+        ));
+        assert!(matches!(
+            failed_reply(Request::CheckConnection, "down"),
+            Reply::Connection(Err(error)) if error == "down"
+        ));
+    }
+
+    #[test]
+    fn endpoint_host_extracts_the_host_or_nothing() {
+        assert_eq!(
+            endpoint_host("https://siren.example.test/v1/audio/transcriptions"),
+            "siren.example.test"
+        );
+        assert_eq!(endpoint_host("http://127.0.0.1:8080/v1"), "127.0.0.1");
+        assert_eq!(endpoint_host(""), "");
+        assert_eq!(endpoint_host("not a url"), "");
+    }
+
+    #[test]
+    fn recent_requests_read_the_database_and_fail_in_kind() {
+        assert_eq!(
+            live_request_kind(&Request::Recent { limit: 5 }),
+            LiveRequestKind::DatabaseRead
+        );
+        assert!(matches!(
+            failed_reply(Request::Recent { limit: 5 }, "down"),
+            Reply::Recent(Err(error)) if error == "down"
+        ));
+    }
+
+    #[test]
+    fn live_recent_returns_newest_first_with_all_statuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        db.save_transcript_attempt(1_000, "older", "/tmp/older.wav", "m", Some(10))
+            .unwrap();
+        let failed = db
+            .save_failed_attempt(500, Some("/tmp/failed.wav"), "boom", Some("m"), None)
+            .unwrap();
+
+        let Reply::Recent(Ok(recent)) =
+            handle_live(&db, &runtime, "", Request::Recent { limit: 1 })
+        else {
+            panic!("expected recent reply");
+        };
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, failed);
+        assert!(recent[0].failed);
+
+        let Reply::Recent(Ok(all)) = handle_live(&db, &runtime, "", Request::Recent { limit: 0 })
+        else {
+            panic!("expected recent reply");
+        };
+        assert_eq!(all.len(), 1, "a zero limit is clamped to one");
+    }
+
+    #[test]
+    fn demo_recent_returns_at_most_limit_recordings() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+
+        request_tx.send(Request::Recent { limit: 3 }).unwrap();
+        let Reply::Recent(Ok(recent)) = reply_rx.recv().unwrap() else {
+            panic!("expected recent reply");
+        };
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].id, 10_000);
+
+        drop(request_tx);
+        worker.join().expect("demo worker exits cleanly");
+    }
+
+    #[test]
+    fn live_delete_removes_the_audio_file_best_effort() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("app.db")).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let audio = dir.path().join("clip.wav");
+        std::fs::write(&audio, b"wav").unwrap();
+        let id = db
+            .save_transcript_attempt(1_000, "text", audio.to_str().unwrap(), "m", Some(10))
+            .unwrap();
+        let missing_audio = db
+            .save_transcript_attempt(
+                1_000,
+                "text",
+                dir.path().join("gone.wav").to_str().unwrap(),
+                "m",
+                Some(10),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            handle_live(&db, &runtime, "", Request::Delete(id)),
+            Reply::Deleted(Ok(deleted)) if deleted == id
+        ));
+        assert!(!audio.exists());
+        assert!(matches!(
+            handle_live(&db, &runtime, "", Request::Delete(missing_audio)),
+            Reply::Deleted(Ok(deleted)) if deleted == missing_audio
+        ));
+        assert!(
+            matches!(
+                handle_live(&db, &runtime, "", Request::Delete(id)),
+                Reply::Deleted(Ok(deleted)) if deleted == id
+            ),
+            "deleting an already-deleted recording is idempotent"
+        );
+    }
+
+    #[test]
+    fn demo_delete_removes_the_recording() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+
+        request_tx.send(Request::Delete(10_001)).unwrap();
+        assert!(matches!(reply_rx.recv(), Ok(Reply::Deleted(Ok(10_001)))));
+        request_tx.send(Request::Detail(10_001)).unwrap();
+        assert!(matches!(reply_rx.recv(), Ok(Reply::Detail(Err(_)))));
+        request_tx.send(Request::Delete(10_001)).unwrap();
+        assert!(matches!(reply_rx.recv(), Ok(Reply::Deleted(Err(_)))));
+
+        drop(request_tx);
+        worker.join().expect("demo worker exits cleanly");
     }
 }

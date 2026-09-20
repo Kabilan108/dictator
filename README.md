@@ -419,9 +419,15 @@ Configuration file location: `$XDG_CONFIG_HOME/dictator/config.json`, defaulting
     "niri_app_shortcuts": {
       "com.t3tools.T3Code": "ctrl_v"
     }
+  },
+  "shortcuts": {
+    "toggle": "Super+T",
+    "cancel": "F3"
   }
 }
 ```
+
+The optional `shortcuts` block is display-only. The daemon does not bind keys; your compositor does. The desktop app shows these labels on its Dictation tab so the bindings you configured elsewhere are visible next to the record button.
 
 Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording.
 

@@ -16,6 +16,18 @@ pub struct Config {
     pub audio: AudioConfig,
     #[serde(default)]
     pub typing: TypingConfig,
+    #[serde(default)]
+    pub shortcuts: ShortcutHints,
+}
+
+/// Human-readable key bindings shown by the GUI. The daemon does not bind
+/// keys itself; the compositor or hotkey daemon owns them.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ShortcutHints {
+    #[serde(default)]
+    pub toggle: String,
+    #[serde(default)]
+    pub cancel: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +126,7 @@ pub fn default_config() -> Config {
             max_duration_min: 5,
         },
         typing: TypingConfig::default(),
+        shortcuts: ShortcutHints::default(),
     }
 }
 
@@ -440,10 +453,20 @@ mod tests {
     fn legacy_config_without_typing_uses_defaults() {
         let mut value = serde_json::to_value(default_config()).unwrap();
         value.as_object_mut().unwrap().remove("typing");
+        value.as_object_mut().unwrap().remove("shortcuts");
 
         let cfg: Config = serde_json::from_value(value).unwrap();
 
         assert_eq!(cfg.typing, TypingConfig::default());
+        assert_eq!(cfg.shortcuts, ShortcutHints::default());
+    }
+
+    #[test]
+    fn parses_partial_shortcut_hints() {
+        let hints: ShortcutHints =
+            serde_json::from_value(serde_json::json!({"toggle": "Super+D"})).unwrap();
+        assert_eq!(hints.toggle, "Super+D");
+        assert_eq!(hints.cancel, "");
     }
 
     #[test]
