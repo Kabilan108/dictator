@@ -30,7 +30,7 @@ CLI compatibility tests run with GUI features enabled as well.
 Tested with real GPUI windows at 1120×700 and the tray popup at 340×510:
 
 - Dictation, History, Stats, and Settings render with bundled IBM Plex Mono and
-  Instrument Serif. Dictation is the default tab. Stats fits within the default
+  Geist. Dictation is the default tab. Stats fits within the default
   window: five summary tiles, 30-day activity and time-of-day charts, then the
   latency histogram beside recording-length figures and the model table.
 - Dictation: Start recording drove the live daemon through the same toggle IPC

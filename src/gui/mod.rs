@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    AnyWindowHandle, App, Application, Bounds, Context, Entity, Global, IntoElement, Subscription,
-    Timer, Window, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px, size,
+    AnyWindowHandle, App, Application, Bounds, Context, Entity, Global, IntoElement, Rgba,
+    Subscription, Timer, Window, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px,
+    size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{Icon, IconName, Root, Theme, ThemeMode};
@@ -93,9 +94,7 @@ pub fn run(options: GuiOptions) -> Result<()> {
         cx.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf")),
-                Cow::Borrowed(include_bytes!(
-                    "../../assets/fonts/InstrumentSerif-Regular.ttf"
-                )),
+                Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Medium.ttf")),
             ])
             .expect("failed to load Dictator fonts");
 
@@ -763,7 +762,7 @@ impl MainView {
             .child(
                 div()
                     .font_family(FONT_DISPLAY)
-                    .text_size(px(18.))
+                    .text_size(px(16.))
                     .mr(px(10.))
                     .child("Dictator"),
             );
@@ -872,17 +871,17 @@ impl MainView {
                             .pt(px(14.))
                             .pb(px(4.))
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(16.))
+                            .text_size(px(14.))
                             .text_color(TEXT)
                             .child(format_date(recording.timestamp)),
                     );
                 }
-                let text = if recording.failed {
-                    recording.error.clone()
+                let text = single_line(if recording.failed {
+                    &recording.error
                 } else {
-                    recording.text.clone()
-                };
-                let empty = text.trim().is_empty();
+                    &recording.text
+                });
+                let empty = text.is_empty();
                 list = list.child(
                     div()
                         .id(("recording", id as u64))
@@ -1098,7 +1097,7 @@ impl MainView {
                         .child(
                             div()
                                 .font_family(FONT_DISPLAY)
-                                .text_size(px(25.))
+                                .text_size(px(22.))
                                 .text_color(RED)
                                 .child("Failed recording"),
                         )
@@ -1186,9 +1185,7 @@ impl MainView {
             .map(|revision| revision.text.as_str())
             .unwrap_or(recording.text.as_str());
         let current_text = self.editor.read(cx).value();
-        let changed = original
-            .split_whitespace()
-            .ne(current_text.split_whitespace());
+        let changed = original != current_text.as_ref();
         div()
             .flex_1()
             .min_w_0()
@@ -1203,7 +1200,7 @@ impl MainView {
                     .child(
                         div()
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(23.))
+                            .text_size(px(20.))
                             .child(format_date(recording.timestamp)),
                     )
                     .child(
@@ -1260,7 +1257,7 @@ impl MainView {
                                 .child(self.render_diff(original, current_text.as_ref()))
                             }),
                     )
-                    .child(self.render_metadata(&detail)),
+                    .child(self.render_metadata(&detail, cx)),
             )
             .child(
                 div()
@@ -1396,61 +1393,102 @@ impl MainView {
             None => "Daemon unavailable".to_string(),
         };
         let state_color = match state {
-            Some(DaemonState::Recording) => RED,
+            Some(DaemonState::Recording) | Some(DaemonState::Error) => RED,
             Some(DaemonState::Transcribing) | Some(DaemonState::Typing) => BLUE,
-            Some(DaemonState::Error) => RED,
             Some(DaemonState::Idle) => GREEN,
             None => MUTED,
         };
-        let toggle_hint = if settings.shortcut_toggle.is_empty() {
-            "No shortcut configured".to_string()
-        } else {
-            settings.shortcut_toggle.clone()
-        };
-        let cancel_hint = if settings.shortcut_cancel.is_empty() {
-            None
-        } else {
-            Some(settings.shortcut_cancel.clone())
-        };
-        let latest = self
-            .recent
-            .iter()
-            .find(|recording| !recording.failed)
-            .cloned();
-        let recent = self.recent.clone();
         let connection = self.connection.clone();
         let checking = self.connection_pending;
-        let notice = self.notice.clone();
+        let host = settings_host(&connection, &settings.endpoint);
+        let daemon_line = match &status {
+            Some(status) => format!("daemon up {}", format_uptime(status.uptime_seconds)),
+            None => "daemon not running".to_string(),
+        };
+        let provider_line = match &connection {
+            Some(report) => match &report.provider {
+                Ok(detail) => format!("{host} · {detail}"),
+                Err(error) => format!("{host} · {error}"),
+            },
+            None if checking => format!("{host} · checking..."),
+            None => format!("{host} · not checked"),
+        };
+        let provider_ok = connection.as_ref().map(|report| report.provider.is_ok());
+        let status_strip = div()
+            .flex()
+            .items_center()
+            .gap(px(18.))
+            .px(px(28.))
+            .h(px(36.))
+            .bg(MANTLE)
+            .border_b_1()
+            .border_color(LINE)
+            .text_size(px(12.))
+            .text_color(SUBTEXT)
+            .child(status_pill(daemon_line, Some(connected)))
+            .child(status_pill(
+                format!("{} · {}", settings.provider, settings.model),
+                None,
+            ))
+            .child(status_pill(provider_line, provider_ok))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("check-connection")
+                    .px(px(8.))
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .text_color(MUTED)
+                    .cursor_pointer()
+                    .hover(|this| this.bg(SURFACE_2).text_color(TEXT))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.check_connection();
+                        cx.notify();
+                    }))
+                    .child(if checking {
+                        "Checking..."
+                    } else {
+                        "Check connection"
+                    }),
+            );
 
-        let record_card = card()
-            .flex_1()
-            .min_w_0()
-            .child(section_heading("RECORD"))
+        let hint = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        let toggle_hint = hint(&settings.shortcut_toggle);
+        let cancel_hint = hint(&settings.shortcut_cancel);
+        let record_panel = div()
+            .w_full()
+            .max_w(px(720.))
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(16.))
+            .pt(px(28.))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(px(10.))
-                    .child(div().size(px(8.)).rounded_full().bg(state_color))
+                    .child(div().size(px(9.)).rounded_full().bg(state_color))
                     .child(
                         div()
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(24.))
+                            .text_size(px(26.))
                             .child(state_label),
                     ),
             )
-            .child(render_meter(recording, rms, peak))
+            .child(div().w_full().child(render_meter(recording, rms, peak)))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(px(10.))
                     .child(
                         div()
                             .id("dictation-toggle")
-                            .px(px(14.))
-                            .py(px(8.))
+                            .px(px(18.))
+                            .py(px(9.))
                             .rounded(px(4.))
+                            .text_size(px(13.))
                             .bg(if recording { SURFACE_2 } else { BLUE })
                             .text_color(if recording { TEXT } else { BG })
                             .when(!connected || transcribing, |this| this.opacity(0.5))
@@ -1467,6 +1505,7 @@ impl MainView {
                                 "Start recording"
                             }),
                     )
+                    .when_some(toggle_hint, |this, hint| this.child(key_hint(hint)))
                     .when(busy, |this| {
                         this.child(action_button(
                             "Cancel",
@@ -1475,96 +1514,133 @@ impl MainView {
                                 cx.notify();
                             }),
                         ))
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .items_end()
-                            .text_size(px(11.))
-                            .text_color(MUTED)
-                            .child(div().flex().gap(px(6.)).child("toggle").child(key_hint(toggle_hint)))
-                            .when_some(cancel_hint, |this, hint| {
-                                this.child(div().flex().gap(px(6.)).mt(px(4.)).child("cancel").child(key_hint(hint)))
-                            }),
-                    ),
-            )
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .line_height(gpui::relative(1.6))
-                    .text_color(SUBTEXT)
-                    .child("Press the toggle shortcut, speak, press it again. The transcript is pasted into the focused window, copied to the clipboard, and saved to history. Recordings started from this window are saved the same way."),
+                        .when_some(cancel_hint, |this, hint| this.child(key_hint(hint)))
+                    }),
             );
 
-        let daemon_line = match &status {
-            Some(status) => format!("Connected · up {}", format_uptime(status.uptime_seconds)),
-            None => "Not running".to_string(),
-        };
-        let provider_line = match &connection {
-            Some(report) => match &report.provider {
-                Ok(detail) => format!("Reachable · {detail}"),
-                Err(error) => format!("Unreachable · {error}"),
-            },
-            None if checking => "Checking...".to_string(),
-            None => "Not checked yet".to_string(),
-        };
-        let provider_ok = connection.as_ref().map(|report| report.provider.is_ok());
-        let checked_line = connection
-            .as_ref()
-            .map(|report| format!("Checked {}", format_time(report.checked_at)))
-            .unwrap_or_default();
-        let status_card = card()
-            .w(px(340.))
-            .flex_none()
-            .child(section_heading("STATUS"))
-            .child(status_row("Daemon", daemon_line, Some(connected)))
-            .child(status_row(
-                "Provider",
-                format!("{} · {}", settings.provider, settings.model),
-                None,
-            ))
-            .child(status_row(
-                &settings_host(&connection, &settings.endpoint),
-                provider_line,
-                provider_ok,
-            ))
-            .child(div().flex_1())
+        let latest = self
+            .recent
+            .iter()
+            .find(|recording| !recording.failed)
+            .cloned();
+        let latest_id = latest.as_ref().map(|recording| recording.id);
+        let last_result = latest.map(|recording| {
+            let copy_text = recording.text.clone();
+            let id = recording.id;
+            div()
+                .w_full()
+                .max_w(px(720.))
+                .flex()
+                .items_start()
+                .gap(px(12.))
+                .px(px(14.))
+                .py(px(12.))
+                .bg(MANTLE)
+                .border_1()
+                .border_color(LINE)
+                .rounded(px(6.))
+                .child(
+                    div()
+                        .id("copy-last-result")
+                        .flex_none()
+                        .mt(px(2.))
+                        .p(px(6.))
+                        .rounded(px(4.))
+                        .text_color(MUTED)
+                        .cursor_pointer()
+                        .hover(|this| this.bg(SURFACE_2).text_color(TEXT))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_text.clone(),
+                            ));
+                            this.notice = "Copied".to_string();
+                            cx.notify();
+                        }))
+                        .child(Icon::new(IconName::Copy).size(px(15.))),
+                )
+                .child(
+                    div()
+                        .id("last-result-text")
+                        .flex_1()
+                        .min_w_0()
+                        .max_h(px(96.))
+                        .overflow_y_scroll()
+                        .text_size(px(14.))
+                        .line_height(gpui::relative(1.5))
+                        .text_color(TEXT)
+                        .child(if recording.text.trim().is_empty() {
+                            "No speech was transcribed.".to_string()
+                        } else {
+                            recording.text.clone()
+                        }),
+                )
+                .child(
+                    div()
+                        .id("open-last-result")
+                        .flex_none()
+                        .text_size(px(11.))
+                        .text_color(MUTED)
+                        .cursor_pointer()
+                        .hover(|this| this.text_color(TEXT))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.reveal_recording(id, window, cx);
+                            cx.notify();
+                        }))
+                        .child(format!("#{id}")),
+                )
+        });
+
+        let recent: Vec<_> = self
+            .recent
+            .iter()
+            .filter(|recording| Some(recording.id) != latest_id)
+            .cloned()
+            .collect();
+        let mut recent_list = div()
+            .w_full()
+            .max_w(px(720.))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.))
-                    .child(action_button(
-                        "Check connection",
-                        cx.listener(|this, _, _, cx| {
-                            this.check_connection();
-                            cx.notify();
-                        }),
-                    ))
+                    .pb(px(6.))
+                    .child(section_heading("RECENT"))
+                    .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .id("open-all-history")
+                            .text_size(px(11.))
                             .text_color(MUTED)
-                            .child(checked_line),
+                            .cursor_pointer()
+                            .hover(|this| this.text_color(TEXT))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_tab(Tab::History);
+                                cx.notify();
+                            }))
+                            .child("Open history"),
                     ),
             );
-
-        let mut recent_list = div().flex().flex_col().flex_1().min_h_0().overflow_hidden();
         if recent.is_empty() {
-            recent_list = recent_list.child(div().text_color(MUTED).child("No recordings yet."));
+            recent_list = recent_list.child(div().text_color(MUTED).child("No other recordings."));
         }
         for recording in recent {
             let id = recording.id;
             let copy_text = recording.text.clone();
             let failed = recording.failed;
-            let body = if failed {
-                recording.error.clone()
-            } else if recording.text.trim().is_empty() {
+            let body = single_line(if failed {
+                &recording.error
+            } else {
+                &recording.text
+            });
+            let body = if body.is_empty() {
                 "No speech was transcribed".to_string()
             } else {
-                recording.text.clone()
+                body
             };
             recent_list = recent_list.child(
                 div()
@@ -1626,134 +1702,26 @@ impl MainView {
                     }),
             );
         }
-        let recent_card = card()
-            .flex_1()
-            .min_w_0()
-            .min_h_0()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .child(section_heading("RECENT DICTATIONS"))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("open-all-history")
-                            .text_size(px(11.))
-                            .text_color(MUTED)
-                            .cursor_pointer()
-                            .hover(|this| this.text_color(TEXT))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.set_tab(Tab::History);
-                                cx.notify();
-                            }))
-                            .child("Open history"),
-                    ),
-            )
-            .child(recent_list);
-
-        let latest_card = card()
-            .w(px(340.))
-            .flex_none()
-            .min_h_0()
-            .child(section_heading("LAST RESULT"))
-            .child(match &latest {
-                Some(recording) => div()
-                    .id("latest-result")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .text_size(px(15.))
-                    .line_height(gpui::relative(1.5))
-                    .text_color(TEXT)
-                    .child(if recording.text.trim().is_empty() {
-                        "No speech was transcribed.".to_string()
-                    } else {
-                        recording.text.clone()
-                    })
-                    .into_any_element(),
-                None => div()
-                    .flex_1()
-                    .text_color(MUTED)
-                    .child("Record something to see the transcript here.")
-                    .into_any_element(),
-            })
-            .when_some(latest, |this, recording| {
-                let copy_text = recording.text.clone();
-                this.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.))
-                        .text_size(px(11.))
-                        .text_color(MUTED)
-                        .child(format!(
-                            "#{} · {} · {} words",
-                            recording.id,
-                            format_time(recording.timestamp),
-                            recording.text.split_whitespace().count()
-                        ))
-                        .child(div().flex_1())
-                        .child(action_button(
-                            "Copy",
-                            cx.listener(move |this, _, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    copy_text.clone(),
-                                ));
-                                this.notice = "Copied".to_string();
-                                cx.notify();
-                            }),
-                        )),
-                )
-            });
 
         div()
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
-            .gap(px(14.))
-            .px(px(28.))
-            .py(px(18.))
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .child(
-                        div()
-                            .font_family(FONT_DISPLAY)
-                            .text_size(px(27.))
-                            .child("Dictation"),
-                    )
-                    .child(div().flex_1())
-                    .when(!notice.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(if notice.starts_with("Copied") {
-                                    GREEN
-                                } else {
-                                    MUTED
-                                })
-                                .child(notice),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(14.))
-                    .child(record_card)
-                    .child(status_card),
-            )
+            .child(status_strip)
             .child(
                 div()
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .gap(px(14.))
-                    .child(recent_card)
-                    .child(latest_card),
+                    .flex_col()
+                    .items_center()
+                    .gap(px(20.))
+                    .px(px(28.))
+                    .pb(px(18.))
+                    .child(record_panel)
+                    .when_some(last_result, |this, result| this.child(result))
+                    .child(recent_list),
             )
             .into_any_element()
     }
@@ -1857,57 +1825,35 @@ impl MainView {
     }
 
     fn render_diff(&self, original: &str, current: &str) -> impl IntoElement {
-        let original_words: Vec<_> = original.split_whitespace().collect();
-        let current_words: Vec<_> = current.split_whitespace().collect();
-        let prefix = original_words
-            .iter()
-            .zip(&current_words)
-            .take_while(|(left, right)| left == right)
-            .count();
-        let suffix = original_words[prefix..]
-            .iter()
-            .rev()
-            .zip(current_words[prefix..].iter().rev())
-            .take_while(|(left, right)| left == right)
-            .count();
         let mut diff = div()
             .flex()
             .flex_wrap()
-            .gap(px(4.))
+            .items_end()
+            .gap_x(px(4.))
+            .gap_y(px(2.))
             .p(px(10.))
             .bg(MANTLE)
             .border_1()
             .border_color(LINE)
             .rounded(px(4.))
             .text_size(px(12.));
-        for word in &original_words[..prefix] {
-            diff = diff.child(div().text_color(SUBTEXT).child((*word).to_string()));
-        }
-        let original_end = original_words.len().saturating_sub(suffix);
-        for word in &original_words[prefix..original_end] {
-            diff = diff.child(
-                div()
+        for segment in word_diff(original, current) {
+            diff = diff.child(match segment {
+                DiffSegment::Same(word) => div().text_color(SUBTEXT).child(word),
+                DiffSegment::Removed(word) => div()
                     .text_color(RED)
                     .bg(alpha(RED, 0.1))
                     .child(format!("−{word}")),
-            );
-        }
-        let current_end = current_words.len().saturating_sub(suffix);
-        for word in &current_words[prefix..current_end] {
-            diff = diff.child(
-                div()
+                DiffSegment::Added(word) => div()
                     .text_color(GREEN)
                     .bg(alpha(GREEN, 0.1))
                     .child(format!("+{word}")),
-            );
-        }
-        for word in &current_words[current_end..] {
-            diff = diff.child(div().text_color(SUBTEXT).child((*word).to_string()));
+            });
         }
         diff
     }
 
-    fn render_metadata(&self, detail: &Detail) -> impl IntoElement {
+    fn render_metadata(&self, detail: &Detail, cx: &mut Context<Self>) -> impl IntoElement {
         let recording = &detail.recording;
         let mut attempts = div().flex().flex_col().gap(px(6.));
         for attempt in detail.attempts.iter().rev().take(4) {
@@ -1960,6 +1906,8 @@ impl MainView {
             .file_name()
             .map(|name| middle_ellipsis(&name.to_string_lossy(), 28))
             .unwrap_or_else(|| "Not available".to_string());
+        let audio_full = recording.audio_path.to_string_lossy().into_owned();
+        let model_full = recording.model.clone();
         div()
             .id("metadata-scroll")
             .w(px(220.))
@@ -1976,8 +1924,13 @@ impl MainView {
                     .gap(px(10.))
                     .child(section_heading("RECORDING"))
                     .child(meta_row("Duration", format_duration(recording.duration_ms)))
-                    .child(meta_row("Model", recording.model.clone()))
-                    .child(meta_row("Audio", audio))
+                    .child(copyable_meta_row(
+                        "Model",
+                        recording.model.clone(),
+                        model_full,
+                        cx,
+                    ))
+                    .child(copyable_meta_row("Audio", audio, audio_full, cx))
                     .child(meta_row(
                         "Revision",
                         if recording.revision > 0 {
@@ -2021,12 +1974,6 @@ impl MainView {
             .daily_last_30
             .iter()
             .filter(|day| day.recordings > 0)
-            .count();
-        let streak = stats
-            .daily_last_30
-            .iter()
-            .rev()
-            .take_while(|day| day.recordings > 0)
             .count();
         let success_rate = if stats.total > 0 {
             format!(
@@ -2076,10 +2023,10 @@ impl MainView {
             .min_h_0()
             .overflow_y_scroll()
             .px(px(28.))
-            .py(px(14.))
+            .py(px(16.))
             .flex()
             .flex_col()
-            .gap(px(12.))
+            .gap(px(14.))
             .child(
                 div()
                     .flex()
@@ -2087,13 +2034,16 @@ impl MainView {
                     .child(
                         div()
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(24.))
+                            .text_size(px(22.))
                             .child("Your dictation"),
                     )
                     .child(div().flex_1())
-                    .child(div().text_size(px(11.)).text_color(MUTED).child(format!(
-                        "{active_days} active days in the last 30 · {streak} day streak"
-                    ))),
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(MUTED)
+                            .child(format!("{active_days} active days in the last 30")),
+                    ),
             )
             .child(tiles)
             .child(
@@ -2112,7 +2062,7 @@ impl MainView {
                     )
                     .child(
                         card()
-                            .w(px(330.))
+                            .w(px(380.))
                             .flex_none()
                             .child(chart_heading("Time of day", "Recordings by hour"))
                             .child(render_hour_chart(stats)),
@@ -2133,24 +2083,14 @@ impl MainView {
                         card()
                             .flex_1()
                             .min_w_0()
-                            .child(chart_heading("Recording length", "Completed recordings"))
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap(px(18.))
-                                    .child(mini_stat(
-                                        format_duration(stats.median_duration_ms.unwrap_or(0)),
-                                        "median",
-                                    ))
-                                    .child(mini_stat(
-                                        format_duration(stats.average_duration_ms.unwrap_or(0)),
-                                        "average",
-                                    ))
-                                    .child(mini_stat(
-                                        format_hours(stats.today_duration_ms),
-                                        "today",
-                                    )),
-                            )
+                            .child(chart_heading(
+                                "Models",
+                                format!(
+                                    "Median length {} · average {}",
+                                    format_duration(stats.median_duration_ms.unwrap_or(0)),
+                                    format_duration(stats.average_duration_ms.unwrap_or(0))
+                                ),
+                            ))
                             .child(render_model_table(stats)),
                     ),
             )
@@ -2221,7 +2161,7 @@ impl MainView {
                     .child(
                 div()
                     .font_family(FONT_DISPLAY)
-                    .text_size(px(28.))
+                    .text_size(px(24.))
                     .child("Settings"),
             )
             .child(section_title("MICROPHONE"))
@@ -2455,7 +2395,7 @@ impl Render for TrayView {
                     .child(
                         div()
                             .font_family(FONT_DISPLAY)
-                            .text_size(px(17.))
+                            .text_size(px(15.))
                             .child("Dictator"),
                     ),
             )
@@ -2641,36 +2581,17 @@ fn key_hint(label: String) -> impl IntoElement {
         .child(label)
 }
 
-fn status_row(label: &str, value: String, ok: Option<bool>) -> impl IntoElement {
+fn status_pill(value: String, ok: Option<bool>) -> impl IntoElement {
     div()
         .flex()
-        .items_start()
-        .gap(px(10.))
-        .text_size(px(12.))
-        .child(
-            div()
-                .mt(px(5.))
-                .size(px(7.))
-                .flex_none()
-                .rounded_full()
-                .bg(match ok {
-                    Some(true) => GREEN,
-                    Some(false) => RED,
-                    None => LINE_STRONG,
-                }),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .text_color(MUTED)
-                        .text_size(px(10.))
-                        .child(label.to_string()),
-                )
-                .child(div().text_color(SUBTEXT).line_clamp(2).child(value)),
-        )
+        .items_center()
+        .gap(px(7.))
+        .child(div().size(px(7.)).flex_none().rounded_full().bg(match ok {
+            Some(true) => GREEN,
+            Some(false) => RED,
+            None => LINE_STRONG,
+        }))
+        .child(div().truncate().child(value))
 }
 
 fn settings_host(connection: &Option<ConnectionReport>, endpoint: &str) -> String {
@@ -2808,6 +2729,143 @@ fn meta_row(label: &'static str, value: String) -> impl IntoElement {
         .child(div().text_color(SUBTEXT).truncate().child(value))
 }
 
+fn copyable_meta_row(
+    label: &'static str,
+    shown: String,
+    copy_text: String,
+    cx: &mut Context<MainView>,
+) -> impl IntoElement {
+    let group = format!("meta-{label}");
+    div()
+        .group(group.clone())
+        .flex()
+        .items_end()
+        .gap(px(6.))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(div().text_size(px(10.)).text_color(MUTED).child(label))
+                .child(div().text_color(SUBTEXT).truncate().child(shown)),
+        )
+        .child(
+            div()
+                .id(gpui::SharedString::from(format!("meta-copy-{label}")))
+                .flex_none()
+                .p(px(3.))
+                .rounded(px(3.))
+                .text_color(MUTED)
+                .opacity(0.)
+                .group_hover(group, |this| this.opacity(1.))
+                .hover(|this| this.bg(SURFACE_2).text_color(TEXT))
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_text.clone()));
+                    this.notice = format!("{label} copied");
+                    cx.notify();
+                }))
+                .child(Icon::new(IconName::Copy).size(px(12.))),
+        )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DiffSegment {
+    Same(String),
+    Removed(String),
+    Added(String),
+}
+
+/// Splits on whitespace but keeps whitespace runs as their own tokens, so a
+/// changed line break or doubled space shows up as a removed/added `⏎` or `␣`.
+fn diff_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut gap = String::new();
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            if !word.is_empty() {
+                tokens.push(std::mem::take(&mut word));
+            }
+            gap.push(ch);
+        } else {
+            if !gap.is_empty() {
+                tokens.push(std::mem::take(&mut gap));
+            }
+            word.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        tokens.push(word);
+    }
+    if !gap.is_empty() {
+        tokens.push(gap);
+    }
+    tokens
+}
+
+fn is_gap(token: &str) -> bool {
+    token.chars().all(char::is_whitespace)
+}
+
+fn visible_gap(token: &str) -> String {
+    token
+        .chars()
+        .map(|ch| match ch {
+            '\n' => '⏎',
+            '\t' => '⇥',
+            _ => '␣',
+        })
+        .collect()
+}
+
+fn word_diff(original: &str, current: &str) -> Vec<DiffSegment> {
+    let left = diff_tokens(original);
+    let right = diff_tokens(current);
+    let prefix = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+    let suffix = left[prefix..]
+        .iter()
+        .rev()
+        .zip(right[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = Vec::new();
+    let push_same = |token: &str, out: &mut Vec<DiffSegment>| {
+        if !is_gap(token) {
+            out.push(DiffSegment::Same(token.to_string()));
+        }
+    };
+    let shown = |token: &str| -> Option<String> {
+        if !is_gap(token) {
+            Some(token.to_string())
+        } else if token == " " {
+            None
+        } else {
+            Some(visible_gap(token))
+        }
+    };
+    for token in &left[..prefix] {
+        push_same(token, &mut out);
+    }
+    for token in &left[prefix..left.len() - suffix] {
+        if let Some(text) = shown(token) {
+            out.push(DiffSegment::Removed(text));
+        }
+    }
+    let right_end = right.len() - suffix;
+    for token in &right[prefix..right_end] {
+        if let Some(text) = shown(token) {
+            out.push(DiffSegment::Added(text));
+        }
+    }
+    for token in &right[right_end..] {
+        push_same(token, &mut out);
+    }
+    out
+}
+
 fn middle_ellipsis(value: &str, max_chars: usize) -> String {
     let count = value.chars().count();
     if count <= max_chars || max_chars < 5 {
@@ -2818,6 +2876,10 @@ fn middle_ellipsis(value: &str, max_chars: usize) -> String {
     let start: String = value.chars().take(keep_start).collect();
     let end: String = value.chars().skip(count - keep_end).collect();
     format!("{start}…{end}")
+}
+
+fn single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn plural(count: usize, noun: &str) -> String {
@@ -2838,7 +2900,7 @@ fn tray_metric(value: String, label: &'static str) -> impl IntoElement {
         .child(
             div()
                 .font_family(FONT_DISPLAY)
-                .text_size(px(18.))
+                .text_size(px(16.))
                 .child(value),
         )
         .child(div().text_size(px(9.)).text_color(MUTED).child(label))
@@ -2862,65 +2924,132 @@ fn render_meter(active: bool, rms: f32, peak: f32) -> impl IntoElement {
     meter
 }
 
+fn heat(fraction: f32) -> Rgba {
+    let t = fraction.clamp(0.0, 1.0);
+    if t < 0.5 {
+        mix(TEAL, BLUE, t * 2.0)
+    } else {
+        mix(BLUE, MAUVE, (t - 0.5) * 2.0)
+    }
+}
+
+fn mix(a: Rgba, b: Rgba, t: f32) -> Rgba {
+    Rgba {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: 1.0,
+    }
+}
+
+fn chart_with_axis(
+    max: i64,
+    height: f32,
+    format: impl Fn(i64) -> String,
+    bars: impl IntoElement,
+    footer: impl IntoElement,
+) -> impl IntoElement {
+    let ticks = [max, max / 2, 0];
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(6.))
+        .child(
+            div()
+                .flex()
+                .items_end()
+                .child(
+                    div()
+                        .w(px(46.))
+                        .flex_none()
+                        .h(px(height))
+                        .flex()
+                        .flex_col()
+                        .justify_between()
+                        .items_end()
+                        .pr(px(6.))
+                        .text_size(px(10.))
+                        .text_color(MUTED)
+                        .children(ticks.into_iter().map(|tick| div().child(format(tick)))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(height))
+                        .border_l_1()
+                        .border_b_1()
+                        .border_color(LINE_STRONG)
+                        .pl(px(4.))
+                        .flex()
+                        .items_end()
+                        .child(bars),
+                ),
+        )
+        .child(div().pl(px(50.)).child(footer))
+}
+
+fn bar(fraction: f32, height: f32, filled: bool, color: Rgba) -> gpui::Div {
+    div()
+        .flex_1()
+        .h(px(if filled {
+            (fraction * height).max(3.)
+        } else {
+            2.
+        }))
+        .rounded_t(px(2.))
+        .bg(if filled { color } else { alpha(MUTED, 0.25) })
+}
+
+fn axis_footer(left: String, middle: String, right: String) -> impl IntoElement {
+    div()
+        .flex()
+        .justify_between()
+        .text_size(px(11.))
+        .text_color(MUTED)
+        .child(left)
+        .child(middle)
+        .child(right)
+}
+
 fn render_activity_chart(stats: &Stats) -> impl IntoElement {
+    const HEIGHT: f32 = 110.;
     let max_words = stats
         .daily_last_30
         .iter()
         .map(|day| day.words)
         .max()
         .unwrap_or(0)
-        .max(1) as f32;
-    let mut bars = div()
-        .h(px(88.))
-        .flex()
-        .items_end()
-        .gap(px(3.))
-        .border_b_1()
-        .border_color(LINE);
-    let count = stats.daily_last_30.len();
+        .max(1);
+    let mut bars = div().flex_1().h_full().flex().items_end().gap(px(3.));
     for (index, day) in stats.daily_last_30.iter().enumerate() {
-        let is_today = index + 1 == count;
-        let height = if day.words > 0 {
-            (day.words as f32 / max_words * 82.).max(3.)
-        } else {
-            2.
-        };
+        let fraction = day.words as f32 / max_words as f32;
         bars = bars.child(
-            div()
+            bar(fraction, HEIGHT, day.words > 0, heat(fraction))
                 .id(("activity-day", index))
-                .flex_1()
-                .h(px(height))
-                .rounded_t(px(2.))
-                .bg(if day.words == 0 {
-                    alpha(MUTED, 0.25)
-                } else if is_today {
-                    BLUE
-                } else {
-                    alpha(BLUE, 0.6)
-                })
                 .hover(|this| this.bg(TEXT)),
         );
     }
-    let first = stats.daily_last_30.first().map(|day| day.date);
-    let last = stats.daily_last_30.last().map(|day| day.date);
     let label = |date: Option<chrono::NaiveDate>| {
         date.map(|date| date.format("%b %-d").to_string())
             .unwrap_or_default()
     };
-    div().flex().flex_col().gap(px(6.)).child(bars).child(
-        div()
-            .flex()
-            .justify_between()
-            .text_size(px(10.))
-            .text_color(MUTED)
-            .child(label(first))
-            .child(format!("peak {} words", format_count(max_words as i64)))
-            .child(label(last)),
+    chart_with_axis(
+        max_words,
+        HEIGHT,
+        format_count,
+        bars,
+        axis_footer(
+            label(stats.daily_last_30.first().map(|day| day.date)),
+            format!("peak {} words", format_count(max_words)),
+            label(stats.daily_last_30.last().map(|day| day.date)),
+        ),
     )
 }
 
 fn render_hour_chart(stats: &Stats) -> impl IntoElement {
-    let max = stats.by_hour.iter().copied().max().unwrap_or(0).max(1) as f32;
+    const HEIGHT: f32 = 110.;
+    let max = stats.by_hour.iter().copied().max().unwrap_or(0).max(1);
     let peak_hour = stats
         .by_hour
         .iter()
@@ -2928,49 +3057,28 @@ fn render_hour_chart(stats: &Stats) -> impl IntoElement {
         .max_by_key(|(_, count)| **count)
         .filter(|(_, count)| **count > 0)
         .map(|(hour, _)| hour);
-    let mut bars = div()
-        .h(px(88.))
-        .flex()
-        .items_end()
-        .gap(px(2.))
-        .border_b_1()
-        .border_color(LINE);
-    for (hour, count) in stats.by_hour.iter().enumerate() {
-        bars = bars.child(
-            div()
-                .flex_1()
-                .h(px(if *count > 0 {
-                    (*count as f32 / max * 82.).max(3.)
-                } else {
-                    2.
-                }))
-                .rounded_t(px(2.))
-                .bg(if Some(hour) == peak_hour {
-                    BLUE
-                } else if *count > 0 {
-                    alpha(BLUE, 0.5)
-                } else {
-                    alpha(MUTED, 0.25)
-                }),
-        );
+    let mut bars = div().flex_1().h_full().flex().items_end().gap(px(2.));
+    for count in stats.by_hour.iter() {
+        let fraction = *count as f32 / max as f32;
+        bars = bars.child(bar(fraction, HEIGHT, *count > 0, heat(fraction)));
     }
-    div().flex().flex_col().gap(px(6.)).child(bars).child(
-        div()
-            .flex()
-            .justify_between()
-            .text_size(px(10.))
-            .text_color(MUTED)
-            .child("00")
-            .child(
-                peak_hour
-                    .map(|hour| format!("busiest {hour:02}:00–{:02}:00", (hour + 1) % 24))
-                    .unwrap_or_default(),
-            )
-            .child("23"),
+    chart_with_axis(
+        max,
+        HEIGHT,
+        format_count,
+        bars,
+        axis_footer(
+            "00:00".to_string(),
+            peak_hour
+                .map(|hour| format!("busiest {hour:02}:00–{:02}:00", (hour + 1) % 24))
+                .unwrap_or_default(),
+            "23:00".to_string(),
+        ),
     )
 }
 
 fn render_latency_chart(stats: &Stats) -> impl IntoElement {
+    const HEIGHT: f32 = 96.;
     let max_value = stats
         .latency_samples
         .iter()
@@ -2983,51 +3091,36 @@ fn render_latency_chart(stats: &Stats) -> impl IntoElement {
         let index = ((*sample * bins.len() as i64) / (max_value + 1)) as usize;
         bins[index.min(bins.len() - 1)] += 1;
     }
-    let max_bin = bins.iter().copied().max().unwrap_or(1).max(1) as f32;
-    let mut bars = div()
-        .h(px(64.))
-        .flex()
-        .items_end()
-        .gap(px(3.))
-        .border_b_1()
-        .border_color(LINE);
-    for bin in bins {
-        bars = bars.child(
-            div()
-                .flex_1()
-                .h(px(if bin > 0 {
-                    (bin as f32 / max_bin * 58.).max(3.)
-                } else {
-                    2.
-                }))
-                .rounded_t(px(2.))
-                .bg(if bin > 0 {
-                    alpha(BLUE, 0.6)
-                } else {
-                    alpha(MUTED, 0.25)
-                }),
-        );
+    let max_bin = bins.iter().copied().max().unwrap_or(0).max(1);
+    let mut bars = div().flex_1().h_full().flex().items_end().gap(px(3.));
+    for (index, bin) in bins.into_iter().enumerate() {
+        let position = index as f32 / (bins.len() - 1) as f32;
+        bars = bars.child(bar(
+            bin as f32 / max_bin as f32,
+            HEIGHT,
+            bin > 0,
+            heat(position),
+        ));
     }
     div()
         .flex()
         .flex_col()
-        .gap(px(6.))
-        .child(bars)
+        .gap(px(10.))
+        .child(chart_with_axis(
+            max_bin,
+            HEIGHT,
+            |value| value.to_string(),
+            bars,
+            axis_footer(
+                "0 s".to_string(),
+                format!("{} samples", stats.latency_samples.len()),
+                format_latency(Some(max_value)),
+            ),
+        ))
         .child(
             div()
                 .flex()
                 .justify_between()
-                .text_size(px(10.))
-                .text_color(MUTED)
-                .child("0 s")
-                .child(format!("{} samples", stats.latency_samples.len()))
-                .child(format_latency(Some(max_value))),
-        )
-        .child(
-            div()
-                .flex()
-                .gap(px(18.))
-                .mt(px(4.))
                 .child(mini_stat(format_latency(stats.p50), "p50"))
                 .child(mini_stat(format_latency(stats.p95), "p95"))
                 .child(mini_stat(format_latency(stats.p99), "p99"))
@@ -3035,19 +3128,24 @@ fn render_latency_chart(stats: &Stats) -> impl IntoElement {
         )
 }
 
-fn chart_heading(title: &'static str, note: &'static str) -> impl IntoElement {
+fn chart_heading(title: &'static str, note: impl Into<String>) -> impl IntoElement {
     div()
         .flex()
         .justify_between()
         .items_center()
-        .child(div().text_size(px(13.)).child(title))
-        .child(div().text_size(px(10.)).text_color(MUTED).child(note))
+        .child(div().text_size(px(14.)).child(title))
+        .child(
+            div()
+                .text_size(px(11.))
+                .text_color(MUTED)
+                .child(note.into()),
+        )
 }
 
 fn render_model_table(stats: &Stats) -> impl IntoElement {
     let mut table = div().mt(px(4.)).border_t_1().border_color(LINE);
     table = table.child(table_row("Model", "Recordings", "Audio", "p95", true));
-    for (model, recordings, duration_ms, p95) in stats.models.iter().take(3) {
+    for (model, recordings, duration_ms, p95) in stats.models.iter().take(4) {
         table = table.child(table_row(
             model,
             &recordings.to_string(),
@@ -3062,10 +3160,10 @@ fn render_model_table(stats: &Stats) -> impl IntoElement {
 fn table_row(a: &str, b: &str, c: &str, d: &str, heading: bool) -> impl IntoElement {
     div()
         .flex()
-        .py(px(5.))
+        .py(px(8.))
         .border_b_1()
         .border_color(LINE)
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(if heading { MUTED } else { SUBTEXT })
         .child(div().w_2_5().truncate().child(a.to_string()))
         .child(div().w_1_5().child(b.to_string()))
@@ -3084,14 +3182,14 @@ fn stat_tile(value: String, label: &'static str, note: String) -> impl IntoEleme
         .child(
             div()
                 .font_family(FONT_DISPLAY)
-                .text_size(px(24.))
+                .text_size(px(21.))
                 .child(value),
         )
-        .child(div().mt(px(2.)).text_size(px(11.)).child(label))
+        .child(div().mt(px(2.)).text_size(px(12.)).child(label))
         .child(
             div()
                 .mt(px(2.))
-                .text_size(px(10.))
+                .text_size(px(11.))
                 .text_color(MUTED)
                 .truncate()
                 .child(note),
@@ -3103,10 +3201,10 @@ fn mini_stat(value: String, label: &'static str) -> impl IntoElement {
         .child(
             div()
                 .font_family(FONT_DISPLAY)
-                .text_size(px(19.))
+                .text_size(px(17.))
                 .child(value),
         )
-        .child(div().text_size(px(10.)).text_color(MUTED).child(label))
+        .child(div().text_size(px(11.)).text_color(MUTED).child(label))
 }
 
 fn format_count(value: i64) -> String {
@@ -3495,6 +3593,32 @@ mod state_tests {
     }
 
     #[test]
+    fn diff_tracks_whitespace_changes() {
+        use DiffSegment::*;
+        assert_eq!(
+            word_diff("a b", "a\n\nb"),
+            vec![Same("a".into()), Added("⏎⏎".into()), Same("b".into())]
+        );
+        assert_eq!(
+            word_diff("Bofo's at 64%.", "Bofo's at 64%"),
+            vec![
+                Same("Bofo's".into()),
+                Same("at".into()),
+                Removed("64%.".into()),
+                Added("64%".into()),
+            ]
+        );
+        assert_eq!(
+            word_diff("same text", "same text"),
+            vec![Same("same".into()), Same("text".into())]
+        );
+        assert_eq!(
+            word_diff("x  y", "x y"),
+            vec![Same("x".into()), Removed("␣␣".into()), Same("y".into())]
+        );
+    }
+
+    #[test]
     fn counts_and_hours_are_human_readable() {
         assert_eq!(format_count(0), "0");
         assert_eq!(format_count(999), "999");
@@ -3512,6 +3636,7 @@ mod state_tests {
         assert_eq!(shortened.chars().count(), 28);
         assert!(shortened.starts_with("09192026-194510"));
         assert!(shortened.ends_with("c20.wav"));
+        assert_eq!(single_line("a\n\n b\tc "), "a b c");
         assert_eq!(plural(1, "attempt"), "1 attempt");
         assert_eq!(plural(3, "attempt"), "3 attempts");
     }

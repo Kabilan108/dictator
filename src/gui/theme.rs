@@ -28,6 +28,8 @@ pub const MUTED: Rgba = rgb(0x9399b2);
 pub const BLUE: Rgba = rgb(0x89b4fa);
 pub const RED: Rgba = rgb(0xf38ba8);
 pub const GREEN: Rgba = rgb(0xa6e3a1);
+pub const TEAL: Rgba = rgb(0x94e2d5);
+pub const MAUVE: Rgba = rgb(0xcba6f7);
 
 pub const FONT_MONO: &str = "IBM Plex Mono";
-pub const FONT_DISPLAY: &str = "Instrument Serif";
+pub const FONT_DISPLAY: &str = "Geist";
