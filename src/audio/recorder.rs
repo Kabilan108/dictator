@@ -668,6 +668,9 @@ fn read_parec_stream(
     }
 }
 
+/// Requests a small server-side buffer so `kill` on stop loses at most ~50 ms.
+/// PulseAudio's default record latency is about one second, which truncated
+/// recordings to whole-second multiples and dropped anything shorter.
 fn parec_command(source_name: &str, sample_rate: &str) -> Command {
     let mut command = Command::new("parec");
     command
@@ -678,6 +681,8 @@ fn parec_command(source_name: &str, sample_rate: &str) -> Command {
             "--channels=1",
             "--client-name=dictator",
             "--stream-name=Dictation",
+            "--latency-msec=50",
+            "--process-time-msec=10",
             "--device",
             source_name,
             "--rate",
@@ -905,6 +910,8 @@ mod tests {
                 "--channels=1",
                 "--client-name=dictator",
                 "--stream-name=Dictation",
+                "--latency-msec=50",
+                "--process-time-msec=10",
                 "--device",
                 "bluez_input.headset",
                 "--rate",
