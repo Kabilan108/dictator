@@ -74,17 +74,12 @@ in
     };
 
     gui = {
-      enable = lib.mkEnableOption "Dictator desktop and tray application";
+      enable = lib.mkEnableOption "Dictator desktop application";
       package = lib.mkOption {
         type = lib.types.package;
         default = self.packages.${pkgs.system}.gui;
         defaultText = "dictator.packages.${pkgs.system}.gui";
         description = "Package providing dictator-gui.";
-      };
-      autostart = lib.mkOption {
-        type = lib.types.bool;
-        default = true;
-        description = "Start the tray application with the graphical session.";
       };
     };
 
@@ -209,10 +204,6 @@ in
 
     home.file."${configRoot}/dictator/config.json" = lib.mkIf (configSource != null) {
       source = configSource;
-    };
-
-    xdg.configFile."autostart/dictator.desktop" = lib.mkIf (cfg.gui.enable && cfg.gui.autostart) {
-      text = "[Desktop Entry]\nType=Application\nName=Dictator\nExec=${cfg.gui.package}/bin/dictator-gui --tray\nTerminal=false\n";
     };
 
     systemd.user.services.dictator = {

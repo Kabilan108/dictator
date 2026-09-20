@@ -110,7 +110,7 @@
                 }
             '';
             meta = old.meta // {
-              description = "Dictator GPUI desktop and tray application";
+              description = "Dictator GPUI desktop application";
               mainProgram = "dictator-gui";
             };
           });

@@ -1,7 +1,5 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -9,45 +7,10 @@ use serde::Deserialize;
 
 use crate::utils::{bounded_output, live_niri_socket};
 
-const POPUP_TITLE: &str = "Dictator quick controls";
 const MAIN_TITLE: &str = "Dictator";
-const POPUP_WIDTH: i32 = 340;
-const POPUP_HEIGHT: i32 = 510;
-const EDGE_GAP: i32 = 16;
-const ANCHOR_GAP: i32 = 8;
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const DISCOVERY_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_NIRI_OUTPUT_BYTES: usize = 1024 * 1024;
-static PLACEMENT_RUNNING: AtomicBool = AtomicBool::new(false);
-
-/// Places the quick-controls window through Niri after GPUI has created it.
-///
-/// GPUI 0.2 creates Wayland xdg-toplevel windows even for popup window kinds,
-/// so Niri initially tiles this window. This helper returns immediately and
-/// performs the compositor-specific correction on a bounded background thread.
-/// Other compositors keep GPUI's default behavior.
-pub fn place_popup(anchor: Option<(i32, i32)>) {
-    let Some(socket) = live_niri_socket() else {
-        return;
-    };
-    if PLACEMENT_RUNNING
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-
-    if thread::Builder::new()
-        .name("dictator-popup-placement".to_string())
-        .spawn(move || {
-            let _running = PlacementGuard;
-            place_popup_with_niri(&socket, anchor);
-        })
-        .is_err()
-    {
-        PLACEMENT_RUNNING.store(false, Ordering::Release);
-    }
-}
 
 /// Sizes the main window through Niri after GPUI has created it.
 ///
@@ -62,10 +25,13 @@ pub fn size_main_window(width: i32, height: i32) {
         .name("dictator-main-placement".to_string())
         .spawn(move || {
             let deadline = Instant::now() + DISCOVERY_TIMEOUT;
-            let Some(window_id) = find_window(&socket, MAIN_TITLE, deadline) else {
+            let Some(window) = find_window(&socket, MAIN_TITLE, deadline) else {
                 return;
             };
-            let id = window_id.to_string();
+            if window.size() == Some((width, height)) {
+                return;
+            }
+            let id = window.id.to_string();
             if !niri_action(
                 &socket,
                 &["set-window-width", "--id", &id, &width.to_string()],
@@ -81,77 +47,13 @@ pub fn size_main_window(width: i32, height: i32) {
         });
 }
 
-struct PlacementGuard;
-
-impl Drop for PlacementGuard {
-    fn drop(&mut self) {
-        PLACEMENT_RUNNING.store(false, Ordering::Release);
-    }
-}
-
-fn place_popup_with_niri(socket: &Path, anchor: Option<(i32, i32)>) {
-    let deadline = Instant::now() + DISCOVERY_TIMEOUT;
-    let Some(window_id) = find_window(socket, POPUP_TITLE, deadline) else {
-        return;
-    };
-    let Some(output) = output_for_anchor(socket, anchor, deadline) else {
-        return;
-    };
-    let (x, y) = popup_position(output, anchor);
-
-    if !niri_action(
-        socket,
-        &["move-window-to-floating", "--id", &window_id.to_string()],
-        deadline,
-    ) {
-        return;
-    }
-    if !niri_action(
-        socket,
-        &[
-            "set-window-width",
-            "--id",
-            &window_id.to_string(),
-            &POPUP_WIDTH.to_string(),
-        ],
-        deadline,
-    ) {
-        return;
-    }
-    if !niri_action(
-        socket,
-        &[
-            "set-window-height",
-            "--id",
-            &window_id.to_string(),
-            &POPUP_HEIGHT.to_string(),
-        ],
-        deadline,
-    ) {
-        return;
-    }
-    let _ = niri_action(
-        socket,
-        &[
-            "move-floating-window",
-            "--id",
-            &window_id.to_string(),
-            "--x",
-            &x.to_string(),
-            "--y",
-            &y.to_string(),
-        ],
-        deadline,
-    );
-}
-
-fn find_window(socket: &Path, title: &str, deadline: Instant) -> Option<u64> {
+fn find_window(socket: &Path, title: &str, deadline: Instant) -> Option<NiriWindow> {
     let pid = std::process::id();
     loop {
         if let Some(windows) = niri_json::<Vec<NiriWindow>>(socket, &["windows"], deadline)
-            && let Some(id) = window_id_for(windows, pid, title)
+            && let Some(window) = window_for(windows, pid, title)
         {
-            return Some(id);
+            return Some(window);
         }
         if Instant::now() >= deadline {
             return None;
@@ -160,79 +62,13 @@ fn find_window(socket: &Path, title: &str, deadline: Instant) -> Option<u64> {
     }
 }
 
-fn window_id_for(windows: Vec<NiriWindow>, pid: u32, title: &str) -> Option<u64> {
+fn window_for(windows: Vec<NiriWindow>, pid: u32, title: &str) -> Option<NiriWindow> {
     // Window IDs increase over a Niri session. Choosing the largest ID avoids
     // moving a stale duplicate during a rapid window recreation.
     windows
         .into_iter()
         .filter(|window| window.pid == Some(pid) && window.title.as_deref() == Some(title))
-        .map(|window| window.id)
-        .max()
-}
-
-fn output_for_anchor(
-    socket: &Path,
-    anchor: Option<(i32, i32)>,
-    deadline: Instant,
-) -> Option<LogicalRect> {
-    if let Some(anchor) = anchor
-        && let Some(outputs) =
-            niri_json::<HashMap<String, NiriOutput>>(socket, &["outputs"], deadline)
-        && let Some(output) = outputs
-            .into_values()
-            .filter_map(|output| output.logical)
-            .find(|output| output.contains(anchor))
-    {
-        return Some(output);
-    }
-
-    niri_json::<NiriOutput>(socket, &["focused-output"], deadline).and_then(|output| output.logical)
-}
-
-fn popup_position(output: LogicalRect, anchor: Option<(i32, i32)>) -> (i32, i32) {
-    let min_x = output.x;
-    let min_y = output.y;
-    let max_x = output
-        .x
-        .saturating_add(output.width)
-        .saturating_sub(POPUP_WIDTH);
-    let max_y = output
-        .y
-        .saturating_add(output.height)
-        .saturating_sub(POPUP_HEIGHT);
-
-    let (desired_x, desired_y) = if let Some((anchor_x, anchor_y)) = anchor {
-        let right = anchor_x.saturating_add(ANCHOR_GAP);
-        let left = anchor_x
-            .saturating_sub(POPUP_WIDTH)
-            .saturating_sub(ANCHOR_GAP);
-        let below = anchor_y.saturating_add(ANCHOR_GAP);
-        let above = anchor_y
-            .saturating_sub(POPUP_HEIGHT)
-            .saturating_sub(ANCHOR_GAP);
-        (
-            if right <= max_x { right } else { left },
-            if below <= max_y { below } else { above },
-        )
-    } else {
-        (
-            max_x.saturating_sub(EDGE_GAP),
-            min_y.saturating_add(EDGE_GAP),
-        )
-    };
-
-    (
-        clamp_to_output(desired_x, min_x, max_x),
-        clamp_to_output(desired_y, min_y, max_y),
-    )
-}
-
-fn clamp_to_output(value: i32, min: i32, max: i32) -> i32 {
-    if max < min {
-        min
-    } else {
-        value.clamp(min, max)
-    }
+        .max_by_key(|window| window.id)
 }
 
 fn niri_json<T: for<'de> Deserialize<'de>>(
@@ -284,32 +120,23 @@ fn niri_action(socket: &Path, action: &[&str], deadline: Instant) -> bool {
     .is_ok_and(|output| !output.timed_out && output.status.success())
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct NiriWindow {
     id: u64,
     title: Option<String>,
     pid: Option<u32>,
+    #[serde(default)]
+    layout: NiriLayout,
 }
 
-#[derive(Deserialize)]
-struct NiriOutput {
-    logical: Option<LogicalRect>,
+#[derive(Debug, Default, Deserialize)]
+struct NiriLayout {
+    window_size: Option<(i32, i32)>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
-struct LogicalRect {
-    x: i32,
-    y: i32,
-    width: i32,
-    height: i32,
-}
-
-impl LogicalRect {
-    fn contains(self, (x, y): (i32, i32)) -> bool {
-        x >= self.x
-            && x < self.x.saturating_add(self.width)
-            && y >= self.y
-            && y < self.y.saturating_add(self.height)
+impl NiriWindow {
+    fn size(&self) -> Option<(i32, i32)> {
+        self.layout.window_size
     }
 }
 
@@ -317,46 +144,31 @@ impl LogicalRect {
 mod tests {
     use super::*;
 
-    const OUTPUT: LogicalRect = LogicalRect {
-        x: 100,
-        y: 200,
-        width: 1_000,
-        height: 800,
-    };
-
-    #[test]
-    fn default_position_is_top_right_inside_the_output() {
-        assert_eq!(popup_position(OUTPUT, None), (744, 216));
-    }
-
-    #[test]
-    fn anchor_position_flips_at_the_right_and_bottom_edges() {
-        assert_eq!(popup_position(OUTPUT, Some((1_050, 950))), (702, 432));
-    }
-
-    #[test]
-    fn popup_is_clamped_when_the_output_is_smaller_than_it() {
-        let small = LogicalRect {
-            x: -500,
-            y: 40,
-            width: 300,
-            height: 400,
-        };
-        assert_eq!(popup_position(small, None), (-500, 40));
-    }
-
     #[test]
     fn window_list_accepts_null_titles() {
         let windows: Vec<NiriWindow> = serde_json::from_str(&format!(
             r#"[
                 {{"id": 1, "title": null, "pid": 12}},
-                {{"id": 2, "title": "{POPUP_TITLE}", "pid": 12}}
+                {{"id": 2, "title": "{MAIN_TITLE}", "pid": 12}}
             ]"#
         ))
         .unwrap();
         assert_eq!(windows[0].title, None);
-        assert_eq!(windows[1].title.as_deref(), Some(POPUP_TITLE));
-        assert_eq!(window_id_for(windows, 12, POPUP_TITLE), Some(2));
+        assert_eq!(windows[1].title.as_deref(), Some(MAIN_TITLE));
+        let window = window_for(windows, 12, MAIN_TITLE).unwrap();
+        assert_eq!(window.id, 2);
+        assert_eq!(window.size(), None);
+    }
+
+    #[test]
+    fn window_size_is_read_from_niri() {
+        let windows: Vec<NiriWindow> = serde_json::from_str(&format!(
+            r#"[{{"id": 7, "title": "{MAIN_TITLE}", "pid": 3, "is_floating": true,
+                 "layout": {{"window_size": [1120, 700], "tile_size": [1120, 700]}}}}]"#
+        ))
+        .unwrap();
+        let window = window_for(windows, 3, MAIN_TITLE).unwrap();
+        assert_eq!(window.size(), Some((1120, 700)));
     }
 
     #[test]

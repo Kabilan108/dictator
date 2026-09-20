@@ -27,7 +27,7 @@ CLI compatibility tests run with GUI features enabled as well.
 
 ## Desktop acceptance on NixOS and niri
 
-Tested with real GPUI windows at 1120×700 and the tray popup at 340×510:
+Tested with a real GPUI main window at 1120×700:
 
 - Dictation, History, Stats, and Settings render with bundled IBM Plex Mono and
   Geist. Dictation is the default tab. Stats fits within the default
@@ -51,8 +51,6 @@ Tested with real GPUI windows at 1120×700 and the tray popup at 340×510:
   one diff, the model transcript against the current text, and only when they
   differ; the revision list and restore action were removed as unhelpful.
 - Playback, pause, and waveform seeking controlled a real `ffplay` process.
-- The system tray registered with the session's StatusNotifierWatcher. Repeated
-  activation reused the popup. Niri placed it near the activation coordinates.
 - Microphone capture delivered PCM before cancellation. This probe used an
   isolated preferences directory. Bluetooth identity/reconnect behavior was
   tested with fixtures; no Bluetooth microphone was connected during validation.
@@ -61,16 +59,14 @@ Desktop test audio, history, preferences, and provider configuration were isolat
 from the user's data. Clipboard/paste commands from the test daemon were
 intercepted. The installed Home Manager daemon was not replaced or activated.
 
-GPUI 0.2.2 creates a normal Wayland toplevel for its popup window kind and does
-not request an initial size for any window. On niri, Dictator uses the
-compositor's IPC to float, size, and position its own popup, and to size the
-main window to 924×740 after it opens. Other compositors may need window rules
-for `Dictator` and `Dictator quick controls`.
+GPUI 0.2.2 does not request an initial size for any window. On niri, Dictator
+uses the compositor's IPC to size the main window to 924×740 after it opens.
+Other compositors may need a window rule for `Dictator`.
 
-GPUI's Linux backend stops its event loop when the last window closes. With the
-tray enabled, closing the main window therefore replaces the process with a
-tray-only instance (`dictator-gui --tray`); the tray item re-registers and can
-reopen the window. Only the tray's Quit item ends the process.
+GPUI's Linux backend stops its event loop when the last window closes, so
+closing the main window ends the process. The GUI is opened on demand from the
+desktop shell's dictation panel, which also owns the bar indicator and quick
+recording controls.
 
 Review follow-up checks covered unavailable desktop notifications, stalled Pulse
 and Niri subprocesses, deferred editor/search events, legacy failure discovery,
@@ -79,7 +75,7 @@ unit could write the exact Dictator app directories while an unrelated home-file
 write was denied. The retry workflow passed 50 consecutive focused runs after
 one unreproduced timeout, followed by a successful full suite.
 
-A final native lifecycle check reopened the tray five times and then restarted the
-isolated daemon while the main window remained open. History, statistics, and
+A final native lifecycle check restarted the isolated daemon while the main
+window remained open. History, statistics, and
 recording controls stayed available. A subprocess regression and a negative-control
 probe verified that opening another database connection preserves process locks.

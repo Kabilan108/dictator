@@ -6,30 +6,26 @@ mod theme;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Local, Utc};
 use gpui::{
-    AnyWindowHandle, App, Application, Bounds, Context, Entity, Global, IntoElement, Rgba,
-    Subscription, Timer, Window, WindowBounds, WindowKind, WindowOptions, div, prelude::*, px,
-    size,
+    App, Application, Bounds, Context, Entity, IntoElement, Rgba, Subscription, Timer, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Icon, IconName, Root, Theme, ThemeMode};
 
 use crate::ipc::DaemonState;
-use crate::tray::{TrayAction, TrayHandle};
 
 use backend::{
     Backend, ConnectionReport, Detail, Filter, Microphone, Page, Recording, Reply, Request, Stats,
     Status,
 };
 use levels::LevelFeed;
-use placement::{place_popup, size_main_window};
+use placement::size_main_window;
 use playback::{AudioPlayer, waveform};
 use theme::*;
 
@@ -71,50 +67,21 @@ impl gpui::AssetSource for GuiAssets {
     }
 }
 
-#[derive(Default)]
-struct WindowRegistry {
-    main: Option<AnyWindowHandle>,
-    popup: Option<AnyWindowHandle>,
-}
-
-impl Global for WindowRegistry {}
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct GuiOptions {
     pub demo: bool,
-    pub show_main: bool,
-    pub tray: bool,
 }
 
-impl Default for GuiOptions {
-    fn default() -> Self {
-        Self {
-            demo: false,
-            show_main: true,
-            tray: true,
-        }
-    }
-}
-
-static EXPLICIT_QUIT: AtomicBool = AtomicBool::new(false);
-
-/// GPUI's Linux backend stops its event loop when the last window closes, so
-/// a closed main window would take the tray with it. In tray mode the process
-/// replaces itself with a tray-only instance instead; only the tray's Quit
-/// item ends the process.
 pub fn run(options: GuiOptions) -> Result<()> {
     Application::new().with_assets(GuiAssets).run(move |cx| {
         gpui_component::init(cx);
-        if !options.tray {
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
-        }
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         Theme::change(ThemeMode::Dark, None, cx);
-        cx.set_global(WindowRegistry::default());
         cx.text_system()
             .add_fonts(vec![
                 Cow::Borrowed(include_bytes!("../../assets/fonts/IBMPlexMono-Regular.ttf")),
@@ -122,218 +89,30 @@ pub fn run(options: GuiOptions) -> Result<()> {
                 Cow::Borrowed(include_bytes!("../../assets/fonts/Geist-Regular.ttf")),
             ])
             .expect("failed to load Dictator fonts");
-
-        let (tray_handle, tray_actions) = if options.tray {
-            let (tx, rx) = std::sync::mpsc::channel();
-            match crate::tray::spawn(tx) {
-                Ok(handle) => (Some(handle), Some(rx)),
-                Err(error) => {
-                    eprintln!("dictator GUI: tray unavailable: {error:#}");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        start_host(cx, options, tray_handle, tray_actions);
-        if options.show_main {
-            open_main_window(cx, options).expect("failed to open Dictator window");
-        }
+        open_main_window(cx, options).expect("failed to open Dictator window");
         cx.activate(true);
     });
-    if should_relaunch_as_tray(options, EXPLICIT_QUIT.load(Ordering::Acquire)) {
-        relaunch_as_tray(options)?;
-    }
     Ok(())
 }
 
-fn should_relaunch_as_tray(options: GuiOptions, explicit_quit: bool) -> bool {
-    options.tray && !explicit_quit
-}
-
-fn relaunch_as_tray(options: GuiOptions) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe().context("failed to locate dictator-gui")?;
-    let mut command = std::process::Command::new(exe);
-    command.arg("--tray");
-    if options.demo {
-        command.arg("--demo");
-    }
-    Err(anyhow::Error::from(command.exec()).context("failed to relaunch tray-only dictator-gui"))
-}
-
-pub fn open_main_window(cx: &mut App, options: GuiOptions) -> Result<()> {
-    if !cx.has_global::<WindowRegistry>() {
-        cx.set_global(WindowRegistry::default());
-    }
-    if let Some(handle) = cx.global::<WindowRegistry>().main
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
-        return Ok(());
-    }
+fn open_main_window(cx: &mut App, options: GuiOptions) -> Result<()> {
     let bounds = Bounds::centered(None, size(px(WINDOW_SIZE.0), px(WINDOW_SIZE.1)), cx);
-    let handle = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                app_id: Some(APP_ID.to_string()),
-                window_min_size: Some(size(px(860.), px(620.))),
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.set_window_title("Dictator");
-                let view = cx.new(|cx| MainView::new(options.demo, window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            },
-        )
-        .context("failed to open main window")?;
-    cx.global_mut::<WindowRegistry>().main = Some(handle.into());
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            app_id: Some(APP_ID.to_string()),
+            window_min_size: Some(size(px(860.), px(620.))),
+            ..Default::default()
+        },
+        move |window, cx| {
+            window.set_window_title("Dictator");
+            let view = cx.new(|cx| MainView::new(options.demo, window, cx));
+            cx.new(|cx| Root::new(view, window, cx))
+        },
+    )
+    .context("failed to open main window")?;
     size_main_window(WINDOW_SIZE.0 as i32, WINDOW_SIZE.1 as i32);
     Ok(())
-}
-
-pub fn open_tray_popup(cx: &mut App, options: GuiOptions) -> Result<()> {
-    open_tray_popup_at(cx, options, None)
-}
-
-fn open_tray_popup_at(cx: &mut App, options: GuiOptions, anchor: Option<(i32, i32)>) -> Result<()> {
-    if !cx.has_global::<WindowRegistry>() {
-        cx.set_global(WindowRegistry::default());
-    }
-    if let Some(handle) = cx.global::<WindowRegistry>().popup
-        && handle
-            .update(cx, |_, window, _| window.activate_window())
-            .is_ok()
-    {
-        place_popup(anchor);
-        return Ok(());
-    }
-    let bounds = Bounds::centered(None, size(px(340.), px(510.)), cx);
-    let handle = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                kind: WindowKind::PopUp,
-                app_id: Some(APP_ID.to_string()),
-                is_resizable: false,
-                is_minimizable: false,
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.set_window_title("Dictator quick controls");
-                let view = cx.new(|cx| TrayView::new(options, window, cx));
-                cx.new(|cx| Root::new(view, window, cx))
-            },
-        )
-        .context("failed to open tray popup")?;
-    cx.global_mut::<WindowRegistry>().popup = Some(handle.into());
-    place_popup(anchor);
-    Ok(())
-}
-
-fn start_host(
-    cx: &mut App,
-    options: GuiOptions,
-    tray: Option<TrayHandle>,
-    actions: Option<Receiver<TrayAction>>,
-) {
-    let host = cx.new(|cx| HostView::new(options, tray, actions, cx));
-    cx.set_global(HostController { _host: host });
-}
-
-struct HostController {
-    _host: Entity<HostView>,
-}
-
-impl Global for HostController {}
-
-struct HostView {
-    options: GuiOptions,
-    tray: Option<TrayHandle>,
-    actions: Option<Receiver<TrayAction>>,
-    backend: Backend,
-    status_pending: bool,
-    last_status_request: Instant,
-}
-
-impl HostView {
-    fn new(
-        options: GuiOptions,
-        tray: Option<TrayHandle>,
-        actions: Option<Receiver<TrayAction>>,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let backend = Backend::new(options.demo);
-        backend.send(Request::Status);
-        cx.spawn(async move |this, cx| {
-            loop {
-                Timer::after(Duration::from_millis(250)).await;
-                if !cx
-                    .update(|cx| {
-                        let Some(entity) = this.upgrade() else {
-                            return false;
-                        };
-                        entity.update(cx, |this, cx| this.poll(cx));
-                        true
-                    })
-                    .unwrap_or(false)
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-        Self {
-            options,
-            tray,
-            actions,
-            backend,
-            status_pending: true,
-            last_status_request: Instant::now(),
-        }
-    }
-
-    fn poll(&mut self, cx: &mut Context<Self>) {
-        if let Some(actions) = &self.actions {
-            while let Ok(action) = actions.try_recv() {
-                match action {
-                    TrayAction::OpenHistory => {
-                        let _ = open_main_window(cx, self.options);
-                    }
-                    TrayAction::OpenPopup => {
-                        let _ = open_tray_popup(cx, self.options);
-                    }
-                    TrayAction::OpenPopupAt(x, y) => {
-                        let _ = open_tray_popup_at(cx, self.options, Some((x, y)));
-                    }
-                    TrayAction::ToggleRecording => self.backend.send(Request::Toggle),
-                    TrayAction::CancelRecording => self.backend.send(Request::Cancel),
-                    TrayAction::Quit => {
-                        EXPLICIT_QUIT.store(true, Ordering::Release);
-                        cx.quit();
-                    }
-                }
-            }
-        }
-        for reply in self.backend.drain() {
-            if let Reply::Status(result) = reply {
-                self.status_pending = false;
-                if let Ok(status) = result
-                    && let Some(tray) = &self.tray
-                {
-                    tray.update(status.state.as_str());
-                }
-            }
-        }
-        if !self.status_pending && self.last_status_request.elapsed() >= Duration::from_secs(1) {
-            self.backend.send(Request::Status);
-            self.status_pending = true;
-            self.last_status_request = Instant::now();
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2387,10 +2166,7 @@ impl MainView {
 
 impl Render for MainView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let recovery = self
-            .status
-            .as_ref()
-            .and_then(|status| recovery_banner(status, false));
+        let recovery = self.status.as_ref().and_then(recovery_banner);
         div()
             .size_full()
             .flex()
@@ -2407,332 +2183,6 @@ impl Render for MainView {
                 Tab::Stats => self.render_stats(),
                 Tab::Settings => self.render_settings(cx),
             })
-    }
-}
-
-struct TrayView {
-    options: GuiOptions,
-    backend: Backend,
-    status: Status,
-    page: Option<Page>,
-    stats: Option<Stats>,
-    notice: String,
-    status_pending: bool,
-    last_status_request: Instant,
-    connected: bool,
-}
-
-impl TrayView {
-    fn new(options: GuiOptions, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let backend = Backend::new(options.demo);
-        backend.send(Request::Status);
-        backend.send(Request::History {
-            search: String::new(),
-            filter: Filter::All,
-            page: 0,
-        });
-        backend.send(Request::Stats);
-        let weak = cx.weak_entity();
-        window
-            .spawn(cx, async move |cx| {
-                loop {
-                    Timer::after(Duration::from_millis(180)).await;
-                    if !cx
-                        .update(|window, cx| {
-                            let Some(entity) = weak.upgrade() else {
-                                return false;
-                            };
-                            entity.update(cx, |this, cx| this.poll(window, cx));
-                            true
-                        })
-                        .unwrap_or(false)
-                    {
-                        break;
-                    }
-                }
-            })
-            .detach();
-        Self {
-            options,
-            backend,
-            status: Status {
-                state: DaemonState::Idle,
-                duration_ms: 0,
-                error: String::new(),
-                recovered_text: String::new(),
-                uptime_seconds: 0,
-                last_recording_id: None,
-                last_recording_generation: 0,
-                audio_level_rms: 0.0,
-                audio_level_peak: 0.0,
-            },
-            page: None,
-            stats: None,
-            notice: String::new(),
-            status_pending: true,
-            last_status_request: Instant::now(),
-            connected: false,
-        }
-    }
-
-    fn poll(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        for reply in self.backend.drain() {
-            match reply {
-                Reply::Status(result) => {
-                    self.status_pending = false;
-                    match result {
-                        Ok(status) => {
-                            self.status = status;
-                            self.connected = true;
-                            if self.notice.starts_with("Daemon disconnected:") {
-                                self.notice.clear();
-                            }
-                        }
-                        Err(error) => {
-                            self.connected = false;
-                            self.notice = disconnected_notice(&error);
-                        }
-                    }
-                }
-                Reply::History(result) => {
-                    apply_tray_result(&mut self.page, result, &mut self.notice)
-                }
-                Reply::Stats(result) => {
-                    apply_tray_result(&mut self.stats, result, &mut self.notice)
-                }
-                Reply::Action(result) => {
-                    self.notice = match result {
-                        Ok(()) => String::new(),
-                        Err(error) => action_notice(Err(error)),
-                    };
-                    if !self.status_pending {
-                        self.backend.send(Request::Status);
-                        self.status_pending = true;
-                        self.last_status_request = Instant::now();
-                    }
-                    self.backend.send(Request::History {
-                        search: String::new(),
-                        filter: Filter::All,
-                        page: 0,
-                    });
-                }
-                _ => {}
-            }
-        }
-        if !self.status_pending && self.last_status_request.elapsed() >= Duration::from_secs(1) {
-            self.backend.send(Request::Status);
-            self.status_pending = true;
-            self.last_status_request = Instant::now();
-        }
-        cx.notify();
-    }
-}
-
-impl Render for TrayView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let status = self.status.clone();
-        let recording = status.state == DaemonState::Recording;
-        let transcribing = status.state == DaemonState::Transcribing;
-        let recent = self
-            .page
-            .as_ref()
-            .map(|page| page.recordings.iter().take(5).cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let stats = self.stats.clone().unwrap_or_default();
-        let today_minutes = stats.today_duration_ms as f64 / 60_000.0;
-        let today_wpm = if today_minutes > 0.0 {
-            stats.today_words as f64 / today_minutes
-        } else {
-            0.0
-        };
-        let options = self.options;
-        let recovery = recovery_banner(&status, true);
-        let notice = self.notice.clone();
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(BG)
-            .text_color(TEXT)
-            .font_family(FONT_UI)
-            .text_size(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(16.))
-                    .h(px(44.))
-                    .bg(MANTLE)
-                    .border_b_1()
-                    .border_color(LINE)
-                    .child(cursor_logo(Some(status.state)))
-                    .child(
-                        div()
-                            .font_family(FONT_DISPLAY)
-                            .text_size(px(15.))
-                            .child("Dictator"),
-                    ),
-            )
-            .when_some(recovery, |this, recovery| this.child(recovery))
-            .when(!notice.is_empty(), |this| {
-                this.child(
-                    div()
-                        .mx(px(12.))
-                        .mt(px(8.))
-                        .px(px(10.))
-                        .py(px(7.))
-                        .max_h(px(42.))
-                        .overflow_hidden()
-                        .bg(SURFACE)
-                        .border_l_2()
-                        .border_color(LINE_STRONG)
-                        .text_size(px(11.))
-                        .text_color(SUBTEXT)
-                        .child(notice),
-                )
-            })
-            .child(
-                div()
-                    .p(px(16.))
-                    .flex()
-                    .flex_col()
-                    .gap(px(10.))
-                    .child(render_meter(
-                        recording,
-                        status.audio_level_rms,
-                        status.audio_level_peak,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(if transcribing {
-                                "Transcribing...".to_string()
-                            } else {
-                                format_duration(status.duration_ms)
-                            })
-                            .child(
-                                div()
-                                    .id("tray-record")
-                                    .size(px(28.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.))
-                                    .when(recording, |this| this.bg(SURFACE_2))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.backend.send(Request::Toggle);
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .size(px(10.))
-                                            .rounded(if recording { px(2.) } else { px(5.) })
-                                            .bg(if transcribing { BLUE } else { RED }),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .border_y_1()
-                    .border_color(LINE)
-                    .child(tray_metric(stats.today_words.to_string(), "words today"))
-                    .child(tray_metric(format!("{today_wpm:.0}"), "words / min")),
-            )
-            .child(
-                div()
-                    .flex()
-                    .border_b_1()
-                    .border_color(LINE)
-                    .child(tray_metric(
-                        format!("{:.1}m", stats.today_duration_ms as f64 / 60_000.0),
-                        "audio today",
-                    ))
-                    .child(tray_metric(format_latency(stats.p95), "p95 latency")),
-            )
-            .child(
-                div()
-                    .px(px(16.))
-                    .pt(px(12.))
-                    .pb(px(5.))
-                    .text_size(px(10.))
-                    .text_color(MUTED)
-                    .child("RECENT"),
-            )
-            .child(
-                div()
-                    .id("tray-recent-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .children(recent.into_iter().map(|recording| {
-                        div()
-                            .flex()
-                            .items_center()
-                            .h(px(32.))
-                            .gap(px(9.))
-                            .px(px(16.))
-                            .py(px(7.))
-                            .text_color(if recording.failed { RED } else { SUBTEXT })
-                            .child(
-                                div()
-                                    .w(px(42.))
-                                    .text_color(MUTED)
-                                    .font_family(FONT_MONO)
-                                    .child(format_time(recording.timestamp)),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(if recording.failed {
-                                        recording.error
-                                    } else {
-                                        recording.text
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_color(MUTED)
-                                    .font_family(FONT_MONO)
-                                    .child(format_duration(recording.duration_ms)),
-                            )
-                    })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .px(px(16.))
-                    .h(px(42.))
-                    .border_t_1()
-                    .border_color(LINE)
-                    .text_color(MUTED)
-                    .child(if self.connected {
-                        format!("daemon up {}", format_uptime(status.uptime_seconds))
-                    } else {
-                        "daemon disconnected".to_string()
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .id("open-history")
-                            .cursor_pointer()
-                            .text_color(SUBTEXT)
-                            .on_click(move |_, window, cx| {
-                                let _ = open_main_window(cx, options);
-                                window.remove_window();
-                            })
-                            .child("open history"),
-                    ),
-            )
     }
 }
 
@@ -2806,7 +2256,7 @@ fn action_button(
         .child(label)
 }
 
-fn recovery_banner(status: &Status, compact: bool) -> Option<gpui::AnyElement> {
+fn recovery_banner(status: &Status) -> Option<gpui::AnyElement> {
     if status.state != DaemonState::Error || status.recovered_text.is_empty() {
         return None;
     }
@@ -2820,9 +2270,9 @@ fn recovery_banner(status: &Status, compact: bool) -> Option<gpui::AnyElement> {
     };
     Some(
         div()
-            .mx(if compact { px(12.) } else { px(16.) })
+            .mx(px(16.))
             .my(px(8.))
-            .p(px(if compact { 10. } else { 12. }))
+            .p(px(12.))
             .bg(MANTLE)
             .border_l_2()
             .border_color(RED)
@@ -2844,13 +2294,9 @@ fn recovery_banner(status: &Status, compact: bool) -> Option<gpui::AnyElement> {
                     .when(!recovered_text.is_empty(), |this| {
                         this.child(
                             div()
-                                .id(if compact {
-                                    "tray-recovered-text"
-                                } else {
-                                    "recovered-text"
-                                })
+                                .id("recovered-text")
                                 .mt(px(7.))
-                                .max_h(px(if compact { 38. } else { 64. }))
+                                .max_h(px(64.))
                                 .overflow_y_scroll()
                                 .text_color(SUBTEXT)
                                 .child(recovered_text),
@@ -3055,22 +2501,6 @@ fn plural(count: usize, noun: &str) -> String {
     }
 }
 
-fn tray_metric(value: String, label: &'static str) -> impl IntoElement {
-    div()
-        .w_1_2()
-        .px(px(16.))
-        .py(px(9.))
-        .border_r_1()
-        .border_color(LINE)
-        .child(
-            div()
-                .font_family(FONT_DISPLAY)
-                .text_size(px(16.))
-                .child(value),
-        )
-        .child(div().text_size(px(9.)).text_color(MUTED).child(label))
-}
-
 fn push_level(history: &mut VecDeque<(f32, f32)>, recording: bool, sample: (f32, f32)) {
     if !recording {
         history.clear();
@@ -3134,24 +2564,6 @@ fn smoothed(levels: &[f32], index: usize) -> f32 {
     };
     let i = index as isize;
     ((get(i - 1) + 2.0 * get(i) + get(i + 1)) / 4.0).clamp(0.0, 1.0)
-}
-
-fn render_meter(active: bool, rms: f32, peak: f32) -> impl IntoElement {
-    let mut meter = div().h(px(30.)).flex().items_center().gap(px(2.));
-    for index in 0..36 {
-        let height = if active {
-            let level = if index % 6 == 0 { peak } else { rms };
-            2. + level.clamp(0.0, 1.0) * 28.0
-        } else {
-            2.
-        };
-        meter = meter.child(div().flex_1().h(px(height)).bg(if active {
-            BLUE
-        } else {
-            alpha(MUTED, 0.45)
-        }));
-    }
-    meter
 }
 
 fn heat(fraction: f32) -> Rgba {
@@ -3670,19 +3082,6 @@ fn can_go_previous(page_index: usize) -> bool {
     page_index > 0
 }
 
-fn apply_tray_result<T>(slot: &mut Option<T>, result: Result<T, String>, notice: &mut String) {
-    match result {
-        Ok(value) => {
-            *slot = Some(value);
-            clear_database_notice(notice);
-        }
-        Err(error) => {
-            *slot = None;
-            *notice = error;
-        }
-    }
-}
-
 fn clear_database_notice(notice: &mut String) {
     if notice.starts_with("Database unavailable:") {
         notice.clear();
@@ -3881,18 +3280,6 @@ mod state_tests {
     }
 
     #[test]
-    fn closing_the_last_window_keeps_the_tray_unless_quit_was_chosen() {
-        let with_tray = GuiOptions::default();
-        let without_tray = GuiOptions {
-            tray: false,
-            ..GuiOptions::default()
-        };
-        assert!(should_relaunch_as_tray(with_tray, false));
-        assert!(!should_relaunch_as_tray(with_tray, true));
-        assert!(!should_relaunch_as_tray(without_tray, false));
-    }
-
-    #[test]
     fn smoothing_averages_neighbours_and_clamps() {
         let levels = [0.0, 1.0, 0.0, 2.0];
         assert!((smoothed(&levels, 1) - 0.5).abs() < f32::EPSILON);
@@ -4006,26 +3393,6 @@ mod state_tests {
         assert!(!can_go_previous(0));
         assert!(can_go_previous(1));
         assert!(can_go_previous(4));
-    }
-
-    #[test]
-    fn tray_backend_failure_replaces_stale_data_and_is_visible() {
-        let mut value = Some(41);
-        let mut notice = String::new();
-
-        apply_tray_result(
-            &mut value,
-            Err("history unavailable".to_string()),
-            &mut notice,
-        );
-
-        assert_eq!(value, None);
-        assert_eq!(notice, "history unavailable");
-
-        notice = "Database unavailable: transient WAL error".to_string();
-        apply_tray_result(&mut value, Ok(42), &mut notice);
-        assert_eq!(value, Some(42));
-        assert!(notice.is_empty());
     }
 
     #[test]

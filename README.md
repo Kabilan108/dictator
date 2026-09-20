@@ -10,7 +10,7 @@ A voice typing daemon for Linux that enables voice typing anywhere the cursor is
 ## Desktop app
 
 The optional GPUI desktop app provides transcript history, playback, editing and
-revision comparison, recording controls, statistics, and a system tray popup.
+revision comparison, recording controls, and statistics.
 The daemon continues to own recording, transcription and insertion.
 
 ```bash
@@ -24,20 +24,14 @@ direnv exec "$PWD" cargo run --features gui --bin dictator-gui -- --demo
 nix run .#gui
 ```
 
-Use `--tray` to start without opening the history window. Left-click the tray
-icon for quick controls; its menu can open history or quit the GUI. Quitting the
-GUI leaves the daemon running. The GUI requires a graphical session and a
-StatusNotifierItem host for tray integration. The main window also works without
-a tray host. Use matching daemon and GUI builds for microphone priorities and
-terminal recording updates. On niri the popup is positioned through compositor
-IPC; other Wayland compositors may need a floating window rule for
-`Dictator quick controls`.
+The GUI is a plain windowed app: open it on demand and it exits when its
+window closes. The daemon keeps running either way. The desktop shell's
+dictation panel provides the bar indicator, quick recording controls, and the
+launcher for the GUI. Use matching daemon and GUI builds for microphone
+priorities and terminal recording updates.
 
 For Home Manager, enable `services.dictator.gui.enable = true` alongside the
-existing daemon configuration. GUI autostart defaults to enabled and can be
-turned off with `services.dictator.gui.autostart = false`. On compositors that do
-not process XDG autostart entries, launch `dictator-gui --tray` from compositor
-startup.
+existing daemon configuration to install `dictator-gui`.
 
 The Settings screen displays daemon configuration read-only. Microphone
 priorities live in a separate app-owned preferences file; Home Manager's
