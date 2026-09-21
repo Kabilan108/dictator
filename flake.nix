@@ -16,25 +16,18 @@
           pkgs = import nixpkgs { inherit system; };
           lib = pkgs.lib;
         in
-        {
-          default = pkgs.buildGoModule rec {
+        rec {
+          default = pkgs.rustPlatform.buildRustPackage rec {
             pname = "dictator";
             version = "2.4.0";
             src = ./.;
-            vendorHash = "sha256-Jud5o3QUVlWab/dICquh5PWUnIj6YkxWdRA8INKL3Jw=";
+            cargoLock.lockFile = ./Cargo.lock;
 
-            buildPhase = ''
-              runHook preBuild
-              make build VERSION=${version}
-              runHook postBuild
-            '';
+            DICTATOR_VERSION = version;
 
-            installPhase = ''
-              runHook preInstall
-
-              install -Dm755 build/dictator $out/bin/dictator
-
-              # Shell completions (Cobra-generated)
+            postInstall = ''
+              wrapProgram $out/bin/dictator --prefix PATH : ${lib.makeBinPath [ pkgs.pulseaudio ]}
+              # Shell completions (clap-generated)
               install -d $out/share/bash-completion/completions
               $out/bin/dictator completion bash > $out/share/bash-completion/completions/dictator
 
@@ -43,13 +36,10 @@
 
               install -d $out/share/fish/vendor_completions.d
               $out/bin/dictator completion fish > $out/share/fish/vendor_completions.d/dictator.fish
-
-              runHook postInstall
             '';
 
             # ensure tests run under nix
             # doCheck = true;
-            # checkPhase = "make test";
 
             meta = with lib; {
               description = "native speech to text daemon for linux";
@@ -59,9 +49,71 @@
               mainProgram = "dictator";
             };
 
-            buildInputs = with pkgs; [ portaudio ];
-            nativeBuildInputs = with pkgs; [ pkg-config ];
+            buildInputs = [ ];
+            nativeBuildInputs = with pkgs; [
+              pkg-config
+              makeWrapper
+            ];
           };
+          gui = default.overrideAttrs (old: {
+            pname = "dictator-gui";
+            cargoBuildFeatures = [ "gui" ];
+            cargoCheckFeatures = [ "gui" ];
+            buildInputs =
+              old.buildInputs
+              ++ (with pkgs; [
+                fontconfig
+                libxcb
+                freetype
+                libxkbcommon
+                wayland
+                libGL
+                vulkan-loader
+                openssl
+              ]);
+            nativeBuildInputs =
+              old.nativeBuildInputs
+              ++ (with pkgs; [
+                cmake
+                ninja
+                clang
+              ]);
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+            postInstall = ''
+              rm -f $out/bin/dictator
+              install -Dm644 assets/dictator.svg $out/share/icons/hicolor/scalable/apps/dictator.svg
+              install -Dm644 assets/dictator.desktop $out/share/applications/dictator.desktop
+              wrapProgram $out/bin/dictator-gui \
+                --prefix PATH : ${
+                  lib.makeBinPath [
+                    pkgs.ffmpeg
+                    pkgs.pulseaudio
+                  ]
+                } \
+                --prefix LD_LIBRARY_PATH : ${
+                  lib.makeLibraryPath (
+                    with pkgs;
+                    [
+                      libxkbcommon
+                      wayland
+                      libGL
+                      vulkan-loader
+                      fontconfig
+                      freetype
+                      libx11
+                      libxcb
+                      libxcursor
+                      libxi
+                      libxrandr
+                    ]
+                  )
+                }
+            '';
+            meta = old.meta // {
+              description = "Dictator GPUI desktop application";
+              mainProgram = "dictator-gui";
+            };
+          });
         }
       );
       devShells = forAllSystems (
@@ -69,12 +121,44 @@
         let
           pkgs = import nixpkgs { inherit system; };
           commonPackages = with pkgs; [
-            go
-            gopls
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
             ffmpeg
+            pulseaudio
             pkg-config
-            portaudio
+            libxcb
+            fontconfig
+            freetype
+            libxkbcommon
+            wayland
+            libGL
+            vulkan-loader
+            openssl
+            cmake
+            ninja
+            clang
+            llvmPackages.libclang
           ];
+          guiLibraries = with pkgs; [
+            libxkbcommon
+            wayland
+            libGL
+            vulkan-loader
+            fontconfig
+            freetype
+            libx11
+            libxcb
+            libxcursor
+            libxi
+            libxrandr
+          ];
+          guiEnvironment = {
+            LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibraries;
+            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+          };
           x11Packages = with pkgs; [
             xclip
             xdotool
@@ -85,15 +169,24 @@
           ];
         in
         {
-          default = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
-          };
-          wayland = pkgs.mkShell {
-            buildInputs = commonPackages ++ waylandPackages;
-          };
-          x11 = pkgs.mkShell {
-            buildInputs = commonPackages ++ x11Packages;
-          };
+          default = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ waylandPackages;
+            }
+          );
+          wayland = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ waylandPackages;
+            }
+          );
+          x11 = pkgs.mkShell (
+            guiEnvironment
+            // {
+              buildInputs = commonPackages ++ x11Packages;
+            }
+          );
         }
       );
       homeManagerModules = {

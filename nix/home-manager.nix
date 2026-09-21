@@ -28,13 +28,14 @@ let
         pkgs.coreutils
         pkgs.wtype
       ];
-  pathPackages = displayPackages ++ [ pkgs.portaudio ] ++ cfg.extraPathPackages;
+  pathPackages = displayPackages ++ [ pkgs.pulseaudio ] ++ cfg.extraPathPackages;
   defaultPassEnvironment = [
     "DISPLAY"
     "XAUTHORITY"
     "DBUS_SESSION_BUS_ADDRESS"
     "WAYLAND_DISPLAY"
     "XDG_RUNTIME_DIR"
+    "NIRI_SOCKET"
   ];
   configSource =
     if cfg.configFile != null then
@@ -44,6 +45,22 @@ let
     else
       null;
   extraArgs = lib.escapeShellArgs cfg.extraArgs;
+  xdgRoot = variable: fallback: cfg.environment.${variable} or fallback;
+  configRoot = xdgRoot "XDG_CONFIG_HOME" config.xdg.configHome;
+  dataRoot = xdgRoot "XDG_DATA_HOME" config.xdg.dataHome;
+  stateRoot = xdgRoot "XDG_STATE_HOME" config.xdg.stateHome;
+  writableAppDirectories = [
+    "${configRoot}/dictator"
+    "${dataRoot}/dictator"
+    "${stateRoot}/dictator"
+  ];
+  prepareWritableAppDirectories = lib.escapeShellArgs writableAppDirectories;
+  serviceEnvironment = {
+    XDG_CONFIG_HOME = configRoot;
+    XDG_DATA_HOME = dataRoot;
+    XDG_STATE_HOME = stateRoot;
+  }
+  // cfg.environment;
 in
 {
   options.services.dictator = {
@@ -54,6 +71,16 @@ in
       default = self.packages.${pkgs.system}.default;
       defaultText = "dictator.packages.${pkgs.system}.default";
       description = "Dictator package to use.";
+    };
+
+    gui = {
+      enable = lib.mkEnableOption "Dictator desktop application";
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = self.packages.${pkgs.system}.gui;
+        defaultText = "dictator.packages.${pkgs.system}.gui";
+        description = "Package providing dictator-gui.";
+      };
     };
 
     displayServer = lib.mkOption {
@@ -153,12 +180,30 @@ in
         assertion = configSource != null;
         message = "services.dictator: set settings or configFile when enabling the service.";
       }
+      {
+        assertion = lib.all (path: lib.hasPrefix "/" path) [
+          configRoot
+          dataRoot
+          stateRoot
+        ];
+        message = "services.dictator: XDG config, data, and state roots must be absolute paths.";
+      }
+      {
+        assertion =
+          configRoot == config.home.homeDirectory || lib.hasPrefix "${config.home.homeDirectory}/" configRoot;
+        message = "services.dictator: XDG_CONFIG_HOME must be within home.homeDirectory so Home Manager can manage config.json.";
+      }
     ];
 
-    home.packages = [ cfg.package ] ++ pathPackages ++ cfg.extraPackages;
+    home.packages = [
+      cfg.package
+    ]
+    ++ lib.optional cfg.gui.enable cfg.gui.package
+    ++ pathPackages
+    ++ cfg.extraPackages;
 
-    xdg.configFile = lib.mkIf (configSource != null) {
-      "dictator/config.json".source = configSource;
+    home.file."${configRoot}/dictator/config.json" = lib.mkIf (configSource != null) {
+      source = configSource;
     };
 
     systemd.user.services.dictator = {
@@ -176,10 +221,17 @@ in
           + lib.optionalString (cfg.extraArgs != [ ]) " ${extraArgs}";
         Restart = "on-failure";
         RestartSec = 5;
+        ExecStartPre = "+${lib.getExe' pkgs.coreutils "install"} -d -m 0700 ${prepareWritableAppDirectories}";
+        UMask = "0077";
+        ProtectHome = "read-only";
+        ReadOnlyPaths = [ config.home.homeDirectory ];
+        ReadWritePaths = writableAppDirectories;
+        RuntimeDirectory = "dictator";
+        RuntimeDirectoryMode = "0700";
         Environment = [
           "PATH=${lib.makeBinPath pathPackages}"
         ]
-        ++ lib.mapAttrsToList (name: value: "${name}=${value}") cfg.environment;
+        ++ lib.mapAttrsToList (name: value: "${name}=${value}") serviceEnvironment;
         EnvironmentFile = lib.optional (cfg.environmentFile != null) cfg.environmentFile;
         PassEnvironment =
           if cfg.passEnvironment != null then cfg.passEnvironment else defaultPassEnvironment;
