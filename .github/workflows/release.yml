@@ -1,158 +1,162 @@
-name: Release on Version Change
+name: Build, cache and release
 
 on:
   push:
     branches: [master]
   workflow_dispatch:
-
-concurrency:
-  group: release
-  cancel-in-progress: false
+    inputs:
+      cache_only:
+        description: Populate the cache without publishing a release
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
-env:
-  DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+concurrency:
+  group: release-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
 
 jobs:
-  check-version:
-    runs-on: ubuntu-latest
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  plan:
+    needs: check
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
     outputs:
-      current_version: ${{ steps.get_version.outputs.version }}
-      should_release: ${{ steps.check.outputs.should_release }}
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - id: plan
+        run: python3 scripts/version.py --release-plan >> "$GITHUB_OUTPUT"
 
-      - name: Notify Workflow Started
-        uses: Kabilan108/actions/discord-notify@v1
+  cache:
+    needs: plan
+    runs-on: ubuntu-24.04
+    outputs:
+      cli: ${{ steps.build.outputs.cli }}
+      gui: ${{ steps.build.outputs.gui }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v4
+      - uses: cachix/cachix-action@v17
         with:
-          webhook-url: ${{ env.DISCORD_WEBHOOK }}
-          title: Release Workflow Started
-          description: Checking for version changes in ${{ github.repository }}
-          level: info
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v4
-
-      - name: Get current version from flake
-        id: get_version
+          name: kabilan108
+          skipPush: true
+      - name: Build the CLI and GUI
+        id: build
         run: |
-          VERSION=$(nix eval .#default.version --raw)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Current version: $VERSION"
-
-      - name: Get latest tag
-        id: get_tag
+          nix build .#default --out-link result-cli -L
+          nix build .#gui --out-link result-gui -L
+          test "$(result-cli/bin/dictator version)" = "$(python3 scripts/version.py)"
+          echo "cli=$(readlink -f result-cli)" >> "$GITHUB_OUTPUT"
+          echo "gui=$(readlink -f result-gui)" >> "$GITHUB_OUTPUT"
+      - name: Upload application runtime closures only
+        env:
+          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
         run: |
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "latest_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "Latest tag: $LATEST_TAG"
+          test -n "$CACHIX_AUTH_TOKEN" || { echo 'Configure the CACHIX_AUTH_TOKEN repository secret'; exit 1; }
+          cachix push kabilan108 "$(readlink -f result-cli)" "$(readlink -f result-gui)"
 
-      - name: Check if version changed
-        id: check
-        run: |
-          CURRENT="${{ steps.get_version.outputs.version }}"
-          LATEST="${{ steps.get_tag.outputs.latest_tag }}"
-
-          # Remove 'v' prefix from tag if present
-          LATEST=${LATEST#v}
-
-          if [ "$CURRENT" != "$LATEST" ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "Version changed: $LATEST -> $CURRENT"
-          else
-            echo "should_release=false" >> $GITHUB_OUTPUT
-            echo "No version change detected"
-          fi
-
-      - name: Notify Version Check Complete
-        if: always()
-        uses: Kabilan108/actions/discord-notify@v1
+  verify-cache:
+    needs: [plan, cache]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v4
+      - uses: cachix/cachix-action@v17
         with:
-          webhook-url: ${{ env.DISCORD_WEBHOOK }}
-          title: ${{ steps.check.outputs.should_release == 'true' && 'Version Change Detected - Release Starting' || 'No Release Needed' }}
-          description: ${{ steps.check.outputs.should_release == 'true' && format('New version {0} will be released', steps.get_version.outputs.version) || format('Version {0} matches latest tag', steps.get_version.outputs.version) }}
-          level: ${{ steps.check.outputs.should_release == 'true' && 'info' || 'warn' }}
+          name: kabilan108
+          skipPush: true
+      - name: Download both packages on a fresh runner with builds disabled
+        env:
+          CLI: ${{ needs.cache.outputs.cli }}
+          GUI: ${{ needs.cache.outputs.gui }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          # Verify the roots are in our cache, then substitute their closures.
+          nix path-info --store https://kabilan108.cachix.org "$CLI" "$GUI"
+          nix build .#default --out-link result-cli --max-jobs 0 --builders '' -L
+          nix build .#gui --out-link result-gui --max-jobs 0 --builders '' -L
+          test "$(readlink -f result-cli)" = "$CLI"
+          test "$(readlink -f result-gui)" = "$GUI"
+          test "$(result-cli/bin/dictator version)" = "$VERSION"
+          test -x result-gui/bin/dictator-gui
 
-  build-and-release:
-    needs: check-version
-    if: needs.check-version.outputs.should_release == 'true'
-    runs-on: ubuntu-latest
+  cli-archive:
+    needs: [plan, verify-cache]
+    if: needs.plan.outputs.release == 'true' && inputs.cache_only != true
+    runs-on: ubuntu-22.04
+    env:
+      DICTATOR_VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CLI outside Nix
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          cargo +1.94.0 build --locked --release --bin dictator
+          test "$(target/release/dictator version)" = "$DICTATOR_VERSION"
+          mkdir -p release-assets/package
+          cp target/release/dictator LICENSE release-assets/package/
+          cp docs/cli-install.md release-assets/package/README.md
+          tar -C release-assets/package -czf "release-assets/dictator-${DICTATOR_VERSION}-x86_64-linux.tar.gz" .
+          cd release-assets
+          sha256sum "dictator-${DICTATOR_VERSION}-x86_64-linux.tar.gz" > SHA256SUMS
+      - name: Test the archive in Ubuntu without Nix
+        run: |
+          docker run --rm -v "$PWD/release-assets:/release:ro" \
+            -e DICTATOR_VERSION ubuntu:22.04 bash -euc '
+              mkdir /tmp/dictator
+              tar -xzf "/release/dictator-${DICTATOR_VERSION}-x86_64-linux.tar.gz" -C /tmp/dictator
+              test "$(/tmp/dictator/dictator version)" = "$DICTATOR_VERSION"
+              /tmp/dictator/dictator --help
+              /tmp/dictator/dictator completion bash > /tmp/completion
+              test -s /tmp/completion
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-release
+          path: |
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS
+          if-no-files-found: error
 
+  publish:
+    needs: [plan, verify-cache, cli-archive]
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Notify Release Started
-        uses: Kabilan108/actions/discord-notify@v1
+      - uses: actions/download-artifact@v4
         with:
-          webhook-url: ${{ env.DISCORD_WEBHOOK }}
-          title: Building Release v${{ needs.check-version.outputs.current_version }}
-          description: Starting build process for ${{ github.repository }}
-          level: info
+          name: cli-release
+          path: release-assets
+      - name: Publish this exact commit, resuming incomplete releases
+        run: bash scripts/publish-release.sh
 
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v4
-
-      - name: Build binary with Nix
-        run: |
-          nix build .#default -L
-
-      - name: Prepare release assets
-        run: |
-          mkdir -p release-assets
-          cp result/bin/dictator release-assets/dictator-x86_64-linux
-          chmod +x release-assets/dictator-x86_64-linux
-
-      - name: Create and push tag
-        run: |
-          VERSION="${{ needs.check-version.outputs.current_version }}"
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git tag -a "v$VERSION" -m "Release v$VERSION"
-          git push origin "v$VERSION"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: v${{ needs.check-version.outputs.current_version }}
-          name: Release v${{ needs.check-version.outputs.current_version }}
-          body: |
-            Automated release for version ${{ needs.check-version.outputs.current_version }}
-
-            ## Changes
-            - Built with Nix flake
-            - x86_64-linux binary included
-
-            ## Installation
-            Download the `dictator-x86_64-linux` binary and place it in your PATH.
-          files: |
-            release-assets/dictator-x86_64-linux
-          draft: false
-          prerelease: false
-
-      - name: Notify Release Complete
-        uses: Kabilan108/actions/discord-notify@v1
-        with:
-          webhook-url: ${{ env.DISCORD_WEBHOOK }}
-          title: Release v${{ needs.check-version.outputs.current_version }} Complete
-          description: Successfully released ${{ github.repository }}
-          level: success
-
-  notify-failure:
-    needs: [check-version, build-and-release]
-    if: failure()
-    runs-on: ubuntu-latest
+  notify:
+    needs: [check, plan, cache, verify-cache, cli-archive, publish]
+    if: always() && (failure() || needs.publish.result == 'success')
+    runs-on: ubuntu-24.04
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
     steps:
-      - name: Notify Workflow Failed
+      - name: Report release outcome
+        if: env.DISCORD_WEBHOOK != ''
         uses: Kabilan108/actions/discord-notify@v1
         with:
           webhook-url: ${{ env.DISCORD_WEBHOOK }}
-          title: Release Workflow Failed
-          description: The release workflow encountered an error
-          level: error
+          title: ${{ needs.publish.result == 'success' && 'Dictator release complete' || 'Dictator build or release failed' }}
+          description: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          level: ${{ needs.publish.result == 'success' && 'success' || 'error' }}

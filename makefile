@@ -1,16 +1,16 @@
 .PHONY: build install deps clean test fmt check run release FORCE
 
-VERSION ?= $(shell git describe --tags --always --dirty)
+VERSION ?= $(shell python3 scripts/version.py)
 CARGO ?= cargo
 
-build/dictator: FORCE $(shell find src tests -name '*.rs') Cargo.toml Cargo.lock build.rs
+build/dictator: check-version FORCE $(shell find src tests -name '*.rs') Cargo.toml Cargo.lock build.rs
 	DICTATOR_VERSION=$(VERSION) $(CARGO) build --release
 	mkdir -p build
 	cp target/release/dictator build/dictator
 
 build: build/dictator
 
-install:
+install: check-version
 	DICTATOR_VERSION=$(VERSION) $(CARGO) install --path . --locked
 
 deps:
@@ -46,3 +46,11 @@ check-gui:
 
 test-gui:
 	$(CARGO) test --features gui
+
+.PHONY: check-version bump-version
+
+check-version:
+	python3 scripts/version.py
+
+bump-version:
+	python3 scripts/version.py --bump "$(NEW_VERSION)"

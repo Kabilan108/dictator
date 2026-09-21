@@ -121,6 +121,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           commonPackages = with pkgs; [
+            python3
             cargo
             rustc
             rustfmt

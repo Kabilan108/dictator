@@ -5,3 +5,6 @@ build/
 .worktrees/
 target/
 result
+
+__pycache__/
+result-*/
