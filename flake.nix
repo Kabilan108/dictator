@@ -38,8 +38,10 @@
               $out/bin/dictator completion fish > $out/share/fish/vendor_completions.d/dictator.fish
             '';
 
-            # ensure tests run under nix
-            # doCheck = true;
+            # Tests that spawn /bin/sh can fork while a parallel test holds a
+            # flock or listening socket; the child keeps that descriptor alive
+            # until exec, so the lock and stale-socket tests fail intermittently.
+            checkFlags = [ "--test-threads=1" ];
 
             meta = with lib; {
               description = "native speech to text daemon for linux";
