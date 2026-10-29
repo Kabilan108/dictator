@@ -32,17 +32,16 @@ fi
 notes=$(mktemp)
 trap 'rm -f "$notes"' EXIT
 cat > "$notes" <<EOF
-CLI and GUI packages for x86_64-linux are available from the kabilan108 Cachix cache.
+CLI and GUI packages for x86_64-linux are available through the repository's Nix flake.
 
-With Nix, flakes, and the Cachix client installed:
+With Nix and flakes installed:
 
 \`\`\`sh
-cachix use kabilan108
 nix profile install github:kabilan108/dictator/$tag#default github:kabilan108/dictator/$tag#gui
 dictator version
 \`\`\`
 
-On NixOS, configure the cache declaratively as described in the README.
+Nix builds packages that are not already available from configured binary caches.
 
 The CLI tarball supports x86_64 Linux with glibc 2.35 or newer. It does not
 require Nix. Install the audio and desktop tools listed in its README.

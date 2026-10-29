@@ -50,20 +50,7 @@ the local acceptance checks and remaining platform limits.
 ## Install with Nix
 
 The flake provides CLI and GUI packages for `x86_64-linux`. Enable flakes and
-configure the public `kabilan108` cache. On NixOS, add this to your system
-configuration and apply your usual rebuild:
-
-```nix
-nix.settings = {
-  extra-substituters = [ "https://kabilan108.cachix.org" ];
-  extra-trusted-public-keys = [
-    "kabilan108.cachix.org-1:g8OqmhpqE1Bz9DjKTV17uQ3yzsfGcDB5fDgGfVC4t/o="
-  ];
-};
-```
-
-For other Nix installations, use `cachix use kabilan108` with the Cachix client
-installed. Then install the packages:
+install the packages:
 
 ```sh
 nix profile install github:kabilan108/dictator#default github:kabilan108/dictator#gui
@@ -73,13 +60,13 @@ dictator version
 For a specific release, use `github:kabilan108/dictator/vVERSION#default` and
 `github:kabilan108/dictator/vVERSION#gui`, replacing `VERSION` with its number.
 GUI packages require a release after the historical `v2.4.0` tag.
-The cache supplies prebuilt packages after that revision's cache workflow
-succeeds. A cache miss falls back to a local build.
+Nix builds packages that are not already available from your configured binary
+caches.
 
 NixOS/Home Manager users can keep these packages in their configuration
 instead of a user profile. Import `inputs.dictator.homeManagerModules.default`
 and configure `services.dictator`; enable `services.dictator.gui.enable` for
-the desktop app. Retain Dictator's own nixpkgs pin for cache compatibility.
+the desktop app. Retain Dictator's own nixpkgs pin for reproducible builds.
 See [builds and releases](docs/releases.md) for the workflow and version bumps.
 
 ## Install the Linux CLI archive

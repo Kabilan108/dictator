@@ -1,14 +1,9 @@
-name: Build, cache and release
+name: Build and release
 
 on:
   push:
     branches: [master]
   workflow_dispatch:
-    inputs:
-      cache_only:
-        description: Populate the cache without publishing a release
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -35,62 +30,22 @@ jobs:
       - id: plan
         run: python3 scripts/version.py --release-plan >> "$GITHUB_OUTPUT"
 
-  cache:
+  nix-build:
     needs: plan
     runs-on: ubuntu-24.04
-    outputs:
-      cli: ${{ steps.build.outputs.cli }}
-      gui: ${{ steps.build.outputs.gui }}
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@v4
-      - uses: cachix/cachix-action@v17
-        with:
-          name: kabilan108
-          skipPush: true
       - name: Build the CLI and GUI
-        id: build
         run: |
           nix build .#default --out-link result-cli -L
           nix build .#gui --out-link result-gui -L
           test "$(result-cli/bin/dictator version)" = "$(python3 scripts/version.py)"
-          echo "cli=$(readlink -f result-cli)" >> "$GITHUB_OUTPUT"
-          echo "gui=$(readlink -f result-gui)" >> "$GITHUB_OUTPUT"
-      - name: Upload application runtime closures only
-        env:
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          test -n "$CACHIX_AUTH_TOKEN" || { echo 'Configure the CACHIX_AUTH_TOKEN repository secret'; exit 1; }
-          cachix push kabilan108 "$(readlink -f result-cli)" "$(readlink -f result-gui)"
-
-  verify-cache:
-    needs: [plan, cache]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: DeterminateSystems/nix-installer-action@v4
-      - uses: cachix/cachix-action@v17
-        with:
-          name: kabilan108
-          skipPush: true
-      - name: Download both packages on a fresh runner with builds disabled
-        env:
-          CLI: ${{ needs.cache.outputs.cli }}
-          GUI: ${{ needs.cache.outputs.gui }}
-          VERSION: ${{ needs.plan.outputs.version }}
-        run: |
-          # Verify the roots are in our cache, then substitute their closures.
-          nix path-info --store https://kabilan108.cachix.org "$CLI" "$GUI"
-          nix build .#default --out-link result-cli --max-jobs 0 --builders '' -L
-          nix build .#gui --out-link result-gui --max-jobs 0 --builders '' -L
-          test "$(readlink -f result-cli)" = "$CLI"
-          test "$(readlink -f result-gui)" = "$GUI"
-          test "$(result-cli/bin/dictator version)" = "$VERSION"
           test -x result-gui/bin/dictator-gui
 
   cli-archive:
-    needs: [plan, verify-cache]
-    if: needs.plan.outputs.release == 'true' && inputs.cache_only != true
+    needs: [plan, nix-build]
+    if: needs.plan.outputs.release == 'true'
     runs-on: ubuntu-22.04
     env:
       DICTATOR_VERSION: ${{ needs.plan.outputs.version }}
@@ -127,7 +82,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [plan, verify-cache, cli-archive]
+    needs: [plan, cli-archive]
     permissions:
       contents: write
     runs-on: ubuntu-24.04
@@ -146,7 +101,7 @@ jobs:
         run: bash scripts/publish-release.sh
 
   notify:
-    needs: [check, plan, cache, verify-cache, cli-archive, publish]
+    needs: [check, plan, nix-build, cli-archive, publish]
     if: always() && (failure() || needs.publish.result == 'success')
     runs-on: ubuntu-24.04
     env:
