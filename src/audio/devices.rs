@@ -63,9 +63,19 @@ pub(crate) struct ResolvedMicrophone {
     pub source_name: String,
 }
 
+/// A resolved microphone and the preferences file version it came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Resolution {
+    pub microphone: ResolvedMicrophone,
+    /// Taken under the preferences lock after any write the resolution made
+    /// (seeding the file, appending a new device), so that write does not
+    /// look like a later priority change.
+    pub fingerprint: Option<Fingerprint>,
+}
+
 /// Resolves capture once. The returned Pulse source name remains fixed for the
 /// lifetime of a capture stream, even if preferences or defaults change.
-pub(crate) fn resolve_microphone() -> Result<ResolvedMicrophone> {
+pub(crate) fn resolve_microphone() -> Result<Resolution> {
     let discovery = discover_microphones()?;
     let _guard = PREFERENCES_LOCK.lock().unwrap();
     DeviceManager::system().resolve(&discovery)
@@ -160,7 +170,7 @@ impl DeviceManager {
         Ok(view_preferences(&saved, discovery))
     }
 
-    fn resolve(&self, discovery: &Discovery) -> Result<ResolvedMicrophone> {
+    fn resolve(&self, discovery: &Discovery) -> Result<Resolution> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
         let (saved, changed) = self.load_and_reconcile(discovery)?;
         if changed {
@@ -175,10 +185,13 @@ impl DeviceManager {
             }
         })?;
 
-        Ok(ResolvedMicrophone {
-            id: selected.id.clone(),
-            name: selected.name.clone(),
-            source_name: selected.source_name.clone(),
+        Ok(Resolution {
+            microphone: ResolvedMicrophone {
+                id: selected.id.clone(),
+                name: selected.name.clone(),
+                source_name: selected.source_name.clone(),
+            },
+            fingerprint: fingerprint_at(&self.preferences_path),
         })
     }
 
@@ -887,6 +900,22 @@ mod tests {
             .map(|microphone| (microphone.connected, microphone.bluetooth))
             .collect();
         assert_eq!(flags, [(true, true), (false, true), (true, false)]);
+    }
+
+    #[test]
+    fn resolution_reports_the_preferences_version_it_wrote() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        let manager = DeviceManager::at(path.clone());
+
+        // The first resolution seeds the file.
+        let seeded = manager.resolve(&discovery()).unwrap();
+        assert!(seeded.fingerprint.is_some());
+        assert_eq!(seeded.fingerprint, fingerprint_at(&path));
+
+        // Nothing new to record: the version is unchanged.
+        let again = manager.resolve(&discovery()).unwrap();
+        assert_eq!(again.fingerprint, seeded.fingerprint);
     }
 
     #[test]

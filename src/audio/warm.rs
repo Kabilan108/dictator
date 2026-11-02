@@ -367,9 +367,8 @@ impl Supervisor {
 
     /// Resolves the microphone and opens or swaps the stream to match.
     fn refresh(&mut self) {
-        let fingerprint = (self.backend.fingerprint)();
-        let microphone = match (self.backend.resolve)() {
-            Ok(microphone) => microphone,
+        let (microphone, fingerprint) = match (self.backend.resolve)() {
+            Ok(resolution) => (resolution.microphone, resolution.fingerprint),
             Err(err) => {
                 let live = self
                     .shared
@@ -584,7 +583,7 @@ mod tests {
     use crate::audio::capture::tests::{
         LIVE_SILENCE, microphone, options, quiet_level, shell_capture, wait_for,
     };
-    use crate::audio::devices::ResolvedMicrophone;
+    use crate::audio::devices::{Resolution, ResolvedMicrophone};
 
     struct Fake {
         selected: Arc<Mutex<Result<ResolvedMicrophone, String>>>,
@@ -605,6 +604,10 @@ mod tests {
                         .lock()
                         .unwrap()
                         .clone()
+                        .map(|microphone| Resolution {
+                            microphone,
+                            fingerprint: None,
+                        })
                         .map_err(|err: String| anyhow::anyhow!(err))
                 }),
                 fingerprint: Arc::new(|| None),

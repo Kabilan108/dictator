@@ -198,7 +198,7 @@ impl Recorder {
         }
 
         debug!("starting audio recording");
-        let (stream, warm) = match self.choose_stream()? {
+        let (stream, warm) = match self.choose_stream() {
             Choice::Warm(stream) => (stream, true),
             Choice::Cold(microphone) => (self.open_cold(microphone)?, false),
         };
@@ -238,27 +238,35 @@ impl Recorder {
         Ok(())
     }
 
-    fn choose_stream(&self) -> Result<Choice> {
+    fn choose_stream(&self) -> Choice {
         let Some(warm) = self.warm.acquire(Instant::now()) else {
-            return Ok(Choice::Cold(None));
+            return Choice::Cold(None);
         };
         if (self.backend.fingerprint)() == warm.fingerprint {
-            return Ok(Choice::Warm(warm.stream));
+            return Choice::Warm(warm.stream);
         }
         // Priorities changed since the warm stream was resolved.
         self.warm.resolve_soon();
-        let microphone = (self.backend.resolve)()?;
-        if microphone.source_name == warm.stream.microphone().source_name {
-            Ok(Choice::Warm(warm.stream))
-        } else {
-            Ok(Choice::Cold(Some(microphone)))
+        match (self.backend.resolve)() {
+            Ok(resolution)
+                if resolution.microphone.source_name != warm.stream.microphone().source_name =>
+            {
+                Choice::Cold(Some(resolution.microphone))
+            }
+            Ok(_) => Choice::Warm(warm.stream),
+            Err(err) => {
+                // The live stream is a validated non-Bluetooth input; a
+                // failed lookup should not cost the recording.
+                warn!(err = %format!("{err:#}"), "microphone lookup failed; using the warm microphone");
+                Choice::Warm(warm.stream)
+            }
         }
     }
 
     fn open_cold(&self, microphone: Option<ResolvedMicrophone>) -> Result<Arc<CaptureStream>> {
         let microphone = match microphone {
             Some(microphone) => microphone,
-            None => (self.backend.resolve)()?,
+            None => (self.backend.resolve)()?.microphone,
         };
         CaptureStream::open(
             &self.backend.capture,
@@ -535,7 +543,7 @@ mod tests {
     use super::*;
     use crate::audio::capture::CaptureCommand;
     use crate::audio::capture::tests::{LIVE_SILENCE, microphone, shell_capture, wait_for};
-    use crate::audio::devices::Fingerprint;
+    use crate::audio::devices::{Fingerprint, Resolution};
 
     fn cfg() -> AudioConfig {
         AudioConfig {
@@ -565,9 +573,16 @@ mod tests {
         (directory, command)
     }
 
+    fn resolution(source_name: &str, fingerprint: Option<Fingerprint>) -> Resolution {
+        Resolution {
+            microphone: microphone(source_name),
+            fingerprint,
+        }
+    }
+
     fn backend(capture: CaptureCommand) -> CaptureBackend {
         CaptureBackend {
-            resolve: Arc::new(|| Ok(microphone("fake"))),
+            resolve: Arc::new(|| Ok(resolution("fake", None))),
             fingerprint: Arc::new(|| None),
             capture,
             subscribe: None,
@@ -696,7 +711,7 @@ mod tests {
         let recorder = Recorder::with_backend(
             cfg(),
             CaptureBackend {
-                resolve: Arc::new(move || Ok(microphone(*resolve_selected.lock().unwrap()))),
+                resolve: Arc::new(move || Ok(resolution(*resolve_selected.lock().unwrap(), None))),
                 // Each generation stands for one version of the preferences file.
                 fingerprint: Arc::new(move || {
                     let generation =
@@ -713,15 +728,69 @@ mod tests {
 
         // Same microphone after the change: the warm stream is still used.
         generation.store(1, std::sync::atomic::Ordering::SeqCst);
-        assert!(matches!(recorder.choose_stream().unwrap(), Choice::Warm(_)));
+        assert!(matches!(recorder.choose_stream(), Choice::Warm(_)));
 
         // A different microphone after the change: cold start on the new one.
         *selected.lock().unwrap() = "usb";
         generation.store(2, std::sync::atomic::Ordering::SeqCst);
-        match recorder.choose_stream().unwrap() {
+        match recorder.choose_stream() {
             Choice::Cold(Some(microphone)) => assert_eq!(microphone.source_name, "usb"),
             _ => panic!("expected a cold start on the newly selected microphone"),
         }
+        recorder.close().unwrap();
+    }
+
+    /// A backend whose preferences file stays at version 1 and whose
+    /// resolver succeeds only `successes` times.
+    fn counting_backend(
+        capture: CaptureCommand,
+        successes: usize,
+    ) -> (CaptureBackend, Arc<Mutex<usize>>) {
+        let calls = Arc::new(Mutex::new(0));
+        let counted = Arc::clone(&calls);
+        let backend = CaptureBackend {
+            resolve: Arc::new(move || {
+                let mut calls = counted.lock().unwrap();
+                *calls += 1;
+                if *calls > successes {
+                    anyhow::bail!("temporary pactl discovery failure");
+                }
+                Ok(resolution("fake", Some(Fingerprint::for_test(1))))
+            }),
+            fingerprint: Arc::new(|| Some(Fingerprint::for_test(1))),
+            capture,
+            subscribe: None,
+        };
+        (backend, calls)
+    }
+
+    #[test]
+    fn unchanged_preferences_use_the_warm_stream_without_a_lookup() {
+        let (_directory, capture) = loud_capture();
+        let (backend, calls) = counting_backend(capture, 1);
+        let recorder = Recorder::with_backend(cfg(), backend).unwrap();
+        recorder.start_warm_microphone().unwrap();
+        wait_for(|| recorder.warm.acquire(Instant::now()).is_some());
+
+        // The resolver's own write (version 1) is what the warm stream holds.
+        assert!(matches!(recorder.choose_stream(), Choice::Warm(_)));
+        assert_eq!(*calls.lock().unwrap(), 1);
+        recorder.close().unwrap();
+    }
+
+    #[test]
+    fn failed_lookup_after_a_priority_change_keeps_the_warm_stream() {
+        let (_directory, capture) = loud_capture();
+        let (mut backend, calls) = counting_backend(capture, 1);
+        backend.fingerprint = Arc::new(|| Some(Fingerprint::for_test(2)));
+        let recorder = Recorder::with_backend(cfg(), backend).unwrap();
+        recorder.start_warm_microphone().unwrap();
+        wait_for(|| recorder.warm.acquire(Instant::now()).is_some());
+
+        assert!(matches!(recorder.choose_stream(), Choice::Warm(_)));
+        // The start path looked up once; the supervisor may follow after its
+        // debounce.
+        assert!(*calls.lock().unwrap() >= 2);
         recorder.close().unwrap();
     }
 

@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tracing::{error, info, warn};
 
-use super::devices::{Fingerprint, ResolvedMicrophone};
+use super::devices::{Fingerprint, Resolution, ResolvedMicrophone};
 use super::timeline::Timeline;
 
 /// A warm stream without audio for this long is not used for a recording.
@@ -36,7 +36,7 @@ pub(crate) struct LevelState {
     pub last_level_at: Option<Instant>,
 }
 
-pub(crate) type Resolver = Arc<dyn Fn() -> Result<ResolvedMicrophone> + Send + Sync>;
+pub(crate) type Resolver = Arc<dyn Fn() -> Result<Resolution> + Send + Sync>;
 pub(crate) type FingerprintFn = Arc<dyn Fn() -> Option<Fingerprint> + Send + Sync>;
 pub(crate) type CaptureCommand = Arc<dyn Fn(&str, u32) -> Command + Send + Sync>;
 pub(crate) type SubscribeCommand = Arc<dyn Fn() -> Command + Send + Sync>;
