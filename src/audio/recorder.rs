@@ -245,39 +245,39 @@ impl Recorder {
         let Some(warm) = self.warm.acquire(Instant::now()) else {
             return Choice::Cold(None);
         };
+        if (self.backend.fingerprint)() != warm.fingerprint {
+            // Priorities changed since the warm stream was resolved.
+            self.warm.resolve_soon();
+            match (self.backend.resolve)() {
+                Ok(resolution)
+                    if resolution.microphone.source_name
+                        != warm.stream.microphone().source_name =>
+                {
+                    return Choice::Cold(Some(resolution.microphone));
+                }
+                Ok(_) => {}
+                // A failed lookup should not cost the recording; the source
+                // check below still guards the warm stream.
+                Err(err) => {
+                    warn!(err = %format!("{err:#}"), "microphone lookup failed; using the warm microphone");
+                }
+            }
+        }
         // The sound server may have moved the stream since it opened, possibly
         // to a Bluetooth input; its buffer is then not this microphone's audio.
+        // Checked last, because the lookup above can take seconds.
         match warm.stream.check_source(&self.backend.locate) {
-            Placement::Selected => {}
+            Placement::Selected => Choice::Warm(warm.stream),
             Placement::Moved(_) => {
                 self.warm.resolve_soon();
-                return Choice::Cold(None);
+                Choice::Cold(None)
             }
             Placement::Unknown(err) => {
                 warn!(
                     err,
                     "could not confirm the warm microphone's source; starting a new capture"
                 );
-                return Choice::Cold(None);
-            }
-        }
-        if (self.backend.fingerprint)() == warm.fingerprint {
-            return Choice::Warm(warm.stream);
-        }
-        // Priorities changed since the warm stream was resolved.
-        self.warm.resolve_soon();
-        match (self.backend.resolve)() {
-            Ok(resolution)
-                if resolution.microphone.source_name != warm.stream.microphone().source_name =>
-            {
-                Choice::Cold(Some(resolution.microphone))
-            }
-            Ok(_) => Choice::Warm(warm.stream),
-            Err(err) => {
-                // The live stream is a validated non-Bluetooth input; a
-                // failed lookup should not cost the recording.
-                warn!(err = %format!("{err:#}"), "microphone lookup failed; using the warm microphone");
-                Choice::Warm(warm.stream)
+                Choice::Cold(None)
             }
         }
     }
@@ -561,7 +561,7 @@ mod tests {
 
     use super::*;
     use crate::audio::capture::tests::{
-        LIVE_SILENCE, microphone, on_own_source, shell_capture, wait_for,
+        LIVE_SILENCE, microphone, moved_to, on_own_source, shell_capture, wait_for,
     };
     use crate::audio::capture::{CaptureCommand, Locator};
     use crate::audio::devices::{Fingerprint, Resolution, StreamSource};
@@ -925,6 +925,46 @@ mod tests {
         // The start path looked up once; the supervisor may follow after its
         // debounce.
         assert!(*calls.lock().unwrap() >= 2);
+        recorder.close().unwrap();
+    }
+
+    #[test]
+    fn a_warm_stream_moved_during_a_slow_lookup_is_not_used() {
+        let (_directory, capture) = loud_capture();
+        let server = Arc::new(Mutex::new(on_own_source()));
+        let locate_server = Arc::clone(&server);
+        let move_server = Arc::clone(&server);
+        let calls = Mutex::new(0);
+        let recorder = Recorder::with_backend(
+            cfg(),
+            CaptureBackend {
+                // The first lookup opens the warm stream. The start path's
+                // lookup after a priority change times out, and the server
+                // moves the stream meanwhile.
+                resolve: Arc::new(move || {
+                    let mut calls = calls.lock().unwrap();
+                    *calls += 1;
+                    if *calls == 1 {
+                        return Ok(resolution("fake", Some(Fingerprint::for_test(1))));
+                    }
+                    *move_server.lock().unwrap() = moved_to("bluez_input.headset", true);
+                    anyhow::bail!("microphone discovery timed out");
+                }),
+                fingerprint: Arc::new(|| Some(Fingerprint::for_test(2))),
+                locate: Arc::new(move |stream| {
+                    let locate = locate_server.lock().unwrap().clone();
+                    locate(stream)
+                }),
+                ..backend(capture)
+            },
+        )
+        .unwrap();
+        recorder.start_warm_microphone().unwrap();
+        wait_for(|| recorder.warm.acquire(Instant::now()).is_some());
+        let warm = recorder.warm.acquire(Instant::now()).unwrap().stream;
+
+        assert!(matches!(recorder.choose_stream(), Choice::Cold(None)));
+        assert!(warm.shared().timeline.lock().unwrap().is_ended());
         recorder.close().unwrap();
     }
 

@@ -187,9 +187,11 @@ impl WarmMic {
     }
 
     /// Includes a recording's stream in the source checks the supervisor runs
-    /// when inputs change, until the recording lets go of it.
+    /// when inputs change, until the recording lets go of it. Also schedules
+    /// one check, so a move after the start path's own check is not missed.
     pub fn watch_recording(&self, stream: &Arc<CaptureStream>) {
         *self.shared.recording.lock().unwrap() = Arc::downgrade(stream);
+        self.resolve_soon();
     }
 
     /// Re-resolves the microphone soon and swaps the stream if it changed.
@@ -811,15 +813,18 @@ mod tests {
     /// Takes the live warm stream for a recording, as `Recorder::start` does.
     fn record(warm: &WarmMic) -> WarmStream {
         let recording = warm.acquire(Instant::now()).unwrap();
+        begin_recording(warm, &recording.stream);
         recording
-            .stream
+    }
+
+    fn begin_recording(warm: &WarmMic, stream: &Arc<CaptureStream>) {
+        stream
             .shared()
             .timeline
             .lock()
             .unwrap()
             .begin_session_at_stream_start(usize::MAX);
-        warm.watch_recording(&recording.stream);
-        recording
+        warm.watch_recording(stream);
     }
 
     fn laptop_moved_to_bluetooth(stream: &CaptureStream) -> anyhow::Result<Option<StreamSource>> {
@@ -870,6 +875,28 @@ mod tests {
             &usb.stream,
             &warm.acquire(Instant::now()).unwrap().stream
         ));
+        warm.shutdown();
+    }
+
+    #[test]
+    fn registering_a_recording_stream_schedules_a_check() {
+        let fake = fake(LIVE_SILENCE);
+        let warm = started(&fake);
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        let laptop = warm.acquire(Instant::now()).unwrap().stream;
+        *fake.selected.lock().unwrap() = Ok(microphone("usb"));
+        warm.resolve_soon();
+        wait_for(|| live_source(&warm).as_deref() == Some("usb"));
+
+        // The stream moves after the start path checked it but before the
+        // recording registers it; no device event follows.
+        *fake.server.lock().unwrap() = Arc::new(laptop_moved_to_bluetooth);
+        begin_recording(&warm, &laptop);
+        wait_for(|| laptop.shared().timeline.lock().unwrap().is_ended());
+        assert_eq!(
+            laptop.shared().timeline.lock().unwrap().error(),
+            Some("audio input moved from laptop to bluez_input.headset")
+        );
         warm.shutdown();
     }
 
