@@ -295,6 +295,7 @@ Notes:
 - `services.dictator.settings` or `services.dictator.configFile` is required when enabling the module.
 - `displayServer` controls the default runtime dependencies and environment (Wayland vs X11).
 - If you already manage a config file, set `services.dictator.configFile = /path/to/config.json;`.
+- `settings` is written to `config.json` as is, so provider options such as `send_vocabulary = true;` pass through. The glossary itself lives in the data directory, outside Home Manager's control (see [Vocabulary glossary](#vocabulary-glossary)).
 - To use `${env:VAR}` in the config, set `services.dictator.environmentFile` (supports strings like `${XDG_RUNTIME_DIR}/...`) or `services.dictator.environment`.
 - The service sandbox derives its writable config, data, and state directories
   from Home Manager's XDG paths, or from absolute `XDG_CONFIG_HOME`,
@@ -382,6 +383,9 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `mic resume` | Reopen the warm microphone after `mic release` |
 | `transcripts` | Manage transcript history |
 | `retry [AUDIO_FILE]` | Retry the latest failed transcription or a saved WAV file |
+| `glossary list` | Print the vocabulary glossary, one term per line |
+| `glossary add <TERM>` | Add a term to the glossary; quote terms with spaces |
+| `glossary remove <TERM>` | Remove a term, ignoring case |
 
 ### Microphone capture
 
@@ -483,6 +487,40 @@ The `notifications` field controls desktop notifications:
 | `"errors_only"` | Notify only when an operation fails |
 | `"off"` | Disable desktop notifications |
 
+### Vocabulary glossary
+
+[siren](https://github.com/Kabilan108/siren) can boost the spelling of a list of terms: names, tools, jargon. Dictator keeps that list in `$XDG_DATA_HOME/dictator/glossary.json` (default `~/.local/share/dictator/glossary.json`), outside the config directory, so you can edit it while Home Manager owns `config.json`. Edit it from the Glossary section of the desktop app's settings or with `dictator glossary add|remove|list`:
+
+```json
+{
+  "version": 1,
+  "terms": ["Claude", "tmux", "Sietch"]
+}
+```
+
+A provider receives the list only when it sets `send_vocabulary`, because other providers may reject an unknown form field:
+
+```json
+"siren": {
+  "endpoint": "https://siren.example/v1/audio/transcriptions",
+  "key": "${env:SIREN_API_KEY}",
+  "model": "nvidia/parakeet-tdt-0.6b-v2",
+  "send_vocabulary": true
+}
+```
+
+With the flag on, every request, including CLI retries and retries from the desktop app's history, carries the list as a JSON array in the `vocabulary` form field:
+
+| Glossary file | Field sent | Effect in siren |
+|---------------|------------|-----------------|
+| Missing | none | The server's default list |
+| `"terms": []` | `[]` | Boosting off |
+| Terms | `["Claude", ...]` | Boosts those terms |
+
+Removing the last term leaves an empty list, which turns boosting off. Delete the file to go back to the server's default list.
+
+The daemon checks the file before each request and rereads it only when it changed, so edits apply to the next transcription without a restart. Before sending, it trims each term and drops anything siren would reject with a 400, logging a warning: empty terms, terms over 64 characters, terms with control or invisible characters, case-insensitive duplicates, and terms past the 200th. If the file cannot be parsed, the daemon logs a warning and sends no field. The CLI and the desktop app refuse invalid terms when you add them.
+
 When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_DIR/dictator/osd.sock`, falling back to `/tmp/dictator-$UID/osd.sock` when `XDG_RUNTIME_DIR` is unavailable.
 
 ### Visual OSD Events
@@ -539,4 +577,5 @@ Run `dictator --log-level DEBUG daemon` for diagnostic output.
 - Application logs stored in `~/.local/state/dictator/app.log`
 - Audio recordings stored in `~/.local/share/dictator/recordings/`
 - Database stored in `~/.local/share/dictator/app.db`
+- Vocabulary glossary stored in `~/.local/share/dictator/glossary.json`
 - Config stored in `$XDG_CONFIG_HOME/dictator/config.json`, with `~/.config` as the default config root

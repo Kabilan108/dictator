@@ -44,6 +44,10 @@ pub struct Provider {
     pub key: String,
     #[serde(default)]
     pub model: String,
+    /// Send the glossary as a `vocabulary` form field. Only siren accepts it;
+    /// other providers may reject unknown fields.
+    #[serde(default)]
+    pub send_vocabulary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,6 +100,7 @@ pub fn default_config() -> Config {
             endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             key: String::new(),
             model: "gpt-4o-transcribe".to_string(),
+            send_vocabulary: false,
         },
     );
     Config {
@@ -434,6 +439,23 @@ mod tests {
         assert_eq!(cfg.audio.sample_rate, 16000);
         assert_eq!(cfg.notifications, NotificationMode::Off);
         assert_eq!(cfg.api.providers["openai"].model, "gpt-4o-transcribe");
+        assert!(!cfg.api.providers["openai"].send_vocabulary);
+    }
+
+    #[test]
+    fn send_vocabulary_is_per_provider_and_off_by_default() {
+        let mut base = serde_json::to_value(default_config()).unwrap();
+        deep_merge(
+            &mut base,
+            serde_json::json!({"api": {"providers": {
+                "siren": {"endpoint": "http://siren", "key": "k", "send_vocabulary": true},
+                "other": {"endpoint": "http://other", "key": "k"}
+            }}}),
+        );
+        let cfg: Config = serde_json::from_value(base).unwrap();
+        assert!(cfg.api.providers["siren"].send_vocabulary);
+        assert!(!cfg.api.providers["other"].send_vocabulary);
+        assert!(!cfg.api.providers["openai"].send_vocabulary);
     }
 
     #[test]
