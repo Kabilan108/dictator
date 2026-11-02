@@ -1,15 +1,16 @@
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use dictator::ipc::client::MAX_RESPONSE_BYTES;
 use dictator::ipc::server::MAX_COMMAND_BYTES;
 use dictator::ipc::{
-    ACTION_CANCEL, ACTION_START, ACTION_STATUS, ACTION_STOP, ACTION_TOGGLE, Client, CommandHandler,
-    DATA_KEY_LAST_ERROR, DATA_KEY_RECORDING_DURATION, DATA_KEY_STATE, DATA_KEY_UPTIME, DaemonState,
-    ERR_INVALID_COMMAND, LEGACY_SOCKET_PATH, Server, StatusData, default_socket_path,
+    ACTION_CANCEL, ACTION_MIC, ACTION_START, ACTION_STATUS, ACTION_STOP, ACTION_TOGGLE, Client,
+    CommandHandler, DATA_KEY_LAST_ERROR, DATA_KEY_MICROPHONE, DATA_KEY_RECORDING_DURATION,
+    DATA_KEY_STATE, DATA_KEY_UPTIME, DaemonState, ERR_INVALID_COMMAND, LEGACY_SOCKET_PATH,
+    MIC_RELEASE, MIC_RESUME, Server, StatusData, default_socket_path,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -19,14 +20,14 @@ struct FakeHandler {
 }
 
 impl CommandHandler for FakeHandler {
-    fn handle_start(&self) -> Result<()> {
+    fn handle_start(&self, _received_at: Instant) -> Result<()> {
         self.starts.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
-    fn handle_stop(&self) -> Result<()> {
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
         bail!("not currently recording")
     }
-    fn handle_toggle(&self) -> Result<()> {
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
     fn handle_cancel(&self) -> Result<()> {
@@ -240,17 +241,17 @@ struct BlockingHandler {
 }
 
 impl CommandHandler for BlockingHandler {
-    fn handle_start(&self) -> Result<()> {
+    fn handle_start(&self, _received_at: Instant) -> Result<()> {
         self.entered.send(()).unwrap();
         self.release.lock().unwrap().recv().unwrap();
         Ok(())
     }
 
-    fn handle_stop(&self) -> Result<()> {
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
 
-    fn handle_toggle(&self) -> Result<()> {
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
 
@@ -339,17 +340,17 @@ impl Drop for DropAwareHandler {
 }
 
 impl CommandHandler for DropAwareHandler {
-    fn handle_start(&self) -> Result<()> {
+    fn handle_start(&self, _received_at: Instant) -> Result<()> {
         self.entered.send(()).unwrap();
         self.release.lock().unwrap().recv().unwrap();
         Ok(())
     }
 
-    fn handle_stop(&self) -> Result<()> {
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
 
-    fn handle_toggle(&self) -> Result<()> {
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
 
@@ -399,4 +400,110 @@ async fn dropping_server_cancels_and_drains_its_tasks() {
         .unwrap()
         .expect("server task retained its handler after cancellation");
     let _ = request.await.unwrap();
+}
+
+struct ArrivalHandler {
+    release: Mutex<std_mpsc::Receiver<()>>,
+    arrivals: Mutex<Vec<Instant>>,
+    mic_actions: Mutex<Vec<String>>,
+}
+
+impl CommandHandler for ArrivalHandler {
+    fn handle_start(&self, received_at: Instant) -> Result<()> {
+        self.release.lock().unwrap().recv().unwrap();
+        self.arrivals.lock().unwrap().push(received_at);
+        Ok(())
+    }
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
+        Ok(())
+    }
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
+        Ok(())
+    }
+    fn handle_cancel(&self) -> Result<()> {
+        Ok(())
+    }
+    fn get_status(&self) -> StatusData {
+        StatusData {
+            state: DaemonState::Idle,
+            recording_duration: None,
+            last_error: None,
+            uptime: Duration::ZERO,
+        }
+    }
+    fn handle_mic(&self, action: &str) -> Result<String> {
+        self.mic_actions.lock().unwrap().push(action.to_owned());
+        Ok(format!("{action}d"))
+    }
+    fn get_microphone_status(&self) -> Option<String> {
+        Some("warm (Desk microphone)".into())
+    }
+}
+
+#[tokio::test]
+async fn commands_carry_their_arrival_time_and_mic_control_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dictator.sock");
+    let (release_tx, release_rx) = std_mpsc::channel();
+    let handler = Arc::new(ArrivalHandler {
+        release: Mutex::new(release_rx),
+        arrivals: Mutex::new(Vec::new()),
+        mic_actions: Mutex::new(Vec::new()),
+    });
+    let server = Server::with_path(handler.clone(), socket_path.clone());
+    server.start().await.unwrap();
+
+    let sent_at = Instant::now();
+    let start_path = socket_path.clone();
+    let start = tokio::spawn(async move {
+        Client::with_path(start_path)
+            .send_command(ACTION_START, &[])
+            .await
+    });
+    // The handler is stuck behind other work, as when a previous command
+    // still holds the daemon's command lock.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let released_at = Instant::now();
+    release_tx.send(()).unwrap();
+    assert!(start.await.unwrap().unwrap().success);
+    let arrival = handler.arrivals.lock().unwrap()[0];
+    assert!(arrival >= sent_at);
+    assert!(
+        released_at.duration_since(arrival) > Duration::from_millis(200),
+        "arrival time was taken when the handler ran"
+    );
+
+    let client = Client::with_path(socket_path);
+    let resp = client
+        .send_command(ACTION_MIC, &[MIC_RELEASE.into()])
+        .await
+        .unwrap();
+    assert!(resp.success, "{}", resp.error);
+    assert_eq!(resp.data[DATA_KEY_MICROPHONE], "released");
+    let resp = client
+        .send_command(ACTION_MIC, &[MIC_RESUME.into()])
+        .await
+        .unwrap();
+    assert_eq!(resp.data[DATA_KEY_MICROPHONE], "resumed");
+    for args in [
+        vec![],
+        vec!["open".to_string()],
+        vec![MIC_RELEASE.into(), MIC_RESUME.into()],
+    ] {
+        let resp = client.send_command(ACTION_MIC, &args).await.unwrap();
+        assert!(!resp.success);
+        assert!(
+            resp.error.contains("mic expects one argument"),
+            "{}",
+            resp.error
+        );
+    }
+    assert_eq!(
+        *handler.mic_actions.lock().unwrap(),
+        [MIC_RELEASE, MIC_RESUME]
+    );
+
+    let resp = client.status().await.unwrap();
+    assert_eq!(resp.data[DATA_KEY_MICROPHONE], "warm (Desk microphone)");
+    server.stop().await.unwrap();
 }

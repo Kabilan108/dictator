@@ -2075,16 +2075,12 @@ impl MainView {
                             div()
                                 .mt(px(4.))
                                 .text_size(px(11.))
-                                .text_color(if microphone.connected { GREEN } else { MUTED })
-                                .child(if microphone.connected {
-                                    if microphone.is_default {
-                                        "Connected · system default"
-                                    } else {
-                                        "Connected"
-                                    }
+                                .text_color(if microphone.connected && !microphone.bluetooth {
+                                    GREEN
                                 } else {
-                                    "Disconnected"
-                                }),
+                                    MUTED
+                                })
+                                .child(microphone_status_label(microphone)),
                         ),
                     )
                     .child(move_button(IconName::ArrowUp, index * 2, up_ids, cx))
@@ -2122,7 +2118,7 @@ impl MainView {
                     .text_size(px(12.))
                     .line_height(gpui::relative(1.6))
                     .text_color(MUTED)
-                    .child("Dictator uses the first connected input in this list. Disconnected inputs keep their place. Changes apply to the next recording."),
+                    .child("Dictator uses the first connected input in this list. Bluetooth inputs are never used. Disconnected inputs keep their place. Changes apply to the next recording."),
             )
             .child(microphones)
             .child(section_title("STATUS"))
@@ -2963,6 +2959,20 @@ fn cursor_logo(state: Option<DaemonState>) -> impl IntoElement {
         .child(div().w(px(2.)).h(px(8.)).rounded_full().bg(color))
         .child(div().w(px(4.)))
         .child(div().w(px(2.)).h(px(18.)).rounded_full().bg(color))
+}
+
+fn microphone_status_label(microphone: &Microphone) -> &'static str {
+    match (
+        microphone.bluetooth,
+        microphone.connected,
+        microphone.is_default,
+    ) {
+        (true, true, _) => "Bluetooth · not used",
+        (true, false, _) => "Bluetooth · disconnected · not used",
+        (false, true, true) => "Connected · system default",
+        (false, true, false) => "Connected",
+        (false, false, _) => "Disconnected",
+    }
 }
 
 fn moved_ids(microphones: &[Microphone], index: usize, direction: isize) -> Option<Vec<String>> {

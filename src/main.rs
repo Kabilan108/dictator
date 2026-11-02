@@ -64,6 +64,15 @@ enum Commands {
     ///
     /// shows the current status of the dictator daemon
     Status,
+    /// control the warm microphone
+    ///
+    /// the daemon keeps the selected microphone open while the session is
+    /// unlocked, so a recording includes the moment before the start command.
+    /// call 'release' before locking the screen and 'resume' after unlocking.
+    Mic {
+        #[command(subcommand)]
+        action: MicAction,
+    },
     /// retry a failed transcription
     ///
     /// retries the newest failed transcription, or a specific WAV recording
@@ -102,11 +111,23 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum MicAction {
+    /// close the warm microphone until 'resume'; a recording in progress keeps capturing
+    Release,
+    /// reopen the warm microphone
+    Resume,
+}
+
 async fn run_command(action: &str, success_msg: &str) {
+    run_command_with_args(action, &[], success_msg).await;
+}
+
+async fn run_command_with_args(action: &str, args: &[String], success_msg: &str) {
     let client = Client::new();
     let response = exit_if_error(
         client
-            .send_command(action, &[])
+            .send_command(action, args)
             .await
             .map_err(daemon::not_running),
         1,
@@ -134,6 +155,9 @@ async fn run_status() {
         }
         if let Some(last_error) = response.data.get(ipc::DATA_KEY_LAST_ERROR) {
             println!("  last error: {last_error}");
+        }
+        if let Some(microphone) = response.data.get(ipc::DATA_KEY_MICROPHONE) {
+            println!("  microphone: {microphone}");
         }
     } else {
         eprintln!("status command failed: {}", response.error);
@@ -307,6 +331,13 @@ fn run_async(command: Commands, daemon_runtime: bool) {
             Commands::Toggle => run_command(ipc::ACTION_TOGGLE, "toggled daemon").await,
             Commands::Cancel => run_command(ipc::ACTION_CANCEL, "operation canceled").await,
             Commands::Status => run_status().await,
+            Commands::Mic { action } => {
+                let (arg, message) = match action {
+                    MicAction::Release => (ipc::MIC_RELEASE, "microphone released"),
+                    MicAction::Resume => (ipc::MIC_RESUME, "microphone resumed"),
+                };
+                run_command_with_args(ipc::ACTION_MIC, &[arg.to_owned()], message).await
+            }
             Commands::Retry { audio_file } => match dictator::retry::run(audio_file).await {
                 Ok(output) => {
                     let mut stdout = io::stdout().lock();

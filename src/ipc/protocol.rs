@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 pub struct Command {
     /// unique identifier for request correlation
     pub id: String,
-    /// command action: start, stop, toggle, cancel, status
+    /// command action: start, stop, toggle, cancel, status, retry, mic
     pub action: String,
     /// optional command arguments
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -77,6 +77,11 @@ pub const ACTION_TOGGLE: &str = "toggle";
 pub const ACTION_CANCEL: &str = "cancel";
 pub const ACTION_STATUS: &str = "status";
 pub const ACTION_RETRY: &str = "retry";
+/// Takes one argument: [`MIC_RELEASE`] or [`MIC_RESUME`].
+pub const ACTION_MIC: &str = "mic";
+
+pub const MIC_RELEASE: &str = "release";
+pub const MIC_RESUME: &str = "resume";
 
 // Socket configuration
 pub const LEGACY_SOCKET_PATH: &str = "/tmp/dictator.sock";
@@ -117,6 +122,7 @@ pub const DATA_KEY_LAST_RECORDING_ID: &str = "last_recording_id";
 pub const DATA_KEY_LAST_RECORDING_GENERATION: &str = "last_recording_generation";
 pub const DATA_KEY_AUDIO_LEVEL_RMS: &str = "audio_level_rms";
 pub const DATA_KEY_AUDIO_LEVEL_PEAK: &str = "audio_level_peak";
+pub const DATA_KEY_MICROPHONE: &str = "microphone";
 
 // Error messages
 pub const ERR_INVALID_COMMAND: &str = "invalid command";

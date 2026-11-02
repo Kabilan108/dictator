@@ -1,7 +1,7 @@
 //! Lists microphone priorities and observes 1.5 seconds of capture without
 //! saving audio or sending it to a transcription provider.
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use dictator::audio::{Recorder, microphone_preferences};
@@ -13,10 +13,10 @@ fn main() -> Result<()> {
             "{}: {} ({})",
             microphone.id,
             microphone.name,
-            if microphone.connected {
-                "connected"
-            } else {
-                "disconnected"
+            match (microphone.connected, microphone.bluetooth) {
+                (_, true) => "bluetooth, never used",
+                (true, false) => "connected",
+                (false, false) => "disconnected",
             }
         );
     }
@@ -36,7 +36,7 @@ fn main() -> Result<()> {
         })),
         Duration::from_millis(20),
     );
-    recorder.start()?;
+    recorder.start(Instant::now())?;
     std::thread::sleep(Duration::from_millis(1500));
     let capture_error = recorder.take_error();
     recorder.cancel()?;

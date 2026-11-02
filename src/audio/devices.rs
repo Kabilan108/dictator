@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
@@ -27,6 +27,8 @@ pub struct Microphone {
     pub name: String,
     pub connected: bool,
     pub is_default: bool,
+    /// Bluetooth inputs keep their place in the list but are never used.
+    pub bluetooth: bool,
 }
 
 /// The complete ordered microphone preference list.
@@ -62,11 +64,46 @@ pub(crate) struct ResolvedMicrophone {
 }
 
 /// Resolves capture once. The returned Pulse source name remains fixed for the
-/// lifetime of the recording, even if preferences or defaults change.
+/// lifetime of a capture stream, even if preferences or defaults change.
 pub(crate) fn resolve_microphone() -> Result<ResolvedMicrophone> {
     let discovery = discover_microphones()?;
     let _guard = PREFERENCES_LOCK.lock().unwrap();
     DeviceManager::system().resolve(&discovery)
+}
+
+/// Identifies one version of the preferences file without reading it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Fingerprint {
+    inode: u64,
+    len: u64,
+    modified_ns: i128,
+}
+
+/// Lets the start path notice a priority change (from the desktop app or
+/// another process) with one `stat` instead of a pactl round trip.
+pub(crate) fn preferences_fingerprint() -> Option<Fingerprint> {
+    fingerprint_at(&CONFIG_DIR.join(PREFERENCES_FILE))
+}
+
+#[cfg(test)]
+impl Fingerprint {
+    pub(crate) fn for_test(version: u64) -> Self {
+        Self {
+            inode: version,
+            len: 0,
+            modified_ns: 0,
+        }
+    }
+}
+
+fn fingerprint_at(path: &Path) -> Option<Fingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    Some(Fingerprint {
+        inode: metadata.ino(),
+        len: metadata.len(),
+        modified_ns: i128::from(metadata.mtime()) * 1_000_000_000
+            + i128::from(metadata.mtime_nsec()),
+    })
 }
 
 struct DeviceManager {
@@ -130,8 +167,13 @@ impl DeviceManager {
             write_preferences(&self.preferences_path, &saved)?;
         }
 
-        let selected = select_microphone(&saved, discovery)
-            .ok_or_else(|| anyhow!("failed to open audio stream: no connected input device"))?;
+        let selected = select_microphone(&saved, discovery).ok_or_else(|| {
+            if discovery.microphones.is_empty() {
+                anyhow!("failed to open audio stream: no connected input device")
+            } else {
+                anyhow!("no non-Bluetooth microphone available")
+            }
+        })?;
 
         Ok(ResolvedMicrophone {
             id: selected.id.clone(),
@@ -149,24 +191,36 @@ impl DeviceManager {
     }
 }
 
+/// Picks the first connected microphone in priority order, then the system
+/// default, then any connected input. Bluetooth inputs are never selected,
+/// even when preferred or default.
 fn select_microphone<'a>(
     saved: &SavedPreferences,
     discovery: &'a Discovery,
 ) -> Option<&'a DiscoveredMicrophone> {
-    let connected: HashMap<_, _> = discovery
+    let usable: HashMap<_, _> = discovery
         .microphones
         .iter()
+        .filter(|microphone| !microphone.bluetooth)
         .map(|microphone| (microphone.id.as_str(), microphone))
         .collect();
     saved
         .microphones
         .iter()
-        .find_map(|saved| connected.get(saved.id.as_str()).copied())
+        .find_map(|saved| usable.get(saved.id.as_str()).copied())
+        .or_else(|| {
+            discovery.default_source.as_deref().and_then(|name| {
+                usable
+                    .values()
+                    .copied()
+                    .find(|microphone| microphone.source_name == name)
+            })
+        })
         .or_else(|| {
             discovery
-                .default_source
-                .as_deref()
-                .and_then(|name| discovery.microphones.iter().find(|m| m.source_name == name))
+                .microphones
+                .iter()
+                .find(|microphone| !microphone.bluetooth)
         })
 }
 
@@ -200,6 +254,7 @@ struct DiscoveredMicrophone {
     id: String,
     name: String,
     source_name: String,
+    bluetooth: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -291,6 +346,7 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
         }
 
         let id = stable_device_id(properties, source_name);
+        let bluetooth = is_bluetooth(properties, source_name);
         let name = source
             .get("description")
             .and_then(Value::as_str)
@@ -306,6 +362,7 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
             id: id.clone(),
             name,
             source_name: source_name.to_owned(),
+            bluetooth,
         };
         match by_id.get_mut(&id) {
             Some(existing) if default_source.as_deref() == Some(source_name) => {
@@ -337,6 +394,22 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
             .collect(),
         default_source,
     })
+}
+
+fn is_bluetooth(properties: Option<&serde_json::Map<String, Value>>, source_name: &str) -> bool {
+    let property = |key: &str| {
+        properties
+            .and_then(|values| values.get(key))
+            .and_then(Value::as_str)
+    };
+    property("device.bus") == Some("bluetooth")
+        || property("device.api") == Some("bluez5")
+        || source_name.starts_with("bluez_")
+}
+
+/// Bluetooth status for a saved microphone that is not connected right now.
+fn is_bluetooth_id(id: &str) -> bool {
+    id.starts_with("bluetooth:") || id.contains("bluez_")
 }
 
 fn stable_device_id(
@@ -415,6 +488,7 @@ fn view_preferences(saved: &SavedPreferences, discovery: &Discovery) -> Micropho
                     is_default: current.is_some_and(|m| {
                         discovery.default_source.as_deref() == Some(m.source_name.as_str())
                     }),
+                    bluetooth: current.map_or_else(|| is_bluetooth_id(&saved.id), |m| m.bluetooth),
                 }
             })
             .collect(),
@@ -691,7 +765,7 @@ mod tests {
         };
         assert_eq!(
             select_microphone(&saved, &discovery).unwrap().source_name,
-            "bluez_input.11_22_33.headset-head-unit"
+            "alsa_input.usb-mic.mono-fallback"
         );
 
         let unsaved = SavedPreferences::default();
@@ -699,6 +773,137 @@ mod tests {
             select_microphone(&unsaved, &discovery).unwrap().source_name,
             "alsa_input.usb-mic.mono-fallback"
         );
+    }
+
+    #[test]
+    fn bluetooth_inputs_are_flagged_and_never_selected() {
+        let discovery = discovery_from_pactl_json(
+            SOURCES.as_bytes(),
+            Some("bluez_input.11_22_33.headset-head-unit".into()),
+        )
+        .unwrap();
+        let flags: Vec<_> = discovery
+            .microphones
+            .iter()
+            .map(|microphone| (microphone.source_name.as_str(), microphone.bluetooth))
+            .collect();
+        assert_eq!(
+            flags,
+            [
+                ("bluez_input.11_22_33.headset-head-unit", true),
+                ("alsa_input.usb-mic.mono-fallback", false),
+            ]
+        );
+
+        // Preferred first and system default, but still skipped.
+        let saved = SavedPreferences {
+            microphones: vec![SavedMicrophone {
+                id: "bluetooth:11:22:33:44:55:66".into(),
+                name: "Travel Headset".into(),
+            }],
+            ..SavedPreferences::default()
+        };
+        assert_eq!(
+            select_microphone(&saved, &discovery).unwrap().source_name,
+            "alsa_input.usb-mic.mono-fallback"
+        );
+        assert_eq!(
+            select_microphone(&SavedPreferences::default(), &discovery)
+                .unwrap()
+                .source_name,
+            "alsa_input.usb-mic.mono-fallback"
+        );
+    }
+
+    #[test]
+    fn bluetooth_detection_covers_bus_api_and_source_name() {
+        let properties = |value: serde_json::Value| {
+            serde_json::from_value::<serde_json::Map<String, Value>>(value).unwrap()
+        };
+        assert!(is_bluetooth(
+            Some(&properties(serde_json::json!({"device.bus": "bluetooth"}))),
+            "alsa_input.renamed"
+        ));
+        assert!(is_bluetooth(
+            Some(&properties(serde_json::json!({"device.api": "bluez5"}))),
+            "renamed"
+        ));
+        assert!(is_bluetooth(None, "bluez_input.headset"));
+        assert!(!is_bluetooth(
+            Some(&properties(serde_json::json!({"device.bus": "usb"}))),
+            "alsa_input.usb-mic"
+        ));
+    }
+
+    #[test]
+    fn only_bluetooth_inputs_fail_with_a_clear_error() {
+        let only_bluetooth = r#"[{
+            "name": "bluez_input.11_22_33.headset-head-unit",
+            "description": "Travel Headset",
+            "monitor_source": "",
+            "properties": {"device.bus": "bluetooth", "device.string": "11:22:33:44:55:66"}
+        }]"#;
+        let directory = tempfile::tempdir().unwrap();
+        let manager = DeviceManager::at(directory.path().join(PREFERENCES_FILE));
+        let discovery = discovery_from_pactl_json(only_bluetooth.as_bytes(), None).unwrap();
+        assert_eq!(
+            manager.resolve(&discovery).unwrap_err().to_string(),
+            "no non-Bluetooth microphone available"
+        );
+
+        let nothing = discovery_from_pactl_json(b"[]", None).unwrap();
+        assert!(
+            manager
+                .resolve(&nothing)
+                .unwrap_err()
+                .to_string()
+                .contains("no connected input device")
+        );
+    }
+
+    #[test]
+    fn preference_view_marks_connected_and_saved_bluetooth_inputs() {
+        let saved = SavedPreferences {
+            microphones: vec![
+                SavedMicrophone {
+                    id: "bluetooth:11:22:33:44:55:66".into(),
+                    name: "Travel Headset".into(),
+                },
+                SavedMicrophone {
+                    id: "bluetooth:aa:bb:cc:dd:ee:ff".into(),
+                    name: "Disconnected earbuds".into(),
+                },
+                SavedMicrophone {
+                    id: "bus:pci-0000:00:14.0-usb-0:5:1.0".into(),
+                    name: "Desk microphone".into(),
+                },
+            ],
+            ..SavedPreferences::default()
+        };
+        let view = view_preferences(&saved, &discovery());
+        let flags: Vec<_> = view
+            .microphones
+            .iter()
+            .map(|microphone| (microphone.connected, microphone.bluetooth))
+            .collect();
+        assert_eq!(flags, [(true, true), (false, true), (true, false)]);
+    }
+
+    #[test]
+    fn fingerprint_changes_when_preferences_are_rewritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        assert_eq!(fingerprint_at(&path), None);
+
+        let mut saved = SavedPreferences::default();
+        reconcile(&mut saved, &discovery());
+        write_preferences(&path, &saved).unwrap();
+        let first = fingerprint_at(&path).unwrap();
+        assert_eq!(fingerprint_at(&path), Some(first));
+
+        saved.microphones.reverse();
+        write_preferences(&path, &saved).unwrap();
+        assert_ne!(fingerprint_at(&path), Some(first));
     }
 
     #[test]
