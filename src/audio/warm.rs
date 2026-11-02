@@ -8,6 +8,7 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -96,6 +97,9 @@ struct Shared {
     /// or a warm stream since replaced.
     recording: Mutex<Weak<CaptureStream>>,
     status: Mutex<WarmStatus>,
+    /// Set before a hold is sent, so a refresh in progress stops at its next
+    /// lookup instead of keeping `mic release` waiting behind all of them.
+    hold_requested: AtomicBool,
 }
 
 pub(crate) struct WarmMic {
@@ -111,6 +115,7 @@ impl WarmMic {
                 current: Mutex::new(None),
                 recording: Mutex::new(Weak::new()),
                 status: Mutex::new(WarmStatus::Off),
+                hold_requested: AtomicBool::new(false),
             }),
             events: Mutex::new(None),
             supervisor: Mutex::new(None),
@@ -142,6 +147,7 @@ impl WarmMic {
             resolve_at: None,
         };
         *self.shared.status.lock().unwrap() = WarmStatus::Opening;
+        self.shared.hold_requested.store(false, Ordering::SeqCst);
         *supervisor = Some(
             std::thread::Builder::new()
                 .name("dictator-warm-mic".into())
@@ -167,6 +173,7 @@ impl WarmMic {
     /// Closes the warm stream for `hold`. With `wait`, returns once the
     /// supervisor has closed it (bounded by [`ACK_TIMEOUT`]).
     pub fn hold(&self, hold: Hold, wait: bool) {
+        self.shared.hold_requested.store(true, Ordering::SeqCst);
         self.send_acked(|ack| Event::Hold(hold, ack), wait);
     }
 
@@ -294,6 +301,7 @@ impl Supervisor {
         let now = Instant::now();
         match event {
             Event::Hold(hold, ack) => {
+                self.shared.hold_requested.store(false, Ordering::SeqCst);
                 match hold {
                     Hold::Released => self.released = true,
                     Hold::Asleep => self.asleep = true,
@@ -386,7 +394,14 @@ impl Supervisor {
         if self.close_if_moved() {
             self.resolve_at = Some(Instant::now() + RECHECK_UNPLACED);
         }
-        let (microphone, fingerprint) = match (self.backend.resolve)() {
+        if self.hold_requested() {
+            return;
+        }
+        let resolution = (self.backend.resolve)();
+        if self.hold_requested() {
+            return;
+        }
+        let (microphone, fingerprint) = match resolution {
             Ok(resolution) => (resolution.microphone, resolution.fingerprint),
             Err(err) => {
                 let working = self
@@ -484,6 +499,7 @@ impl Supervisor {
             }
         }
         if let Some(stream) = &recording
+            && !self.hold_requested()
             && !current
                 .as_ref()
                 .is_some_and(|warm| Arc::ptr_eq(&warm.stream, stream))
@@ -498,6 +514,11 @@ impl Supervisor {
             );
         }
         unplaced.is_some()
+    }
+
+    /// A hold is on its way; the run loop should take it before more lookups.
+    fn hold_requested(&self) -> bool {
+        self.shared.hold_requested.load(Ordering::SeqCst)
     }
 
     fn fail(&mut self, error: String) {
@@ -735,6 +756,56 @@ mod tests {
         wait_for(|| live_source(&warm).is_some());
         warm.shutdown();
         assert_eq!(warm.status(), WarmStatus::Off);
+    }
+
+    #[test]
+    fn release_does_not_wait_behind_a_slow_refresh() {
+        const LOOKUP: Duration = Duration::from_millis(1_500);
+        let fake = fake(LIVE_SILENCE);
+        let slow = Arc::new(AtomicBool::new(false));
+        let looking_up = Arc::new(AtomicBool::new(false));
+        let resolve = fake.backend.resolve.clone();
+        let locate = fake.backend.locate.clone();
+        let (resolve_slow, locate_slow, locate_started) = (
+            Arc::clone(&slow),
+            Arc::clone(&slow),
+            Arc::clone(&looking_up),
+        );
+        let backend = CaptureBackend {
+            resolve: Arc::new(move || {
+                if resolve_slow.load(Ordering::SeqCst) {
+                    std::thread::sleep(LOOKUP);
+                }
+                resolve()
+            }),
+            locate: Arc::new(move |stream| {
+                if locate_slow.load(Ordering::SeqCst) {
+                    locate_started.store(true, Ordering::SeqCst);
+                    std::thread::sleep(LOOKUP);
+                }
+                locate(stream)
+            }),
+            ..fake.backend.clone()
+        };
+        let warm = WarmMic::new();
+        warm.start(backend, options(), quiet_level()).unwrap();
+        wait_for(|| live_source(&warm).is_some());
+
+        // A device event starts a refresh whose lookups each take 1.5 s.
+        slow.store(true, Ordering::SeqCst);
+        warm.resolve_soon();
+        wait_for(|| looking_up.load(Ordering::SeqCst));
+        let released_at = Instant::now();
+        warm.hold(Hold::Released, true);
+
+        // The release waits for the lookup in flight, not the whole refresh.
+        assert!(warm.shared.current.lock().unwrap().is_none());
+        assert!(
+            released_at.elapsed() < LOOKUP + LOOKUP / 2,
+            "{:?}",
+            released_at.elapsed()
+        );
+        warm.shutdown();
     }
 
     #[test]
