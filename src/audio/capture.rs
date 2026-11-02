@@ -330,9 +330,28 @@ impl CaptureStream {
     }
 
     /// Checks with the sound server that the stream still records from the
-    /// source it was opened on. PipeWire ends a stream whose device goes away,
-    /// but PulseAudio moves it to another source, which may be Bluetooth.
-    pub fn placement(&self, locate: &Locator) -> Placement {
+    /// source it was opened on, and ends it with an error if not, so neither
+    /// its buffer nor a recording using it takes audio from another source.
+    /// PipeWire ends a stream whose device goes away, but PulseAudio moves it
+    /// to another source, which may be Bluetooth.
+    pub fn check_source(&self, locate: &Locator) -> Placement {
+        let placement = self.placement(locate);
+        if let Placement::Moved(source) = &placement {
+            warn!(
+                opened = self.microphone.source_name,
+                now = source.source_name,
+                bluetooth = source.bluetooth,
+                "audio stream moved to another source; closing it"
+            );
+            self.fail(format!(
+                "audio input moved from {} to {}",
+                self.microphone.name, source.source_name
+            ));
+        }
+        placement
+    }
+
+    fn placement(&self, locate: &Locator) -> Placement {
         match locate(self) {
             Ok(Some(source))
                 if source.source_name == self.microphone.source_name && !source.bluetooth =>
@@ -347,7 +366,7 @@ impl CaptureStream {
 
     /// Stops the process and ends the stream with `error`, which a recording
     /// still using it reports.
-    pub fn fail(&self, error: String) {
+    fn fail(&self, error: String) {
         self.shared.timeline.lock().unwrap().mark_ended(Some(error));
         self.shared.progress.notify_all();
         self.close();
@@ -799,6 +818,16 @@ pub(crate) mod tests {
         assert_eq!(
             stream.placement(&failing),
             Placement::Unknown("pactl timed out".into())
+        );
+
+        // Only a check that finds the stream moved ends it.
+        stream.check_source(&unlisted);
+        stream.check_source(&on_own_source());
+        assert!(stream.is_live(Instant::now()));
+        stream.check_source(&moved_to("bluez_input.headset", true));
+        assert_eq!(
+            stream.shared().timeline.lock().unwrap().error(),
+            Some("audio input moved from usb to bluez_input.headset")
         );
     }
 

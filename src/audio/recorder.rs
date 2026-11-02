@@ -217,6 +217,7 @@ impl Recorder {
         self.level.lock().unwrap().last_level_at = None;
 
         let microphone = stream.microphone().name.clone();
+        self.warm.watch_recording(&stream);
         let behind = chrono::Duration::from_std(Instant::now().saturating_duration_since(at))
             .unwrap_or_default();
         let mut inner = self.inner.lock().unwrap();
@@ -246,14 +247,9 @@ impl Recorder {
         };
         // The sound server may have moved the stream since it opened, possibly
         // to a Bluetooth input; its buffer is then not this microphone's audio.
-        match warm.stream.placement(&self.backend.locate) {
+        match warm.stream.check_source(&self.backend.locate) {
             Placement::Selected => {}
-            Placement::Moved(source) => {
-                warn!(
-                    now = source.source_name,
-                    bluetooth = source.bluetooth,
-                    "warm microphone moved to another source; starting a new capture"
-                );
+            Placement::Moved(_) => {
                 self.warm.resolve_soon();
                 return Choice::Cold(None);
             }
@@ -565,10 +561,10 @@ mod tests {
 
     use super::*;
     use crate::audio::capture::tests::{
-        LIVE_SILENCE, microphone, moved_to, on_own_source, shell_capture, wait_for,
+        LIVE_SILENCE, microphone, on_own_source, shell_capture, wait_for,
     };
     use crate::audio::capture::{CaptureCommand, Locator};
-    use crate::audio::devices::{Fingerprint, Resolution};
+    use crate::audio::devices::{Fingerprint, Resolution, StreamSource};
 
     fn cfg() -> AudioConfig {
         AudioConfig {
@@ -727,9 +723,8 @@ mod tests {
         recorder.close().unwrap();
     }
 
-    #[test]
-    fn a_warm_stream_off_its_source_is_not_used() {
-        let (_directory, capture) = loud_capture();
+    /// A recorder whose fake sound server answers through `server`.
+    fn located_recorder(capture: CaptureCommand) -> (Recorder, Arc<Mutex<Locator>>) {
         let server = Arc::new(Mutex::new(on_own_source()));
         let locate_server = Arc::clone(&server);
         let recorder = Recorder::with_backend(
@@ -745,24 +740,60 @@ mod tests {
         .unwrap();
         recorder.start_warm_microphone().unwrap();
         wait_for(|| recorder.warm.acquire(Instant::now()).is_some());
+        (recorder, server)
+    }
+
+    /// A server that reports the streams of `pids` on a Bluetooth headset.
+    fn moved_streams(pids: Vec<u32>) -> Locator {
+        Arc::new(move |stream| {
+            Ok(Some(if pids.contains(&stream.pid()) {
+                StreamSource {
+                    source_name: "bluez_input.headset".into(),
+                    bluetooth: true,
+                }
+            } else {
+                StreamSource {
+                    source_name: stream.microphone().source_name.clone(),
+                    bluetooth: false,
+                }
+            }))
+        })
+    }
+
+    #[test]
+    fn a_warm_stream_off_its_source_is_not_used() {
+        let (_directory, capture) = loud_capture();
+        let (recorder, server) = located_recorder(capture);
         assert!(matches!(recorder.choose_stream(), Choice::Warm(_)));
 
+        // A stream the server cannot place is skipped but kept.
         let unlisted: Locator = Arc::new(|_| Ok(None));
         let failing: Locator = Arc::new(|_| Err(anyhow!("pactl timed out")));
-        for locate in [moved_to("bluez_input.headset", true), unlisted, failing] {
+        for locate in [unlisted, failing] {
             *server.lock().unwrap() = locate;
             assert!(matches!(recorder.choose_stream(), Choice::Cold(None)));
         }
 
-        // The recording opens its own capture on the resolved microphone and
-        // takes no pre-roll from the warm buffer.
-        *server.lock().unwrap() = moved_to("bluez_input.headset", true);
+        // A moved stream is ended at once, so no later recording can take its
+        // buffer even if the server moves it back.
+        let original = recorder.warm.acquire(Instant::now()).unwrap().stream;
+        *server.lock().unwrap() = moved_streams(vec![original.pid()]);
+        assert!(matches!(recorder.choose_stream(), Choice::Cold(None)));
+        assert_eq!(
+            original.shared().timeline.lock().unwrap().error(),
+            Some("audio input moved from fake to bluez_input.headset")
+        );
+        *server.lock().unwrap() = on_own_source();
+        assert!(!original.is_live(Instant::now()));
+
+        // The recording opens its own capture and takes no pre-roll.
+        *server.lock().unwrap() = moved_streams(vec![original.pid()]);
         recorder.start(Instant::now()).unwrap();
         {
             let inner = recorder.inner.lock().unwrap();
             let session = inner.session.as_ref().unwrap();
             assert!(!session.warm);
-            assert_eq!(session.stream.microphone().source_name, "fake");
+            assert!(!Arc::ptr_eq(&session.stream, &original));
         }
         std::thread::sleep(Duration::from_millis(400));
         let StopOutcome::Recorded { summary, .. } = recorder.stop(Instant::now()).unwrap() else {
@@ -770,6 +801,35 @@ mod tests {
         };
         assert!(!summary.warm);
         assert_eq!(summary.preroll, Duration::ZERO);
+        recorder.close().unwrap();
+    }
+
+    #[test]
+    fn a_cold_recording_fails_when_its_stream_is_moved() {
+        let (_directory, capture) = loud_capture();
+        let (recorder, server) = located_recorder(capture);
+        let warm_pid = recorder.warm.acquire(Instant::now()).unwrap().stream.pid();
+        *server.lock().unwrap() = moved_streams(vec![warm_pid]);
+        recorder.start(Instant::now()).unwrap();
+        let cold_pid = {
+            let inner = recorder.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            assert!(!session.warm);
+            session.stream.pid()
+        };
+
+        *server.lock().unwrap() = moved_streams(vec![warm_pid, cold_pid]);
+        recorder.warm.resolve_soon();
+        let mut error = None;
+        wait_for(|| {
+            error = recorder.take_error();
+            error.is_some()
+        });
+        assert_eq!(
+            error.as_deref(),
+            Some("audio input moved from fake to bluez_input.headset")
+        );
+        recorder.cancel().unwrap();
         recorder.close().unwrap();
     }
 

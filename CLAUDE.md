@@ -46,7 +46,7 @@ The daemon implements a linear state machine:
 
 ### Audio capture
 
-- `audio/warm.rs`: a supervisor thread keeps one warm `parec` stream open on the selected microphone. It closes the stream for `dictator mic release` and logind suspend, reopens it with backoff, and swaps it when `pactl subscribe` reports source changes. Discovery and resolution run here. On each re-resolution, and in the start path before the warm buffer is used, the stream's source-output is looked up by `parec` PID; a stream the server moved to another source (PulseAudio does this on unplug) is closed and never used.
+- `audio/warm.rs`: a supervisor thread keeps one warm `parec` stream open on the selected microphone. It closes the stream for `dictator mic release` and logind suspend, reopens it with backoff, and swaps it when `pactl subscribe` reports source changes. Discovery and resolution run here. On each re-resolution (for the warm stream and the active recording's stream) and in the start path before the warm buffer is used, the stream's source-output is looked up by `parec` PID; a stream the server moved to another source (PulseAudio does this on unplug) is ended with an error and never used.
 - `audio/capture.rs`: one `parec` process feeding a `Timeline`. Streams are shared through `Arc`, so a recording keeps a released or swapped stream alive until it stops.
 - `audio/timeline.rs`: the ring buffer, sample-index mapping, pre-roll/tail slicing and gate math. Each chunk re-anchors sample indices to `Instant`, and IPC passes each command's arrival `Instant` through `CommandHandler`, so pre-roll and tail are cut at the keypress rather than when the handler ran.
 - `audio/devices.rs`: priority list and selection. Bluetooth sources are never selected.
