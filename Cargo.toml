@@ -37,6 +37,7 @@ uuid = { version = "1", features = ["v4"] }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 gpui = { version = "=0.2.2", optional = true }
 gpui-component = { version = "=0.5.1", optional = true }
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

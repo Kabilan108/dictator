@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -7,16 +7,20 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use crate::audio::{LevelSample, Recorder, TranscriptionRequest, WhisperClient, write_audio_data};
+use crate::audio::{
+    CaptureSummary, LevelSample, Recorder, StopOutcome, TranscriptionRequest, WhisperClient,
+    write_audio_data,
+};
 use crate::ipc::{self, CommandHandler, DaemonState, Server, StatusData};
 use crate::notifier::Notifier;
 use crate::storage::Db;
 use crate::typing::Typer;
-use crate::utils::{Config, NotificationMode};
+use crate::utils::{Config, NotificationMode, get_path_to_recording};
 use crate::visual::{self, Sink, SocketSink, StateEvent, StateValue};
 
 pub const ERROR_DISPLAY_DURATION: Duration = Duration::from_secs(5);
 pub const OSD_METER_UPDATE_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 30);
+const SYSTEM_BUS_TIMEOUT: Duration = Duration::from_secs(5);
 
 struct State {
     state: DaemonState,
@@ -213,6 +217,10 @@ impl Daemon {
             .map_err(|e| anyhow!("failed to show initial notification: {e}"))?;
         self.start_notification_worker();
         self.start_osd();
+        if let Err(err) = self.recorder.start_warm_microphone() {
+            warn!(err = %format!("{err:#}"), "recordings will use cold starts");
+        }
+        self.start_sleep_watcher();
 
         let handler: Arc<dyn CommandHandler> = Arc::new(Arc::clone(self));
         let server = Arc::new(Server::new(handler));
@@ -546,6 +554,25 @@ impl Daemon {
         terminal.generation = terminal.generation.wrapping_add(1).max(1);
     }
 
+    /// Closes the warm microphone across suspend using logind's
+    /// `PrepareForSleep`. Without the system bus, a stream that breaks during
+    /// suspend is still replaced by the warm-microphone health check.
+    fn start_sleep_watcher(self: &Arc<Self>) {
+        let daemon = Arc::downgrade(self);
+        let shutdown = self.shutdown_cancel.clone();
+        self.spawn_background(async move {
+            tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => {}
+                result = watch_sleep(daemon) => {
+                    if let Err(err) = result {
+                        warn!(err = %format!("{err:#}"), "suspend notifications unavailable");
+                    }
+                }
+            }
+        });
+    }
+
     // ---- error handling ------------------------------------------------
 
     fn handle_error_locked(self: &Arc<Self>, operation_id: Option<u64>, error_msg: String) {
@@ -622,15 +649,21 @@ impl Daemon {
         operation_id: u64,
         cancel: CancellationToken,
         recording_duration: Duration,
+        stopped_at: Instant,
     ) {
         if cancel.is_cancelled() {
             return;
         }
 
         let save_daemon = Arc::clone(&self);
-        let saved = tokio::task::spawn_blocking(move || save_daemon.save_recording()).await;
+        let saved =
+            tokio::task::spawn_blocking(move || save_daemon.save_recording(stopped_at)).await;
         let (audio_data, audio_path) = match saved {
-            Ok(Ok(value)) => value,
+            Ok(Ok(Some(value))) => value,
+            Ok(Ok(None)) => {
+                self.finish_discarded(operation_id).await;
+                return;
+            }
             Ok(Err(err)) => {
                 if !self
                     .persist_operation_capture_failure(
@@ -737,9 +770,22 @@ impl Daemon {
         }
     }
 
-    fn save_recording(&self) -> Result<(Vec<u8>, String)> {
-        let (audio_data, audio_path) = match self.recorder.stop() {
-            Ok(v) => v,
+    /// Returns `None` when the gate discarded the recording; nothing is
+    /// written, uploaded or added to history in that case.
+    fn save_recording(&self, stopped_at: Instant) -> Result<Option<(Vec<u8>, String)>> {
+        let (audio_data, audio_path) = match self.recorder.stop(stopped_at) {
+            Ok(StopOutcome::Recorded {
+                wav,
+                started,
+                summary,
+            }) => {
+                log_capture("recording captured", &summary, None);
+                (wav, get_path_to_recording(started)?)
+            }
+            Ok(StopOutcome::Discarded { verdict, summary }) => {
+                log_capture("recording discarded", &summary, Some(verdict.as_str()));
+                return Ok(None);
+            }
             Err(err) => {
                 error!(err = %err, "failed to stop recording");
                 return Err(err);
@@ -753,7 +799,25 @@ impl Daemon {
 
         let audio_path = audio_path.to_string_lossy().into_owned();
         info!(filepath = %audio_path, "audio saved");
-        Ok((audio_data, audio_path))
+        Ok(Some((audio_data, audio_path)))
+    }
+
+    async fn finish_discarded(self: &Arc<Self>, operation_id: u64) {
+        let daemon = Arc::clone(self);
+        let finished = tokio::task::spawn_blocking(move || {
+            let _command = daemon.command_lock.lock().unwrap();
+            let revision = daemon
+                .state
+                .write()
+                .unwrap()
+                .finish_operation(operation_id)?;
+            daemon.publish_osd_state(DaemonState::Idle, None, "");
+            Some(revision)
+        })
+        .await;
+        if let Ok(Some(revision)) = finished {
+            self.notify_state(DaemonState::Idle, revision);
+        }
     }
 
     fn persist_capture_failure(&self, duration: Duration, error_message: &str) {
@@ -992,7 +1056,7 @@ impl Daemon {
         pipeline.is_some()
     }
 
-    fn start_recording_locked(self: &Arc<Self>) -> Result<()> {
+    fn start_recording_locked(self: &Arc<Self>, received_at: Instant) -> Result<()> {
         if self.shutdown_cancel.is_cancelled() {
             bail!("daemon is shutting down");
         }
@@ -1011,7 +1075,7 @@ impl Daemon {
 
         debug!("starting recording");
         self.reset_audio_level();
-        if let Err(err) = self.recorder.start() {
+        if let Err(err) = self.recorder.start(received_at) {
             error!(err = %err, "failed to start recording");
             self.persist_capture_failure(Duration::ZERO, &format!("{err:#}"));
             self.handle_error_locked(None, format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED));
@@ -1162,12 +1226,16 @@ impl Daemon {
         Ok(recording_id)
     }
 
-    fn stop_recording_locked(self: &Arc<Self>, expected_operation_id: Option<u64>) -> Result<()> {
+    fn stop_recording_locked(
+        self: &Arc<Self>,
+        expected_operation_id: Option<u64>,
+        stopped_at: Instant,
+    ) -> Result<()> {
         if self.shutdown_cancel.is_cancelled() {
             bail!("daemon is shutting down");
         }
 
-        let recording_duration = self.recorder.get_recording_duration();
+        let recording_duration = self.recorder.duration_until(stopped_at);
         let (operation_id, cancel, revision) = {
             let mut state = self.state.write().unwrap();
             let Some((operation, revision)) =
@@ -1185,7 +1253,7 @@ impl Daemon {
         let daemon = Arc::clone(self);
         let task = self.runtime.spawn(async move {
             daemon
-                .transcribe_and_type(operation_id, cancel, recording_duration)
+                .transcribe_and_type(operation_id, cancel, recording_duration, stopped_at)
                 .await;
         });
         let mut pipeline = self.pipeline.lock().unwrap();
@@ -1342,30 +1410,44 @@ impl Daemon {
 
     fn stop_recording_at_limit(self: &Arc<Self>, operation_id: u64) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
-        self.stop_recording_locked(Some(operation_id))
+        self.stop_recording_locked(Some(operation_id), Instant::now())
     }
 }
 
 // ---- CommandHandler ----------------------------------------------------
 
 impl CommandHandler for Arc<Daemon> {
-    fn handle_start(&self) -> Result<()> {
+    fn handle_start(&self, received_at: Instant) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
-        self.start_recording_locked()
+        self.start_recording_locked(received_at)
     }
 
-    fn handle_stop(&self) -> Result<()> {
+    fn handle_stop(&self, received_at: Instant) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
-        self.stop_recording_locked(None)
+        self.stop_recording_locked(None, received_at)
     }
 
-    fn handle_toggle(&self) -> Result<()> {
+    fn handle_toggle(&self, received_at: Instant) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
         match self.current_state() {
-            DaemonState::Idle => self.start_recording_locked(),
-            DaemonState::Recording => self.stop_recording_locked(None),
+            DaemonState::Idle => self.start_recording_locked(received_at),
+            DaemonState::Recording => self.stop_recording_locked(None, received_at),
             other => bail!("cannot toggle in current state: {other}"),
         }
+    }
+
+    fn handle_mic(&self, action: &str) -> Result<String> {
+        match action {
+            ipc::MIC_RELEASE => self.recorder.release_microphone(),
+            ipc::MIC_RESUME => self.recorder.resume_microphone(),
+            other => bail!("unknown microphone action: {other}"),
+        }
+        info!(action, "microphone control");
+        Ok(self.recorder.microphone_status().to_string())
+    }
+
+    fn get_microphone_status(&self) -> Option<String> {
+        Some(self.recorder.microphone_status().to_string())
     }
 
     fn handle_cancel(&self) -> Result<()> {
@@ -1446,6 +1528,57 @@ fn osd_state_event(
         ),
         DaemonState::Idle => visual::new_state_event(StateValue::Idle, None, ""),
     }
+}
+
+fn log_capture(message: &str, summary: &CaptureSummary, reason: Option<&str>) {
+    let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    info!(
+        reason,
+        speech_ms = millis(summary.speech),
+        peak_dbfs = %format_args!("{:.1}", summary.loudest_dbfs),
+        audio_ms = millis(summary.audio),
+        preroll_ms = millis(summary.preroll),
+        tail_ms = millis(summary.tail),
+        warm = summary.warm,
+        "{message}"
+    );
+}
+
+async fn watch_sleep(daemon: Weak<Daemon>) -> Result<()> {
+    use futures_util::StreamExt;
+
+    let connection = tokio::time::timeout(SYSTEM_BUS_TIMEOUT, zbus::Connection::system())
+        .await
+        .map_err(|_| anyhow!("timed out connecting to the system bus"))??;
+    let rule = zbus::MatchRule::builder()
+        .msg_type(zbus::message::Type::Signal)
+        .sender("org.freedesktop.login1")?
+        .path("/org/freedesktop/login1")?
+        .interface("org.freedesktop.login1.Manager")?
+        .member("PrepareForSleep")?
+        .build();
+    let mut signals = tokio::time::timeout(
+        SYSTEM_BUS_TIMEOUT,
+        zbus::MessageStream::for_match_rule(rule, &connection, None),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out subscribing to logind sleep signals"))??;
+    debug!("watching logind sleep signals");
+    while let Some(message) = signals.next().await {
+        let asleep: bool = match message.and_then(|message| message.body().deserialize()) {
+            Ok(asleep) => asleep,
+            Err(err) => {
+                warn!(err = %err, "ignoring malformed PrepareForSleep signal");
+                continue;
+            }
+        };
+        let Some(daemon) = daemon.upgrade() else {
+            return Ok(());
+        };
+        info!(asleep, "system sleep state changed");
+        daemon.recorder.set_asleep(asleep);
+    }
+    Ok(())
 }
 
 pub fn not_running(err: anyhow::Error) -> anyhow::Error {
@@ -1677,7 +1810,7 @@ mod tests {
 
         assert!(
             daemon
-                .handle_start()
+                .handle_start(Instant::now())
                 .unwrap_err()
                 .to_string()
                 .contains("cannot start")
@@ -1886,7 +2019,7 @@ mod tests {
             task_started.notify_one();
             task_resume.notified().await;
             task_daemon
-                .transcribe_and_type(1, operation_a, Duration::from_secs(4))
+                .transcribe_and_type(1, operation_a, Duration::from_secs(4), Instant::now())
                 .await;
         });
 
@@ -2010,7 +2143,7 @@ mod tests {
         let manual = tokio::task::spawn_blocking(move || {
             manual_barrier.wait();
             let _command = manual_daemon.command_lock.lock().unwrap();
-            manual_daemon.stop_recording_locked(None)
+            manual_daemon.stop_recording_locked(None, Instant::now())
         });
         let timeout_daemon = Arc::clone(&daemon);
         let timeout = tokio::task::spawn_blocking(move || {

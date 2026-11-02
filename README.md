@@ -377,9 +377,31 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `stop` | Stop recording and start transcription |
 | `toggle` | Toggle between recording and idle states |
 | `cancel` | Cancel any ongoing operation |
-| `status` | Show daemon status and uptime |
+| `status` | Show daemon status, uptime and microphone state |
+| `mic release` | Close the warm microphone, for example before locking the screen |
+| `mic resume` | Reopen the warm microphone after `mic release` |
 | `transcripts` | Manage transcript history |
 | `retry [AUDIO_FILE]` | Retry the latest failed transcription or a saved WAV file |
+
+### Microphone capture
+
+While the session is unlocked, the daemon keeps one `parec` stream open on the selected microphone and holds the last 10 seconds in memory. A recording starts 450 ms before the start command reached the daemon and ends 200 ms after the stop command, so a first or last word spoken right at the keypress survives. If the warm stream is closed or broken when a recording starts, the daemon opens a new capture as before; that recording has no pre-roll.
+
+The microphone is the first connected input in the priority list (see the desktop app's settings), then the system default. Bluetooth inputs are never used, even when listed first or set as the default. If only Bluetooth inputs are connected, the recording fails with `no non-Bluetooth microphone available`. Before a recording uses the warm stream, and whenever inputs change, the daemon asks the sound server which source the warm stream and the recording's stream are recording from. PulseAudio moves a stream to the default source when its microphone is unplugged; a stream found on any source but its own is closed, its buffer is dropped, and a recording using it fails. Plugging in a microphone, removing one, or changing the default source moves the warm stream to the new selection within about a second. A priority change in the desktop app takes effect at the next recording.
+
+Close the warm stream while the screen is locked by wrapping the locker:
+
+```bash
+dictator mic release
+swaylock    # blocks until unlocked
+dictator mic resume
+```
+
+Run swaylock without `-f` here: `-f` returns as soon as the screen locks, which would reopen the microphone immediately. swayidle's `unlock` hook runs on logind's `Unlock` signal, which swaylock does not send, so it cannot carry `mic resume`. `mic release` returns once the stream is closed. A recording in progress keeps capturing until it stops or reaches `max_duration_min`.
+
+The daemon also closes the stream on suspend and reopens it on resume through logind's `PrepareForSleep` signal; this needs no configuration. A `mic release` stays in effect across suspend, and a daemon restart clears it.
+
+The daemon discards a recording without contacting the provider when the time from start to stop is under 300 ms, or when its loudest 30 ms window before the tail is quieter than -50 dBFS after removing DC offset. The level is relative to a full-scale amplitude of 1.0. A discarded recording is not pasted, saved to `recordings/`, or added to history. The OSD returns to idle, no error is shown, and the daemon logs `recording discarded` at INFO with the measured duration and level.
 
 ### Retrying a transcription
 
@@ -395,6 +417,8 @@ dictator retry > recovered.txt
 ```
 
 Retry prints the recovered text in the terminal and saves it to transcript history. It preserves the audio file. A successful retry removes that recording from the pending failures, so the next `dictator retry` selects the next most recent failure.
+
+When the daemon cannot connect to the provider at all, it tries once more after one second. It never resends after a timeout or after the request was sent, because the provider may still be working on the first copy.
 
 Only one CLI retry can run at a time. Ctrl-C cancels the request and keeps an existing failure available for another attempt. If the provider succeeds but history cannot be saved, the command still prints the recovered text, reports the storage error on stderr, and exits with a nonzero status.
 
@@ -445,7 +469,7 @@ Configuration file location: `$XDG_CONFIG_HOME/dictator/config.json`, defaulting
 }
 ```
 
-Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording.
+Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording. The recording buffer grows with the recording, so a long `max_duration_min` costs no memory until it is used; the warm stream itself holds 10 seconds (640 KB at 16 kHz).
 
 The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails. The supplied systemd user service loads variables from `~/.config/dictator/environment` when that file exists.
 
@@ -473,6 +497,8 @@ The OSD socket emits newline-delimited JSON. A new client receives a current sta
 {"type":"state","value":"error","message":"transcription failed"}
 {"type":"state","value":"idle"}
 ```
+
+A recording that the daemon discards as too short or silent goes from `transcribing` straight to `idle`.
 
 State events are delivered in order to healthy connected clients. Meter events are best effort: if the OSD falls behind, Dictator keeps only the latest pending meter sample.
 

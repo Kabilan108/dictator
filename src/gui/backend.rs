@@ -93,6 +93,7 @@ pub struct Microphone {
     pub name: String,
     pub connected: bool,
     pub is_default: bool,
+    pub bluetooth: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -748,6 +749,7 @@ fn map_microphone(microphone: crate::audio::Microphone) -> Microphone {
         name: microphone.name,
         connected: microphone.connected,
         is_default: microphone.is_default,
+        bluetooth: microphone.bluetooth,
     }
 }
 
@@ -881,18 +883,21 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
             name: "USB microphone".to_string(),
             connected: true,
             is_default: false,
+            bluetooth: false,
         },
         Microphone {
             id: "headset".to_string(),
             name: "Bluetooth headset".to_string(),
-            connected: false,
+            connected: true,
             is_default: false,
+            bluetooth: true,
         },
         Microphone {
             id: "builtin".to_string(),
             name: "Built-in microphone".to_string(),
             connected: true,
             is_default: true,
+            bluetooth: false,
         },
     ];
     let mut status = Status {

@@ -3,7 +3,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -29,10 +29,13 @@ struct SocketIdentity {
 }
 
 /// Handles daemon commands received over IPC.
+///
+/// `received_at` is when the command's frame finished arriving, before any
+/// queueing behind other commands, so audio can be anchored to the keypress.
 pub trait CommandHandler: Send + Sync + 'static {
-    fn handle_start(&self) -> Result<()>;
-    fn handle_stop(&self) -> Result<()>;
-    fn handle_toggle(&self) -> Result<()>;
+    fn handle_start(&self, received_at: Instant) -> Result<()>;
+    fn handle_stop(&self, received_at: Instant) -> Result<()>;
+    fn handle_toggle(&self, received_at: Instant) -> Result<()>;
     fn handle_cancel(&self) -> Result<()>;
     fn get_status(&self) -> StatusData;
     fn handle_retry(&self, _recording_id: Option<i64>) -> Result<i64> {
@@ -45,6 +48,13 @@ pub trait CommandHandler: Send + Sync + 'static {
         None
     }
     fn get_recovered_text(&self) -> Option<String> {
+        None
+    }
+    /// Releases or resumes the warm microphone; returns its new status.
+    fn handle_mic(&self, _action: &str) -> Result<String> {
+        bail!("microphone control is not supported")
+    }
+    fn get_microphone_status(&self) -> Option<String> {
         None
     }
 }
@@ -221,6 +231,7 @@ async fn handle_connection(
                 }
             }
         };
+        let received_at = Instant::now();
 
         let response = match line {
             Ok(line) => match serde_json::from_slice::<Command>(&line) {
@@ -229,7 +240,7 @@ async fn handle_connection(
                     // handlers may block briefly (audio thread join, subprocesses)
                     let handler = Arc::clone(&handler);
                     let mut task = tokio::task::spawn_blocking(move || {
-                        process_command(handler.as_ref(), &cmd)
+                        process_command(handler.as_ref(), &cmd, received_at)
                     });
                     let response = tokio::select! {
                         biased;
@@ -320,7 +331,7 @@ where
     Ok(frame)
 }
 
-fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
+fn process_command(handler: &dyn CommandHandler, cmd: &Command, received_at: Instant) -> Response {
     let mut response = Response {
         id: cmd.id.clone(),
         success: false,
@@ -331,7 +342,7 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
     let mut err: Option<anyhow::Error> = None;
 
     match cmd.action.as_str() {
-        ACTION_START => match handler.handle_start() {
+        ACTION_START => match handler.handle_start(received_at) {
             Ok(()) => {
                 response.success = true;
                 response
@@ -340,7 +351,7 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
             }
             Err(e) => err = Some(e),
         },
-        ACTION_STOP => match handler.handle_stop() {
+        ACTION_STOP => match handler.handle_stop(received_at) {
             Ok(()) => {
                 response.success = true;
                 response
@@ -349,7 +360,7 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
             }
             Err(e) => err = Some(e),
         },
-        ACTION_TOGGLE => match handler.handle_toggle() {
+        ACTION_TOGGLE => match handler.handle_toggle(received_at) {
             Ok(()) => response.success = true,
             Err(e) => err = Some(e),
         },
@@ -380,6 +391,23 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
                     response
                         .data
                         .insert(DATA_KEY_STATE.into(), DaemonState::Transcribing.to_string());
+                }
+                Err(e) => err = Some(e),
+            }
+        }
+        ACTION_MIC => {
+            let result = match cmd.args.as_slice() {
+                [action] if action == MIC_RELEASE || action == MIC_RESUME => {
+                    handler.handle_mic(action)
+                }
+                _ => Err(anyhow!(
+                    "mic expects one argument: {MIC_RELEASE} or {MIC_RESUME}"
+                )),
+            };
+            match result {
+                Ok(status) => {
+                    response.success = true;
+                    response.data.insert(DATA_KEY_MICROPHONE.into(), status);
                 }
                 Err(e) => err = Some(e),
             }
@@ -421,6 +449,9 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command) -> Response {
             }
             if let Some(text) = handler.get_recovered_text() {
                 response.data.insert(DATA_KEY_TEXT.into(), text);
+            }
+            if let Some(microphone) = handler.get_microphone_status() {
+                response.data.insert(DATA_KEY_MICROPHONE.into(), microphone);
             }
         }
         other => {

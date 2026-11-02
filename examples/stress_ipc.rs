@@ -12,13 +12,13 @@ use tokio::task::JoinSet;
 
 struct Handler;
 impl CommandHandler for Handler {
-    fn handle_start(&self) -> Result<()> {
+    fn handle_start(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
-    fn handle_stop(&self) -> Result<()> {
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
-    fn handle_toggle(&self) -> Result<()> {
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
         Ok(())
     }
     fn handle_cancel(&self) -> Result<()> {
