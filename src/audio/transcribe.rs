@@ -80,12 +80,11 @@ impl WhisperClient {
 
         let url = normalize_endpoint(&provider.endpoint);
 
-        let mut response = None;
-        let mut last_err = None;
-
-        for attempt in 0..2 {
+        let mut attempts = 0;
+        let resp = loop {
+            attempts += 1;
             let form = build_form(req, model)?;
-            debug!(url = %url, model = %model, attempt = attempt + 1, "sending request");
+            debug!(url = %url, model = %model, attempt = attempts, "sending request");
 
             let send = self
                 .http
@@ -101,27 +100,22 @@ impl WhisperClient {
             };
 
             match result {
-                Ok(resp) => {
-                    response = Some(resp);
-                    break;
-                }
-                Err(err) => {
-                    last_err = Some(err);
-                    if attempt == 0 {
-                        warn!(attempt = attempt + 1, err = %last_err.as_ref().unwrap(), "request attempt failed, retrying");
-                        tokio::select! {
-                            _ = cancel.cancelled() => bail!("transcription cancelled"),
-                            _ = tokio::time::sleep(RETRY_DELAY) => {}
-                        }
+                Ok(resp) => break resp,
+                Err(err) if attempts == 1 && never_reached_server(&err) => {
+                    warn!(attempt = attempts, err = %err, "could not connect, retrying");
+                    tokio::select! {
+                        _ = cancel.cancelled() => bail!("transcription cancelled"),
+                        _ = tokio::time::sleep(RETRY_DELAY) => {}
                     }
                 }
+                Err(err) => {
+                    error!(err = %err, attempts, "transcription request failed");
+                    if attempts > 1 {
+                        bail!("request failed after {attempts} attempts: {err}");
+                    }
+                    bail!("request failed: {err}");
+                }
             }
-        }
-
-        let Some(resp) = response else {
-            let err = last_err.expect("error recorded on failure");
-            error!(err = %err, "all request attempts failed");
-            bail!("request failed after 2 attempts: {err}");
         };
 
         let status = resp.status();
@@ -147,6 +141,13 @@ impl WhisperClient {
         );
         Ok(parsed)
     }
+}
+
+/// Only a request that never reached the provider is safe to send again. After
+/// a timeout or any failure once the body was sent, the provider may still be
+/// transcribing, and a resend would queue a second inference behind the first.
+fn never_reached_server(err: &reqwest::Error) -> bool {
+    err.is_connect() && !err.is_timeout()
 }
 
 // Even a long dictation should fit comfortably within this limit. Bound both
@@ -356,6 +357,127 @@ mod tests {
         assert!(!server.is_finished());
         server.abort();
         let _ = server.await;
+    }
+
+    fn client_for(endpoint: String, timeout_secs: i64) -> WhisperClient {
+        let mut config = crate::utils::default_config().api;
+        config.timeout = timeout_secs;
+        let provider = config.providers.get_mut("openai").unwrap();
+        provider.endpoint = endpoint;
+        provider.key = "test-key".into();
+        WhisperClient::new(&config).unwrap()
+    }
+
+    /// Accepts connections, reads one request each, and never replies.
+    async fn silent_provider() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buffer = vec![0; 64 * 1024];
+                    while stream.read(&mut buffer).await.is_ok_and(|read| read > 0) {}
+                });
+            }
+        });
+        (endpoint, accepted)
+    }
+
+    #[tokio::test]
+    async fn timeout_after_sending_is_not_retried() {
+        let (endpoint, accepted) = silent_provider().await;
+        let client = client_for(endpoint, 1);
+        let started = std::time::Instant::now();
+        let error = client
+            .transcribe(&CancellationToken::new(), &request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("request failed: "), "{error}");
+        assert!(started.elapsed() < Duration::from_millis(1900));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn closed_connection_after_sending_is_not_retried() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            drop(reader);
+            // A second connection would mean the request was sent again.
+            tokio::time::timeout(Duration::from_millis(1500), listener.accept())
+                .await
+                .is_ok()
+        });
+        let error = client_for(endpoint, 10)
+            .transcribe(&CancellationToken::new(), &request())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.starts_with("request failed: "), "{error}");
+        assert!(!server.await.unwrap(), "request was retried");
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_retried_once() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let client = client_for(format!("http://{address}"), 10);
+        // The provider comes up during the retry delay.
+        let server = tokio::spawn(async move {
+            tokio::time::sleep(RETRY_DELAY / 3).await;
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let reply = br#"{"text":"second try"}"#;
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", reply.len());
+            reader.get_mut().write_all(head.as_bytes()).await.unwrap();
+            reader.get_mut().write_all(reply).await.unwrap();
+        });
+        let result = client
+            .transcribe(&CancellationToken::new(), &request())
+            .await
+            .unwrap();
+        assert_eq!(result.text, "second try");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_error_is_classified_as_never_sent() {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(never_reached_server(&error), "{error:?}");
     }
 
     #[test]
