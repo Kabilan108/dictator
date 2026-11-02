@@ -143,6 +143,8 @@ struct MainView {
     glossary: Option<Glossary>,
     glossary_input: Entity<InputState>,
     glossary_error: String,
+    /// Input values of adds awaiting a reply, oldest first.
+    glossary_adds: VecDeque<String>,
     status: Option<Status>,
     last_seen_recording_generation: Option<u64>,
     status_pending: bool,
@@ -270,6 +272,7 @@ impl MainView {
             glossary: None,
             glossary_input,
             glossary_error: String::new(),
+            glossary_adds: VecDeque::new(),
             status: None,
             last_seen_recording_generation: None,
             status_pending: true,
@@ -352,6 +355,7 @@ impl MainView {
         match crate::glossary::normalize_term(&value) {
             Ok(term) => {
                 self.glossary_error.clear();
+                self.glossary_adds.push_back(value);
                 self.backend.send(Request::AddGlossaryTerm(term));
             }
             Err(error) => self.glossary_error = error,
@@ -633,16 +637,22 @@ impl MainView {
                     }
                     Err(error) => self.glossary_error = error,
                 },
-                Reply::GlossaryAdded(result) => match result {
-                    Ok(glossary) => {
-                        self.glossary = Some(glossary);
-                        self.glossary_error.clear();
-                        self.glossary_input.update(cx, |input, cx| {
-                            input.set_value("", window, cx);
-                        });
+                Reply::GlossaryAdded(result) => {
+                    let current = self.glossary_input.read(cx).value().to_string();
+                    let unchanged = submitted_input_unchanged(&mut self.glossary_adds, &current);
+                    match result {
+                        Ok(glossary) => {
+                            self.glossary = Some(glossary);
+                            self.glossary_error.clear();
+                            if unchanged {
+                                self.glossary_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                        }
+                        Err(error) => self.glossary_error = error,
                     }
-                    Err(error) => self.glossary_error = error,
-                },
+                }
             }
         }
         let recording = self
@@ -3175,6 +3185,15 @@ fn glossary_notes(
     notes
 }
 
+/// Takes the oldest pending add, whose reply just arrived, and reports
+/// whether the input still holds what was submitted. Clearing it otherwise
+/// would erase a term typed while the add was queued.
+fn submitted_input_unchanged(pending: &mut VecDeque<String>, current: &str) -> bool {
+    pending
+        .pop_front()
+        .is_some_and(|submitted| submitted == current)
+}
+
 /// Flags a term while it is typed, but not an empty field.
 fn typing_glossary_error(value: &str) -> String {
     if value.trim().is_empty() {
@@ -3636,6 +3655,15 @@ mod state_tests {
             glossary_notes(Some(&filled), false, "openai"),
             ["Not sent: provider \"openai\" does not set send_vocabulary."]
         );
+    }
+
+    #[test]
+    fn add_reply_keeps_input_typed_after_submission() {
+        let mut pending = VecDeque::from(["tmux".to_string(), "Claude".to_string()]);
+        assert!(!submitted_input_unchanged(&mut pending, "Claude"));
+        assert!(submitted_input_unchanged(&mut pending, "Claude"));
+        assert!(pending.is_empty());
+        assert!(!submitted_input_unchanged(&mut pending, ""));
     }
 
     #[test]
