@@ -21,7 +21,8 @@ pub const SILENCE_DBFS: f64 = -50.0;
 /// Window length for the loudness gate.
 pub const GATE_WINDOW: Duration = Duration::from_millis(30);
 /// Extrapolation past the newest chunk covers samples still in flight, but a
-/// stalled stream must not place a command far beyond the received audio.
+/// stalled stream must not place a start command far beyond the received
+/// audio, or the recording would skip what arrives when delivery resumes.
 const MAX_LEAD: Duration = Duration::from_millis(100);
 /// Running window sums are recomputed this often to bound rounding drift.
 const RESYNC_SAMPLES: usize = 4096;
@@ -168,18 +169,19 @@ impl Timeline {
     /// Maps a monotonic instant to a sample index through the newest chunk.
     fn index_at(&self, at: Instant) -> Option<u64> {
         let (arrived, index) = self.anchor?;
-        let index = if at >= arrived {
+        Some(if at >= arrived {
             index.saturating_add(samples_for(at - arrived, self.sample_rate))
         } else {
             index.saturating_sub(samples_for(arrived - at, self.sample_rate))
-        };
-        Some(index.min(self.total + self.max_lead()))
+        })
     }
 
     /// Attaches a recording whose start command arrived at `at`, keeping up
     /// to `preroll` buffered samples before it. Returns the samples kept.
     pub fn begin_session(&mut self, at: Instant, preroll: u64, max_samples: usize) -> usize {
-        let speech_start = self.index_at(at).unwrap_or(self.total);
+        let speech_start = self
+            .index_at(at)
+            .map_or(self.total, |index| index.min(self.total + self.max_lead()));
         let start = speech_start.saturating_sub(preroll).max(self.oldest());
         // A command older than the ring keeps all of it, none as pre-roll.
         let speech_start = speech_start.max(start);
@@ -213,7 +215,10 @@ impl Timeline {
     }
 
     /// Marks the stop command at `at` and returns the exclusive sample index
-    /// the session needs before it can be finalized.
+    /// the session needs before it can be finalized. Unlike the start, the
+    /// stop is not capped at the received audio: during a delivery pause the
+    /// caller waits (bounded) for the buffered audio instead of cutting the
+    /// last word short.
     pub fn end_session(&mut self, at: Instant, tail: u64) -> Option<u64> {
         let speech_end = self.index_at(at).unwrap_or(self.total);
         let session = self.session.as_mut()?;
@@ -424,6 +429,23 @@ mod tests {
             timeline.session.as_ref().unwrap().speech_start,
             1_600 + 1_600
         );
+    }
+
+    #[test]
+    fn stop_during_a_delivery_pause_waits_for_its_full_endpoint() {
+        let mut timeline = Timeline::new(RATE, 32_000);
+        let epoch = Instant::now();
+        feed(&mut timeline, epoch, 16_000);
+        timeline.begin_session(epoch + ms(500), 0, usize::MAX);
+        // Delivery paused after 1.0 s of audio; stop arrived at 1.4 s.
+        let end = timeline.end_session(epoch + ms(1400), 3_200).unwrap();
+        assert_eq!(end, 22_400 + 3_200);
+        assert!(!timeline.reached(end));
+        feed(&mut timeline, epoch, 9_600);
+        assert!(timeline.reached(end));
+        let captured = timeline.take_session().unwrap();
+        assert_eq!(captured.speech_end, 22_400 - 8_000);
+        assert_eq!(captured.tail(), 3_200);
     }
 
     #[test]

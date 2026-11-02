@@ -348,16 +348,20 @@ impl Supervisor {
             self.refresh();
             return;
         }
-        let stalled = self
-            .shared
-            .current
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|warm| warm.stream.is_stalled(now, STALL_GRACE));
+        let (stalled, live) = match self.shared.current.lock().unwrap().as_ref() {
+            Some(warm) => (
+                warm.stream.is_stalled(now, STALL_GRACE),
+                warm.stream.is_live(now),
+            ),
+            None => (false, false),
+        };
         if stalled {
             self.replace(None);
             self.fail("warm microphone stream stopped delivering audio".into());
+        } else if live {
+            // Backoff resets only once a stream proves it delivers audio, so a
+            // parec that starts and dies at once keeps backing off.
+            self.failures = 0;
         }
     }
 
@@ -393,7 +397,6 @@ impl Supervisor {
                 && !warm.stream.is_stalled(Instant::now(), STALL_GRACE)
             {
                 warm.fingerprint = fingerprint;
-                self.failures = 0;
                 return;
             }
         }
@@ -420,7 +423,6 @@ impl Supervisor {
                     fingerprint,
                     generation,
                 }));
-                self.failures = 0;
                 *self.shared.status.lock().unwrap() = WarmStatus::Open(name.clone());
                 info!(microphone = name, "warm microphone open");
             }
@@ -707,6 +709,31 @@ mod tests {
         // and opens again after a one-second backoff.
         wait_for(|| fake.resolves.load(Ordering::SeqCst) >= 2);
         warm.shutdown();
+    }
+
+    #[test]
+    fn capture_that_dies_without_audio_keeps_backing_off() {
+        let fake = fake("sleep 0.05; exit 1");
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let opened_at = Arc::clone(&opened);
+        let resolve = fake.backend.resolve.clone();
+        let backend = CaptureBackend {
+            resolve: Arc::new(move || {
+                opened_at.lock().unwrap().push(Instant::now());
+                resolve()
+            }),
+            ..fake.backend.clone()
+        };
+        let warm = WarmMic::new();
+        warm.start(backend, options(), quiet_level()).unwrap();
+        wait_for(|| opened.lock().unwrap().len() >= 3);
+        warm.shutdown();
+        let opened = opened.lock().unwrap();
+        // Retries after one second, then two: the counter did not reset.
+        assert!(
+            opened[2] - opened[1] >= Duration::from_millis(1_800),
+            "{opened:?}"
+        );
     }
 
     #[test]
