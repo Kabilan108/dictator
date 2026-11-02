@@ -409,6 +409,79 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
     })
 }
 
+/// The source a capture process records from, as the sound server reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StreamSource {
+    pub source_name: String,
+    pub bluetooth: bool,
+}
+
+/// Looks up which source the capture process `pid` records from. `None` when
+/// the server lists no stream for that process.
+pub(crate) fn stream_source(pid: u32) -> Result<Option<StreamSource>> {
+    let outputs = pactl_json(&["list", "source-outputs"])?;
+    let Some(index) = source_index_for_process(&outputs, pid)? else {
+        return Ok(None);
+    };
+    let sources = pactl_json(&["list", "sources"])?;
+    source_by_index(&sources, index)
+}
+
+fn pactl_json(args: &[&str]) -> Result<Vec<u8>> {
+    let what = args.join(" ");
+    let output = bounded_output(
+        Command::new("pactl").arg("--format=json").args(args),
+        PACTL_TIMEOUT,
+        PACTL_OUTPUT_LIMIT,
+    )
+    .with_context(|| format!("failed to run pactl {what}"))?;
+    if output.timed_out {
+        bail!("pactl {what} timed out after {PACTL_TIMEOUT:?}");
+    }
+    if output.stdout_truncated {
+        bail!("pactl {what} output exceeded {PACTL_OUTPUT_LIMIT} bytes");
+    }
+    if !output.status.success() {
+        bail!(
+            "pactl {what} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
+}
+
+fn source_index_for_process(source_outputs: &[u8], pid: u32) -> Result<Option<u64>> {
+    let outputs: Vec<Value> =
+        serde_json::from_slice(source_outputs).context("failed to parse pactl stream data")?;
+    let pid = pid.to_string();
+    Ok(outputs
+        .iter()
+        .find(|output| {
+            output
+                .pointer("/properties/application.process.id")
+                .and_then(Value::as_str)
+                == Some(pid.as_str())
+        })
+        .and_then(|output| output.get("source"))
+        .and_then(Value::as_u64))
+}
+
+fn source_by_index(sources: &[u8], index: u64) -> Result<Option<StreamSource>> {
+    let sources: Vec<Value> =
+        serde_json::from_slice(sources).context("failed to parse pactl microphone data")?;
+    Ok(sources
+        .iter()
+        .find(|source| source.get("index").and_then(Value::as_u64) == Some(index))
+        .and_then(|source| {
+            let source_name = source.get("name").and_then(Value::as_str)?;
+            let properties = source.get("properties").and_then(Value::as_object);
+            Some(StreamSource {
+                source_name: source_name.to_owned(),
+                bluetooth: is_bluetooth(properties, source_name),
+            })
+        }))
+}
+
 fn is_bluetooth(properties: Option<&serde_json::Map<String, Value>>, source_name: &str) -> bool {
     let property = |key: &str| {
         properties
@@ -846,6 +919,42 @@ mod tests {
             Some(&properties(serde_json::json!({"device.bus": "usb"}))),
             "alsa_input.usb-mic"
         ));
+    }
+
+    #[test]
+    fn stream_source_is_found_by_capture_process_id() {
+        let outputs = br#"[
+          {"index": 90, "source": 3, "properties": {"application.process.id": "4100"}},
+          {"index": 91, "source": 5, "properties": {"application.process.id": "4242"}},
+          {"index": 92, "source": 9, "properties": {}}
+        ]"#;
+        let sources = br#"[
+          {"index": 3, "name": "alsa_input.usb-mic", "properties": {"device.bus": "usb"}},
+          {"index": 5, "name": "headset.renamed", "properties": {"device.bus": "bluetooth"}}
+        ]"#;
+        let located = |pid| {
+            source_index_for_process(outputs, pid)
+                .unwrap()
+                .map(|index| source_by_index(sources, index).unwrap())
+        };
+
+        assert_eq!(
+            located(4100),
+            Some(Some(StreamSource {
+                source_name: "alsa_input.usb-mic".into(),
+                bluetooth: false,
+            }))
+        );
+        assert_eq!(
+            located(4242),
+            Some(Some(StreamSource {
+                source_name: "headset.renamed".into(),
+                bluetooth: true,
+            }))
+        );
+        assert_eq!(located(7), None);
+        assert_eq!(source_by_index(sources, 9).unwrap(), None);
+        assert!(source_index_for_process(b"not json", 1).is_err());
     }
 
     #[test]

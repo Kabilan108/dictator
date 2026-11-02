@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use tracing::{error, info, warn};
 
-use super::devices::{Fingerprint, Resolution, ResolvedMicrophone};
+use super::devices::{Fingerprint, Resolution, ResolvedMicrophone, StreamSource};
 use super::timeline::Timeline;
 
 /// A warm stream without audio for this long is not used for a recording.
@@ -40,6 +40,8 @@ pub(crate) type Resolver = Arc<dyn Fn() -> Result<Resolution> + Send + Sync>;
 pub(crate) type FingerprintFn = Arc<dyn Fn() -> Option<Fingerprint> + Send + Sync>;
 pub(crate) type CaptureCommand = Arc<dyn Fn(&str, u32) -> Command + Send + Sync>;
 pub(crate) type SubscribeCommand = Arc<dyn Fn() -> Command + Send + Sync>;
+/// Asks the sound server which source a stream records from.
+pub(crate) type Locator = Arc<dyn Fn(&CaptureStream) -> Result<Option<StreamSource>> + Send + Sync>;
 
 /// External processes used for capture. Tests replace them with fakes.
 #[derive(Clone)]
@@ -48,6 +50,7 @@ pub(crate) struct CaptureBackend {
     pub fingerprint: FingerprintFn,
     pub capture: CaptureCommand,
     pub subscribe: Option<SubscribeCommand>,
+    pub locate: Locator,
 }
 
 impl CaptureBackend {
@@ -61,8 +64,20 @@ impl CaptureBackend {
                 command.arg("subscribe");
                 command
             })),
+            locate: Arc::new(|stream| super::devices::stream_source(stream.pid())),
         }
     }
+}
+
+/// Where the sound server says a stream records from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// The source it was opened on, which is not Bluetooth.
+    Selected,
+    /// Another source.
+    Moved(StreamSource),
+    /// The server could not be asked or does not list the stream.
+    Unknown(String),
 }
 
 #[derive(Clone, Copy)]
@@ -89,6 +104,7 @@ pub(crate) struct StreamShared {
 
 pub(crate) struct CaptureStream {
     microphone: ResolvedMicrophone,
+    pid: u32,
     shared: Arc<StreamShared>,
     opened_at: Instant,
     owner: Mutex<Option<OwnerHandle>>,
@@ -135,7 +151,7 @@ impl CaptureStream {
         // One coalesced level notification, capture completion, and control.
         let (command_tx, command_rx) = mpsc::sync_channel::<StreamCommand>(3);
         let reader_command_tx = command_tx.clone();
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32>>();
         let source_name = microphone.source_name.clone();
         let microphone_name = microphone.name.clone();
         let frames_per_block = options.frames_per_block;
@@ -221,7 +237,7 @@ impl CaptureStream {
                         return;
                     }
                 };
-                let _ = ready_tx.send(Ok(()));
+                let _ = ready_tx.send(Ok(child.id()));
 
                 let mut stopped = false;
                 while let Ok(command) = command_rx.recv() {
@@ -274,7 +290,7 @@ impl CaptureStream {
             .map_err(|e| anyhow!("failed to spawn audio thread: {e}"))?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(pid)) => {
                 info!(
                     microphone_id = microphone.id,
                     microphone = microphone_name,
@@ -283,6 +299,7 @@ impl CaptureStream {
                 );
                 Ok(Arc::new(Self {
                     microphone,
+                    pid,
                     shared,
                     opened_at: Instant::now(),
                     owner: Mutex::new(Some(OwnerHandle { command_tx, thread })),
@@ -305,6 +322,35 @@ impl CaptureStream {
 
     pub fn shared(&self) -> &Arc<StreamShared> {
         &self.shared
+    }
+
+    /// The capture process, which the sound server lists as the stream's owner.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Checks with the sound server that the stream still records from the
+    /// source it was opened on. PipeWire ends a stream whose device goes away,
+    /// but PulseAudio moves it to another source, which may be Bluetooth.
+    pub fn placement(&self, locate: &Locator) -> Placement {
+        match locate(self) {
+            Ok(Some(source))
+                if source.source_name == self.microphone.source_name && !source.bluetooth =>
+            {
+                Placement::Selected
+            }
+            Ok(Some(source)) => Placement::Moved(source),
+            Ok(None) => Placement::Unknown("the sound server does not list the stream".into()),
+            Err(err) => Placement::Unknown(format!("{err:#}")),
+        }
+    }
+
+    /// Stops the process and ends the stream with `error`, which a recording
+    /// still using it reports.
+    pub fn fail(&self, error: String) {
+        self.shared.timeline.lock().unwrap().mark_ended(Some(error));
+        self.shared.progress.notify_all();
+        self.close();
     }
 
     /// Delivering audio now: running and a chunk arrived within [`STALE_AFTER`].
@@ -558,6 +604,26 @@ pub(crate) mod tests {
         })
     }
 
+    /// A sound server that reports every stream on the source it was opened on.
+    pub(crate) fn on_own_source() -> Locator {
+        Arc::new(|stream| {
+            Ok(Some(StreamSource {
+                source_name: stream.microphone().source_name.clone(),
+                bluetooth: false,
+            }))
+        })
+    }
+
+    /// A sound server that reports every stream on `source_name`.
+    pub(crate) fn moved_to(source_name: &'static str, bluetooth: bool) -> Locator {
+        Arc::new(move |_| {
+            Ok(Some(StreamSource {
+                source_name: source_name.into(),
+                bluetooth,
+            }))
+        })
+    }
+
     /// 100 ms of float32 silence every 100 ms, until killed.
     pub(crate) const LIVE_SILENCE: &str =
         "while :; do head -c 6400 /dev/zero || exit 1; sleep 0.1; done";
@@ -695,6 +761,67 @@ pub(crate) mod tests {
         let timeline = stream.shared().timeline.lock().unwrap();
         assert!(timeline.is_ended());
         assert!(timeline.error().is_none());
+        assert!(ended_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn placement_compares_the_server_view_with_the_opened_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("pid");
+        let script = format!("echo $$ > '{}'; {LIVE_SILENCE}", pid_file.display());
+        let capture: CaptureCommand = Arc::new(move |_, _| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", &script]);
+            command
+        });
+        let stream =
+            CaptureStream::open(&capture, microphone("usb"), options(), quiet_level(), None)
+                .unwrap();
+        wait_for(|| stream.is_live(Instant::now()));
+        let reported = std::fs::read_to_string(&pid_file).unwrap();
+        assert_eq!(reported.trim(), stream.pid().to_string());
+
+        assert_eq!(stream.placement(&on_own_source()), Placement::Selected);
+        let moved = |source_name: &str, bluetooth| {
+            Placement::Moved(StreamSource {
+                source_name: source_name.into(),
+                bluetooth,
+            })
+        };
+        assert_eq!(
+            stream.placement(&moved_to("bluez_input.headset", true)),
+            moved("bluez_input.headset", true)
+        );
+        assert_eq!(stream.placement(&moved_to("usb", true)), moved("usb", true));
+        let unlisted: Locator = Arc::new(|_| Ok(None));
+        assert!(matches!(stream.placement(&unlisted), Placement::Unknown(_)));
+        let failing: Locator = Arc::new(|_| Err(anyhow!("pactl timed out")));
+        assert_eq!(
+            stream.placement(&failing),
+            Placement::Unknown("pactl timed out".into())
+        );
+    }
+
+    #[test]
+    fn failing_a_stream_stops_it_with_the_error() {
+        let (ended_tx, ended_rx) = mpsc::channel::<()>();
+        let stream = CaptureStream::open(
+            &shell_capture(LIVE_SILENCE),
+            microphone("fake"),
+            options(),
+            quiet_level(),
+            Some(Box::new(move || ended_tx.send(()).unwrap())),
+        )
+        .unwrap();
+        wait_for(|| stream.is_live(Instant::now()));
+
+        stream.fail("audio input moved".into());
+
+        assert!(!stream.is_live(Instant::now()));
+        assert!(stream.owner.lock().unwrap().is_none());
+        let timeline = stream.shared().timeline.lock().unwrap();
+        assert!(timeline.is_ended());
+        assert_eq!(timeline.error(), Some("audio input moved"));
         assert!(ended_rx.try_recv().is_err());
     }
 

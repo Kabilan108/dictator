@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use super::capture::{
-    CaptureBackend, CaptureStream, LevelState, StreamOptions, SubscribeCommand, on_capture_thread,
+    CaptureBackend, CaptureStream, LevelState, Placement, StreamOptions, SubscribeCommand,
+    on_capture_thread,
 };
 use super::devices::Fingerprint;
 
@@ -368,6 +369,7 @@ impl Supervisor {
 
     /// Resolves the microphone and opens or swaps the stream to match.
     fn refresh(&mut self) {
+        self.close_if_moved();
         let (microphone, fingerprint) = match (self.backend.resolve)() {
             Ok(resolution) => (resolution.microphone, resolution.fingerprint),
             Err(err) => {
@@ -435,6 +437,32 @@ impl Supervisor {
                     self.fail(format!("{err:#}"));
                 }
             }
+        }
+    }
+
+    /// Closes the warm stream, and ends it for a recording still using it,
+    /// when the sound server reports it on a source other than the one it
+    /// was opened on. A stream the server cannot place is kept: the start
+    /// path does not use it, and the next check retries.
+    fn close_if_moved(&mut self) {
+        let current = self.shared.current.lock().unwrap().clone();
+        let Some(warm) = current else {
+            return;
+        };
+        if let Placement::Moved(source) = warm.stream.placement(&self.backend.locate) {
+            let opened = &warm.stream.microphone().source_name;
+            warn!(
+                opened,
+                now = source.source_name,
+                bluetooth = source.bluetooth,
+                "warm microphone moved to another source; closing it"
+            );
+            self.replace(None);
+            warm.stream.fail(format!(
+                "audio input moved from {} to {}",
+                warm.stream.microphone().name,
+                source.source_name
+            ));
         }
     }
 
@@ -581,22 +609,28 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::audio::capture::Locator;
     use crate::audio::capture::tests::{
-        LIVE_SILENCE, microphone, options, quiet_level, shell_capture, wait_for,
+        LIVE_SILENCE, microphone, moved_to, on_own_source, options, quiet_level, shell_capture,
+        wait_for,
     };
     use crate::audio::devices::{Resolution, ResolvedMicrophone};
 
     struct Fake {
         selected: Arc<Mutex<Result<ResolvedMicrophone, String>>>,
         resolves: Arc<AtomicUsize>,
+        /// What the fake sound server says about where streams record from.
+        server: Arc<Mutex<Locator>>,
         backend: CaptureBackend,
     }
 
     fn fake(script: &'static str) -> Fake {
         let selected = Arc::new(Mutex::new(Ok(microphone("laptop"))));
         let resolves = Arc::new(AtomicUsize::new(0));
+        let server = Arc::new(Mutex::new(on_own_source()));
         let resolve_selected = Arc::clone(&selected);
         let resolve_count = Arc::clone(&resolves);
+        let locate_server = Arc::clone(&server);
         Fake {
             backend: CaptureBackend {
                 resolve: Arc::new(move || {
@@ -614,9 +648,14 @@ mod tests {
                 fingerprint: Arc::new(|| None),
                 capture: shell_capture(script),
                 subscribe: None,
+                locate: Arc::new(move |stream| {
+                    let locate = locate_server.lock().unwrap().clone();
+                    locate(stream)
+                }),
             },
             selected,
             resolves,
+            server,
         }
     }
 
@@ -702,6 +741,77 @@ mod tests {
         *fake.selected.lock().unwrap() = Ok(microphone("usb"));
         warm.resolve_soon();
         wait_for(|| live_source(&warm).as_deref() == Some("usb"));
+        warm.shutdown();
+    }
+
+    #[test]
+    fn a_stream_moved_to_another_source_is_closed_and_reopened() {
+        let fake = fake(LIVE_SILENCE);
+        let warm = started(&fake);
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        let recording = warm.acquire(Instant::now()).unwrap();
+
+        // The server moved the stream although the laptop mic is still selected.
+        *fake.server.lock().unwrap() = moved_to("bluez_input.headset", true);
+        warm.resolve_soon();
+        wait_for(|| {
+            recording
+                .stream
+                .shared()
+                .timeline
+                .lock()
+                .unwrap()
+                .is_ended()
+        });
+        assert_eq!(
+            recording.stream.shared().timeline.lock().unwrap().error(),
+            Some("audio input moved from laptop to bluez_input.headset")
+        );
+
+        // A new stream opens on the selected source.
+        *fake.server.lock().unwrap() = on_own_source();
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        let reopened = warm.acquire(Instant::now()).unwrap();
+        assert!(!Arc::ptr_eq(&recording.stream, &reopened.stream));
+        warm.shutdown();
+    }
+
+    #[test]
+    fn a_stream_moved_to_bluetooth_is_closed_when_no_other_microphone_remains() {
+        let fake = fake(LIVE_SILENCE);
+        let warm = started(&fake);
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+
+        // The selected USB mic is unplugged and PulseAudio moves the stream to
+        // the Bluetooth default.
+        *fake.selected.lock().unwrap() = Err("no non-Bluetooth microphone available".into());
+        *fake.server.lock().unwrap() = moved_to("bluez_input.headset", true);
+        warm.resolve_soon();
+        wait_for(|| {
+            warm.status() == WarmStatus::Unavailable("no non-Bluetooth microphone available".into())
+        });
+        assert!(warm.shared.current.lock().unwrap().is_none());
+        assert!(warm.acquire(Instant::now()).is_none());
+        warm.shutdown();
+    }
+
+    #[test]
+    fn a_stream_the_server_cannot_place_survives_a_failed_lookup() {
+        let fake = fake(LIVE_SILENCE);
+        let warm = started(&fake);
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        let original = warm.acquire(Instant::now()).unwrap();
+        let before = fake.resolves.load(Ordering::SeqCst);
+
+        *fake.selected.lock().unwrap() = Err("pactl timed out".into());
+        *fake.server.lock().unwrap() = Arc::new(|_| Err(anyhow::anyhow!("pactl timed out")));
+        warm.resolve_soon();
+        wait_for(|| fake.resolves.load(Ordering::SeqCst) > before);
+        assert!(Arc::ptr_eq(
+            &original.stream,
+            &warm.shared.current.lock().unwrap().as_ref().unwrap().stream
+        ));
+        assert!(!original.stream.shared().timeline.lock().unwrap().is_ended());
         warm.shutdown();
     }
 

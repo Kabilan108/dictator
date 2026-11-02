@@ -10,7 +10,9 @@ use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Local};
 use tracing::{debug, info, warn};
 
-use super::capture::{CaptureBackend, CaptureStream, LevelState, StreamOptions, on_capture_thread};
+use super::capture::{
+    CaptureBackend, CaptureStream, LevelState, Placement, StreamOptions, on_capture_thread,
+};
 use super::devices::ResolvedMicrophone;
 use super::timeline::{
     self, Captured, GATE_WINDOW, PREROLL, RING, TAIL, Verdict, duration_for, samples_for,
@@ -242,6 +244,27 @@ impl Recorder {
         let Some(warm) = self.warm.acquire(Instant::now()) else {
             return Choice::Cold(None);
         };
+        // The sound server may have moved the stream since it opened, possibly
+        // to a Bluetooth input; its buffer is then not this microphone's audio.
+        match warm.stream.placement(&self.backend.locate) {
+            Placement::Selected => {}
+            Placement::Moved(source) => {
+                warn!(
+                    now = source.source_name,
+                    bluetooth = source.bluetooth,
+                    "warm microphone moved to another source; starting a new capture"
+                );
+                self.warm.resolve_soon();
+                return Choice::Cold(None);
+            }
+            Placement::Unknown(err) => {
+                warn!(
+                    err,
+                    "could not confirm the warm microphone's source; starting a new capture"
+                );
+                return Choice::Cold(None);
+            }
+        }
         if (self.backend.fingerprint)() == warm.fingerprint {
             return Choice::Warm(warm.stream);
         }
@@ -541,8 +564,10 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
-    use crate::audio::capture::CaptureCommand;
-    use crate::audio::capture::tests::{LIVE_SILENCE, microphone, shell_capture, wait_for};
+    use crate::audio::capture::tests::{
+        LIVE_SILENCE, microphone, moved_to, on_own_source, shell_capture, wait_for,
+    };
+    use crate::audio::capture::{CaptureCommand, Locator};
     use crate::audio::devices::{Fingerprint, Resolution};
 
     fn cfg() -> AudioConfig {
@@ -586,6 +611,7 @@ mod tests {
             fingerprint: Arc::new(|| None),
             capture,
             subscribe: None,
+            locate: on_own_source(),
         }
     }
 
@@ -702,6 +728,52 @@ mod tests {
     }
 
     #[test]
+    fn a_warm_stream_off_its_source_is_not_used() {
+        let (_directory, capture) = loud_capture();
+        let server = Arc::new(Mutex::new(on_own_source()));
+        let locate_server = Arc::clone(&server);
+        let recorder = Recorder::with_backend(
+            cfg(),
+            CaptureBackend {
+                locate: Arc::new(move |stream| {
+                    let locate = locate_server.lock().unwrap().clone();
+                    locate(stream)
+                }),
+                ..backend(capture)
+            },
+        )
+        .unwrap();
+        recorder.start_warm_microphone().unwrap();
+        wait_for(|| recorder.warm.acquire(Instant::now()).is_some());
+        assert!(matches!(recorder.choose_stream(), Choice::Warm(_)));
+
+        let unlisted: Locator = Arc::new(|_| Ok(None));
+        let failing: Locator = Arc::new(|_| Err(anyhow!("pactl timed out")));
+        for locate in [moved_to("bluez_input.headset", true), unlisted, failing] {
+            *server.lock().unwrap() = locate;
+            assert!(matches!(recorder.choose_stream(), Choice::Cold(None)));
+        }
+
+        // The recording opens its own capture on the resolved microphone and
+        // takes no pre-roll from the warm buffer.
+        *server.lock().unwrap() = moved_to("bluez_input.headset", true);
+        recorder.start(Instant::now()).unwrap();
+        {
+            let inner = recorder.inner.lock().unwrap();
+            let session = inner.session.as_ref().unwrap();
+            assert!(!session.warm);
+            assert_eq!(session.stream.microphone().source_name, "fake");
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        let StopOutcome::Recorded { summary, .. } = recorder.stop(Instant::now()).unwrap() else {
+            panic!("cold recording was discarded");
+        };
+        assert!(!summary.warm);
+        assert_eq!(summary.preroll, Duration::ZERO);
+        recorder.close().unwrap();
+    }
+
+    #[test]
     fn changed_priorities_reresolve_before_using_the_warm_stream() {
         let (_directory, capture) = loud_capture();
         let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -720,6 +792,7 @@ mod tests {
                 }),
                 capture,
                 subscribe: None,
+                locate: on_own_source(),
             },
         )
         .unwrap();
@@ -760,6 +833,7 @@ mod tests {
             fingerprint: Arc::new(|| Some(Fingerprint::for_test(1))),
             capture,
             subscribe: None,
+            locate: on_own_source(),
         };
         (backend, calls)
     }
