@@ -22,6 +22,9 @@ use super::devices::Fingerprint;
 
 /// Coalesces bursts of device events into one re-resolution.
 const RESOLVE_DEBOUNCE: Duration = Duration::from_millis(300);
+/// How soon to check again when the server could not say where a recording's
+/// stream records from.
+const RECHECK_UNPLACED: Duration = Duration::from_secs(1);
 /// How long release and resume wait for the supervisor to act.
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the supervisor checks the stream for silence or exit.
@@ -324,9 +327,8 @@ impl Supervisor {
             }
             Event::Resolve | Event::Retry if self.is_held() => {}
             Event::Resolve => {
-                if self.resolve_at.is_none() {
-                    self.resolve_at = Some(now + RESOLVE_DEBOUNCE);
-                }
+                let at = now + RESOLVE_DEBOUNCE;
+                self.resolve_at = Some(self.resolve_at.map_or(at, |pending| pending.min(at)));
             }
             Event::Retry => {
                 // A stream that just opened has no audio yet but is not broken.
@@ -379,7 +381,9 @@ impl Supervisor {
 
     /// Resolves the microphone and opens or swaps the stream to match.
     fn refresh(&mut self) {
-        self.close_if_moved();
+        if self.close_if_moved() {
+            self.resolve_at = Some(Instant::now() + RECHECK_UNPLACED);
+        }
         let (microphone, fingerprint) = match (self.backend.resolve)() {
             Ok(resolution) => (resolution.microphone, resolution.fingerprint),
             Err(err) => {
@@ -453,23 +457,45 @@ impl Supervisor {
     /// Ends the warm stream and the recording's stream if the sound server
     /// reports either on a source other than the one it was opened on. A
     /// stream the server cannot place is kept: the start path does not use
-    /// it, and the next check retries.
-    fn close_if_moved(&mut self) {
+    /// it. Returns true when a recording's stream could not be placed, so the
+    /// caller checks again soon instead of waiting for the next device event.
+    fn close_if_moved(&mut self) -> bool {
         let current = self.shared.current.lock().unwrap().clone();
-        if let Some(warm) = &current
-            && matches!(
-                warm.stream.check_source(&self.backend.locate),
-                Placement::Moved(_)
-            )
-        {
-            self.replace(None);
+        let recording = self
+            .shared
+            .recording
+            .lock()
+            .unwrap()
+            .upgrade()
+            .filter(|stream| stream.shared().timeline.lock().unwrap().has_session());
+        let is_recording = |stream: &Arc<CaptureStream>| {
+            recording.as_ref().is_some_and(|r| Arc::ptr_eq(r, stream))
+        };
+        let mut unplaced = None;
+        if let Some(warm) = &current {
+            match warm.stream.check_source(&self.backend.locate) {
+                Placement::Moved(_) => {
+                    self.replace(None);
+                }
+                Placement::Unknown(err) if is_recording(&warm.stream) => unplaced = Some(err),
+                _ => {}
+            }
         }
-        let recording = self.shared.recording.lock().unwrap().upgrade();
-        if let Some(stream) = recording
-            && !current.is_some_and(|warm| Arc::ptr_eq(&warm.stream, &stream))
+        if let Some(stream) = &recording
+            && !current
+                .as_ref()
+                .is_some_and(|warm| Arc::ptr_eq(&warm.stream, stream))
+            && let Placement::Unknown(err) = stream.check_source(&self.backend.locate)
         {
-            stream.check_source(&self.backend.locate);
+            unplaced = Some(err);
         }
+        if let Some(err) = &unplaced {
+            warn!(
+                err,
+                "could not confirm the recording's audio source; checking again"
+            );
+        }
+        unplaced.is_some()
     }
 
     fn fail(&mut self, error: String) {
@@ -782,13 +808,41 @@ mod tests {
         warm.shutdown();
     }
 
+    /// Takes the live warm stream for a recording, as `Recorder::start` does.
+    fn record(warm: &WarmMic) -> WarmStream {
+        let recording = warm.acquire(Instant::now()).unwrap();
+        recording
+            .stream
+            .shared()
+            .timeline
+            .lock()
+            .unwrap()
+            .begin_session_at_stream_start(usize::MAX);
+        warm.watch_recording(&recording.stream);
+        recording
+    }
+
+    fn laptop_moved_to_bluetooth(stream: &CaptureStream) -> anyhow::Result<Option<StreamSource>> {
+        let source_name = stream.microphone().source_name.clone();
+        Ok(Some(if source_name == "laptop" {
+            StreamSource {
+                source_name: "bluez_input.headset".into(),
+                bluetooth: true,
+            }
+        } else {
+            StreamSource {
+                source_name,
+                bluetooth: false,
+            }
+        }))
+    }
+
     #[test]
     fn a_recording_stream_is_still_checked_after_a_swap() {
         let fake = fake(LIVE_SILENCE);
         let warm = started(&fake);
         wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
-        let recording = warm.acquire(Instant::now()).unwrap();
-        warm.watch_recording(&recording.stream);
+        let recording = record(&warm);
 
         // A preferred microphone appears during the recording.
         *fake.selected.lock().unwrap() = Ok(microphone("usb"));
@@ -797,20 +851,7 @@ mod tests {
         let usb = warm.acquire(Instant::now()).unwrap();
 
         // The laptop mic goes away and the server moves the recording's stream.
-        *fake.server.lock().unwrap() = Arc::new(|stream| {
-            let source_name = stream.microphone().source_name.clone();
-            Ok(Some(if source_name == "laptop" {
-                StreamSource {
-                    source_name: "bluez_input.headset".into(),
-                    bluetooth: true,
-                }
-            } else {
-                StreamSource {
-                    source_name,
-                    bluetooth: false,
-                }
-            }))
-        });
+        *fake.server.lock().unwrap() = Arc::new(laptop_moved_to_bluetooth);
         warm.resolve_soon();
         wait_for(|| {
             recording
@@ -829,6 +870,56 @@ mod tests {
             &usb.stream,
             &warm.acquire(Instant::now()).unwrap().stream
         ));
+        warm.shutdown();
+    }
+
+    #[test]
+    fn a_recording_stream_the_server_cannot_place_is_checked_again() {
+        let fake = fake(LIVE_SILENCE);
+        let warm = started(&fake);
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        let recording = record(&warm);
+        *fake.selected.lock().unwrap() = Ok(microphone("usb"));
+        warm.resolve_soon();
+        wait_for(|| live_source(&warm).as_deref() == Some("usb"));
+
+        // The recording's stream is moved, but the first lookup of it fails.
+        let failed_once = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        *fake.server.lock().unwrap() = Arc::new(move |stream| {
+            if stream.microphone().source_name == "laptop"
+                && !failed_once.swap(true, Ordering::SeqCst)
+            {
+                anyhow::bail!("pactl failed once");
+            }
+            laptop_moved_to_bluetooth(stream)
+        });
+        let before = fake.resolves.load(Ordering::SeqCst);
+        warm.resolve_soon();
+        wait_for(|| fake.resolves.load(Ordering::SeqCst) > before);
+        assert!(
+            !recording
+                .stream
+                .shared()
+                .timeline
+                .lock()
+                .unwrap()
+                .is_ended()
+        );
+
+        // No device event follows; the supervisor checks again by itself.
+        wait_for(|| {
+            recording
+                .stream
+                .shared()
+                .timeline
+                .lock()
+                .unwrap()
+                .is_ended()
+        });
+        assert_eq!(
+            recording.stream.shared().timeline.lock().unwrap().error(),
+            Some("audio input moved from laptop to bluez_input.headset")
+        );
         warm.shutdown();
     }
 
