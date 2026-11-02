@@ -38,7 +38,7 @@ pub fn ensure_directories() -> Result<()> {
     Ok(())
 }
 
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true).mode(0o700).create(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))

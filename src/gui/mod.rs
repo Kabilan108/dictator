@@ -21,8 +21,8 @@ use gpui_component::{Icon, IconName, Root, Theme, ThemeMode};
 use crate::ipc::DaemonState;
 
 use backend::{
-    Backend, ConnectionReport, Detail, Filter, Microphone, Page, Recording, Reply, Request, Stats,
-    Status,
+    Backend, ConnectionReport, Detail, Filter, Glossary, Microphone, Page, Recording, Reply,
+    Request, Stats, Status,
 };
 use levels::LevelFeed;
 use placement::size_main_window;
@@ -140,6 +140,11 @@ struct MainView {
     level_history: VecDeque<(f32, f32)>,
     levels: LevelFeed,
     microphones: Vec<Microphone>,
+    glossary: Option<Glossary>,
+    glossary_input: Entity<InputState>,
+    glossary_error: String,
+    /// Input values of adds awaiting a reply, oldest first.
+    glossary_adds: VecDeque<String>,
     status: Option<Status>,
     last_seen_recording_generation: Option<u64>,
     status_pending: bool,
@@ -179,6 +184,21 @@ impl MainView {
         let backend = Backend::new(demo);
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("search recordings"));
         let editor = cx.new(|cx| InputState::new(window, cx).auto_grow(3, 16));
+        let glossary_input = cx.new(|cx| InputState::new(window, cx).placeholder("Add a term"));
+        let glossary_subscription = cx.subscribe_in(
+            &glossary_input,
+            window,
+            |this, input, event: &InputEvent, _, cx| {
+                match event {
+                    InputEvent::PressEnter { .. } => this.add_glossary_term(cx),
+                    InputEvent::Change => {
+                        this.glossary_error = typing_glossary_error(&input.read(cx).value());
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            },
+        );
         let search_subscription =
             cx.subscribe_in(&search, window, |this, input, event: &InputEvent, _, cx| {
                 let value = input.read(cx).value().to_string();
@@ -249,6 +269,10 @@ impl MainView {
                 LevelFeed::start(crate::visual::default_socket_path())
             },
             microphones: Vec::new(),
+            glossary: None,
+            glossary_input,
+            glossary_error: String::new(),
+            glossary_adds: VecDeque::new(),
             status: None,
             last_seen_recording_generation: None,
             status_pending: true,
@@ -269,7 +293,11 @@ impl MainView {
             waveform: vec![0.08; 64],
             notice: String::new(),
             loading: true,
-            _subscriptions: vec![search_subscription, editor_subscription],
+            _subscriptions: vec![
+                search_subscription,
+                editor_subscription,
+                glossary_subscription,
+            ],
         };
         this.request_history(String::new());
         this.backend.send(Request::Recent {
@@ -320,6 +348,18 @@ impl MainView {
         self.setting_editor = false;
         self.request_history(String::new());
         self.request_detail(id);
+    }
+
+    fn add_glossary_term(&mut self, cx: &mut Context<Self>) {
+        let value = self.glossary_input.read(cx).value().to_string();
+        match crate::glossary::normalize_term(&value) {
+            Ok(term) => {
+                self.glossary_error.clear();
+                self.glossary_adds.push_back(value);
+                self.backend.send(Request::AddGlossaryTerm(term));
+            }
+            Err(error) => self.glossary_error = error,
+        }
     }
 
     fn request_delete(&mut self, id: i64) {
@@ -590,6 +630,29 @@ impl MainView {
                     }
                     Err(error) => self.notice = error,
                 },
+                Reply::Glossary(result) => match result {
+                    Ok(glossary) => {
+                        self.glossary = Some(glossary);
+                        self.glossary_error.clear();
+                    }
+                    Err(error) => self.glossary_error = error,
+                },
+                Reply::GlossaryAdded(result) => {
+                    let current = self.glossary_input.read(cx).value().to_string();
+                    let unchanged = submitted_input_unchanged(&mut self.glossary_adds, &current);
+                    match result {
+                        Ok(glossary) => {
+                            self.glossary = Some(glossary);
+                            self.glossary_error.clear();
+                            if unchanged {
+                                self.glossary_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
+                            }
+                        }
+                        Err(error) => self.glossary_error = error,
+                    }
+                }
             }
         }
         let recording = self
@@ -614,6 +677,7 @@ impl MainView {
             Tab::Stats => self.backend.send(Request::Stats),
             Tab::Settings => {
                 self.backend.send(Request::Microphones);
+                self.backend.send(Request::Glossary);
                 if self.connection.is_none() {
                     self.check_connection();
                 }
@@ -2049,6 +2113,104 @@ impl MainView {
             )
     }
 
+    fn render_glossary(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = &self.backend.managed_settings;
+        let terms = self
+            .glossary
+            .as_ref()
+            .map(|glossary| glossary.terms.as_slice())
+            .unwrap_or_default();
+        let mut list = div().flex().flex_col();
+        for (index, term) in terms.iter().enumerate() {
+            let term = term.clone();
+            list = list.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .px(px(4.))
+                    .py(px(8.))
+                    .border_b_1()
+                    .border_color(LINE)
+                    .child(div().flex_1().min_w_0().truncate().child(term.clone()))
+                    .child(
+                        div()
+                            .id(("glossary-remove", index))
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.))
+                            .text_color(SUBTEXT)
+                            .cursor_pointer()
+                            .hover(|this| this.bg(SURFACE_2))
+                            .tooltip(|window, cx| Tooltip::new("Remove").build(window, cx))
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.backend.send(Request::RemoveGlossaryTerm(term.clone()));
+                                cx.notify();
+                            }))
+                            .child(Icon::new(IconName::Close).size(px(14.))),
+                    ),
+            );
+        }
+        let notes = glossary_notes(
+            self.glossary.as_ref(),
+            settings.send_vocabulary,
+            &settings.provider,
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.))
+            .mt(px(8.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(30.))
+                            .px(px(8.))
+                            .bg(SURFACE)
+                            .border_1()
+                            .border_color(LINE)
+                            .rounded(px(4.))
+                            .child(Input::new(&self.glossary_input).appearance(false)),
+                    )
+                    .child(action_button(
+                        "Add",
+                        cx.listener(|view, _, _, cx| {
+                            view.add_glossary_term(cx);
+                            cx.notify();
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .w(px(64.))
+                            .flex_none()
+                            .text_right()
+                            .text_color(MUTED)
+                            .child(format!("{} / {}", terms.len(), crate::glossary::MAX_TERMS)),
+                    ),
+            )
+            .when(!self.glossary_error.is_empty(), |this| {
+                this.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(RED)
+                        .child(self.glossary_error.clone()),
+                )
+            })
+            .children(
+                notes
+                    .into_iter()
+                    .map(|note| div().text_size(px(12.)).text_color(MUTED).child(note)),
+            )
+            .child(list)
+    }
+
     fn render_settings(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let settings = &self.backend.managed_settings;
         let mut microphones = div().flex().flex_col();
@@ -2121,6 +2283,15 @@ impl MainView {
                     .child("Dictator uses the first connected input in this list. Bluetooth inputs are never used. Disconnected inputs keep their place. Changes apply to the next recording."),
             )
             .child(microphones)
+            .child(section_title("GLOSSARY"))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .line_height(gpui::relative(1.6))
+                    .text_color(MUTED)
+                    .child("Terms the transcription server should spell exactly as written: names, tools, jargon. Changes apply to the next transcription."),
+            )
+            .child(self.render_glossary(cx))
             .child(section_title("STATUS"))
             .child(self.render_status_rows(cx))
             .child(section_title("DAEMON CONFIGURATION"))
@@ -2988,6 +3159,51 @@ fn moved_ids(microphones: &[Microphone], index: usize, direction: isize) -> Opti
     Some(ids)
 }
 
+/// Explains what the daemon will send, since a missing file and an empty
+/// list behave differently.
+fn glossary_notes(
+    glossary: Option<&Glossary>,
+    send_vocabulary: bool,
+    provider: &str,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    if !send_vocabulary {
+        notes.push(format!(
+            "Not sent: provider \"{provider}\" does not set send_vocabulary."
+        ));
+    }
+    match glossary {
+        Some(glossary) if !glossary.exists => notes.push(
+            "No glossary yet, so the server uses its default list. Adding a term creates one."
+                .to_string(),
+        ),
+        Some(glossary) if glossary.terms.is_empty() => {
+            notes.push("The glossary is empty, so boosting is off.".to_string())
+        }
+        _ => {}
+    }
+    notes
+}
+
+/// Takes the oldest pending add, whose reply just arrived, and reports
+/// whether the input still holds what was submitted. Clearing it otherwise
+/// would erase a term typed while the add was queued.
+fn submitted_input_unchanged(pending: &mut VecDeque<String>, current: &str) -> bool {
+    pending
+        .pop_front()
+        .is_some_and(|submitted| submitted == current)
+}
+
+/// Flags a term while it is typed, but not an empty field.
+fn typing_glossary_error(value: &str) -> String {
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    crate::glossary::normalize_term(value)
+        .err()
+        .unwrap_or_default()
+}
+
 fn centered_message(message: &'static str) -> gpui::AnyElement {
     div()
         .flex_1()
@@ -3411,5 +3627,49 @@ mod state_tests {
             action_notice(Err("recording is no longer failed".to_string())),
             "Request failed: recording is no longer failed"
         );
+    }
+
+    #[test]
+    fn glossary_notes_separate_missing_empty_and_unsent() {
+        let missing = Glossary::default();
+        let empty = Glossary {
+            exists: true,
+            terms: Vec::new(),
+        };
+        let filled = Glossary {
+            exists: true,
+            terms: vec!["Claude".to_string()],
+        };
+
+        assert!(glossary_notes(Some(&filled), true, "siren").is_empty());
+        assert!(glossary_notes(None, true, "siren").is_empty());
+        assert_eq!(
+            glossary_notes(Some(&missing), true, "siren"),
+            ["No glossary yet, so the server uses its default list. Adding a term creates one."]
+        );
+        assert_eq!(
+            glossary_notes(Some(&empty), true, "siren"),
+            ["The glossary is empty, so boosting is off."]
+        );
+        assert_eq!(
+            glossary_notes(Some(&filled), false, "openai"),
+            ["Not sent: provider \"openai\" does not set send_vocabulary."]
+        );
+    }
+
+    #[test]
+    fn add_reply_keeps_input_typed_after_submission() {
+        let mut pending = VecDeque::from(["tmux".to_string(), "Claude".to_string()]);
+        assert!(!submitted_input_unchanged(&mut pending, "Claude"));
+        assert!(submitted_input_unchanged(&mut pending, "Claude"));
+        assert!(pending.is_empty());
+        assert!(!submitted_input_unchanged(&mut pending, ""));
+    }
+
+    #[test]
+    fn typing_feedback_ignores_an_empty_field() {
+        assert_eq!(typing_glossary_error("   "), "");
+        assert_eq!(typing_glossary_error("tmux"), "");
+        assert!(typing_glossary_error(&"x".repeat(65)).contains("at most 64"));
     }
 }

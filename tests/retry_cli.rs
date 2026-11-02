@@ -91,6 +91,22 @@ impl TestEnvironment {
     fn database_path(&self) -> PathBuf {
         self.data_home.join("dictator").join("app.db")
     }
+
+    fn enable_vocabulary(&self) {
+        let path = self.config_home.join("dictator").join("config.json");
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        config["api"]["providers"]["mock"]["send_vocabulary"] = true.into();
+        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    }
+}
+
+fn form_field(request: &[u8], name: &str) -> Option<String> {
+    let request = String::from_utf8_lossy(request);
+    let header = format!("name=\"{name}\"\r\n\r\n");
+    let start = request.find(&header)? + header.len();
+    let end = request[start..].find("\r\n")?;
+    Some(request[start..start + end].to_string())
 }
 
 fn pcm_wav(path: &Path) {
@@ -522,5 +538,92 @@ fn retry_help_is_only_written_to_stdout() {
     assert!(
         !environment.state_home.join("dictator/app.log").exists(),
         "help initialized application logging"
+    );
+}
+
+#[test]
+fn glossary_cli_edits_are_sent_with_each_retry() {
+    let (endpoint, server) = spawn_provider(vec![
+        ("200 OK", r#"{"text":"one"}"#),
+        ("200 OK", r#"{"text":"two"}"#),
+        ("200 OK", r#"{"text":"three"}"#),
+    ]);
+    let environment = TestEnvironment::new(&endpoint);
+    environment.enable_vocabulary();
+    let audio_path = environment.home.join("recording.wav");
+    pcm_wav(&audio_path);
+    let audio = audio_path.to_str().unwrap();
+    let glossary_path = environment.data_home.join("dictator").join("glossary.json");
+
+    let missing = environment.run(&["glossary", "list"]);
+    assert!(missing.status.success(), "{}", output_details(&missing));
+    assert!(missing.stdout.is_empty(), "{}", output_details(&missing));
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("default list"),
+        "{}",
+        output_details(&missing)
+    );
+    let retried = environment.run(&["retry", audio]);
+    assert!(retried.status.success(), "{}", output_details(&retried));
+
+    for term in ["Claude Code", " tmux "] {
+        let added = environment.run(&["glossary", "add", term]);
+        assert!(added.status.success(), "{}", output_details(&added));
+    }
+    for (term, reason) in [
+        ("claude code", "already in the glossary"),
+        ("   ", "cannot be empty"),
+    ] {
+        let rejected = environment.run(&["glossary", "add", term]);
+        assert!(!rejected.status.success(), "{}", output_details(&rejected));
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(reason),
+            "{}",
+            output_details(&rejected)
+        );
+    }
+    let listed = environment.run(&["glossary", "list"]);
+    assert!(listed.status.success(), "{}", output_details(&listed));
+    assert_eq!(listed.stdout, b"Claude Code\ntmux\n");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&glossary_path).unwrap()).unwrap();
+    assert_eq!(
+        stored,
+        serde_json::json!({"version": 1, "terms": ["Claude Code", "tmux"]})
+    );
+    let retried = environment.run(&["retry", audio]);
+    assert!(retried.status.success(), "{}", output_details(&retried));
+
+    for term in ["CLAUDE CODE", "tmux"] {
+        let removed = environment.run(&["glossary", "remove", term]);
+        assert!(removed.status.success(), "{}", output_details(&removed));
+    }
+    let missing_term = environment.run(&["glossary", "remove", "tmux"]);
+    assert!(
+        !missing_term.status.success(),
+        "{}",
+        output_details(&missing_term)
+    );
+    let empty = environment.run(&["glossary", "list"]);
+    assert!(
+        String::from_utf8_lossy(&empty.stderr).contains("boosting is off"),
+        "{}",
+        output_details(&empty)
+    );
+    let retried = environment.run(&["retry", audio]);
+    assert!(retried.status.success(), "{}", output_details(&retried));
+
+    let requests = server.join().unwrap();
+    let fields: Vec<_> = requests
+        .iter()
+        .map(|request| form_field(request, "vocabulary"))
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            None,
+            Some(r#"["Claude Code","tmux"]"#.to_string()),
+            Some("[]".to_string()),
+        ]
     );
 }

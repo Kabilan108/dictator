@@ -34,6 +34,7 @@ Dictator is a voice typing daemon for Linux using a client-server architecture:
 - **Notifier** (`src/notifier.rs`): D-Bus desktop notifications for state changes
 - **Visual** (`src/visual/`): OSD event stream (newline-delimited JSON on a unix socket)
 - **Storage** (`src/storage.rs`): SQLite transcript history
+- **Glossary** (`src/glossary.rs`): vocabulary terms in `$XDG_DATA_HOME/dictator/glossary.json` (`{"version": 1, "terms": [...]}`), edited by the GUI and `dictator glossary`. `WhisperClient` sends them as the `vocabulary` form field when the active provider sets `send_vocabulary`, rereading the file when its inode, size or mtime changes. A missing file sends no field (server default); an empty list sends `[]` (boosting off). Invalid entries are dropped against siren's limits before sending.
 
 ### State Flow
 

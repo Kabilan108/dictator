@@ -106,6 +106,25 @@ pub struct ManagedSettings {
     pub max_duration_minutes: i64,
     pub paste_shortcut: String,
     pub notifications: String,
+    /// Whether the active provider receives the glossary.
+    pub send_vocabulary: bool,
+}
+
+/// The glossary file as stored. A missing file (`exists == false`) sends no
+/// vocabulary; an existing empty list turns boosting off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Glossary {
+    pub exists: bool,
+    pub terms: Vec<String>,
+}
+
+impl Glossary {
+    fn from_stored(stored: Option<Vec<String>>) -> Self {
+        Self {
+            exists: stored.is_some(),
+            terms: stored.unwrap_or_default(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -166,6 +185,9 @@ pub enum Request {
     Recent {
         limit: usize,
     },
+    Glossary,
+    AddGlossaryTerm(String),
+    RemoveGlossaryTerm(String),
 }
 
 /// Replies cross an mpsc channel a few times per second, so the size spread
@@ -183,6 +205,10 @@ pub enum Reply {
     Deleted(Result<i64, String>),
     Connection(Result<ConnectionReport, String>),
     Recent(Result<Vec<Recording>, String>),
+    Glossary(Result<Glossary, String>),
+    /// Kept apart from `Glossary` so the view clears its input only after a
+    /// successful add.
+    GlossaryAdded(Result<Glossary, String>),
 }
 
 pub struct Backend {
@@ -278,7 +304,10 @@ fn live_request_kind(request: &Request) -> LiveRequestKind {
         | Request::Toggle
         | Request::Cancel
         | Request::Retry(_)
-        | Request::CheckConnection => LiveRequestKind::Service,
+        | Request::CheckConnection
+        | Request::Glossary
+        | Request::AddGlossaryTerm(_)
+        | Request::RemoveGlossaryTerm(_) => LiveRequestKind::Service,
     }
 }
 
@@ -340,6 +369,10 @@ fn failed_reply(request: Request, message: &str) -> Reply {
         }
         Request::Delete(_) => Reply::Deleted(Err(message.to_string())),
         Request::CheckConnection => Reply::Connection(Err(message.to_string())),
+        Request::Glossary | Request::RemoveGlossaryTerm(_) => {
+            Reply::Glossary(Err(message.to_string()))
+        }
+        Request::AddGlossaryTerm(_) => Reply::GlossaryAdded(Err(message.to_string())),
     }
 }
 
@@ -552,6 +585,21 @@ fn handle_live_service(
                 checked_at: Utc::now(),
             }
         }))),
+        Request::Glossary => Reply::Glossary(
+            crate::glossary::load(&crate::glossary::glossary_path())
+                .map(Glossary::from_stored)
+                .map_err(|error| format!("{error:#}")),
+        ),
+        Request::AddGlossaryTerm(term) => Reply::GlossaryAdded(
+            crate::glossary::add(&crate::glossary::glossary_path(), &term)
+                .map(|terms| Glossary::from_stored(Some(terms)))
+                .map_err(|error| format!("{error:#}")),
+        ),
+        Request::RemoveGlossaryTerm(term) => Reply::Glossary(
+            crate::glossary::remove(&crate::glossary::glossary_path(), &term)
+                .map(|terms| Glossary::from_stored(Some(terms)))
+                .map_err(|error| format!("{error:#}")),
+        ),
         Request::History { .. }
         | Request::Detail(_)
         | Request::SaveRevision { .. }
@@ -764,6 +812,7 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
+            send_vocabulary: true,
         };
     }
     let config_path = crate::utils::CONFIG_DIR.join("config.json");
@@ -785,6 +834,7 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
             max_duration_minutes: 5,
             paste_shortcut: "ctrl_shift_v".to_string(),
             notifications: "errors_only".to_string(),
+            send_vocabulary: false,
         })
 }
 
@@ -818,6 +868,8 @@ fn parse_managed_settings(
         endpoint: String,
         #[serde(default)]
         model: String,
+        #[serde(default)]
+        send_vocabulary: bool,
     }
     #[derive(Default, serde::Deserialize)]
     struct ReadOnlyAudio {
@@ -868,6 +920,7 @@ fn parse_managed_settings(
         } else {
             config.notifications
         },
+        send_vocabulary: provider.is_some_and(|provider| provider.send_vocabulary),
     })
 }
 
@@ -900,6 +953,9 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
             bluetooth: false,
         },
     ];
+    let mut glossary: Vec<String> = ["Claude", "tmux", "Sietch", "home-manager"]
+        .map(str::to_string)
+        .to_vec();
     let mut status = Status {
         state: DaemonState::Idle,
         duration_ms: 0,
@@ -1071,6 +1127,15 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
                 endpoint_host: "siren.example.test".to_string(),
                 checked_at: Utc::now(),
             })),
+            Request::Glossary => Reply::Glossary(Ok(Glossary::from_stored(Some(glossary.clone())))),
+            Request::AddGlossaryTerm(term) => Reply::GlossaryAdded(
+                crate::glossary::insert_term(&mut glossary, &term)
+                    .map(|()| Glossary::from_stored(Some(glossary.clone()))),
+            ),
+            Request::RemoveGlossaryTerm(term) => Reply::Glossary(
+                crate::glossary::delete_term(&mut glossary, &term)
+                    .map(|()| Glossary::from_stored(Some(glossary.clone()))),
+            ),
         };
         if replies.send(reply).is_err() {
             break;
@@ -1340,7 +1405,8 @@ mod tests {
                     "local": {
                         "endpoint": "http://127.0.0.1:8080/v1",
                         "model": "whisper-local",
-                        "key": "must-not-enter-gui-state"
+                        "key": "must-not-enter-gui-state",
+                        "send_vocabulary": true
                     }
                 }
             },
@@ -1358,6 +1424,7 @@ mod tests {
         assert_eq!(settings.max_duration_minutes, 9);
         assert_eq!(settings.paste_shortcut, "ctrl_v");
         assert_eq!(settings.notifications, "all");
+        assert!(settings.send_vocabulary);
         assert!(!format!("{settings:?}").contains("must-not-enter-gui-state"));
     }
 
@@ -1453,6 +1520,50 @@ mod tests {
             live_request_kind(&Request::Microphones),
             LiveRequestKind::Service
         );
+        assert_eq!(
+            live_request_kind(&Request::AddGlossaryTerm("x".into())),
+            LiveRequestKind::Service
+        );
+    }
+
+    #[test]
+    fn demo_glossary_validates_adds_and_removes() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+
+        request_tx.send(Request::Glossary).unwrap();
+        let Reply::Glossary(Ok(initial)) = reply_rx.recv().unwrap() else {
+            panic!("expected the glossary");
+        };
+        assert!(initial.exists);
+
+        request_tx
+            .send(Request::AddGlossaryTerm("  Arrakis ".into()))
+            .unwrap();
+        let Reply::GlossaryAdded(Ok(added)) = reply_rx.recv().unwrap() else {
+            panic!("expected an added glossary");
+        };
+        assert_eq!(added.terms.last().map(String::as_str), Some("Arrakis"));
+
+        request_tx
+            .send(Request::AddGlossaryTerm("arrakis".into()))
+            .unwrap();
+        let Reply::GlossaryAdded(Err(error)) = reply_rx.recv().unwrap() else {
+            panic!("expected a duplicate error");
+        };
+        assert!(error.contains("already in the glossary"), "{error}");
+
+        request_tx
+            .send(Request::RemoveGlossaryTerm("Arrakis".into()))
+            .unwrap();
+        let Reply::Glossary(Ok(removed)) = reply_rx.recv().unwrap() else {
+            panic!("expected the glossary");
+        };
+        assert_eq!(removed, initial);
+
+        drop(request_tx);
+        worker.join().unwrap();
     }
 
     #[tokio::test]

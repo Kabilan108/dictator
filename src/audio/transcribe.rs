@@ -6,6 +6,7 @@ use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
+use crate::glossary::{self, Vocabulary};
 use crate::utils::ApiConfig;
 
 pub const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -28,6 +29,7 @@ pub struct TranscriptionResponse {
 pub struct WhisperClient {
     config: ApiConfig,
     http: reqwest::Client,
+    vocabulary: Vocabulary,
 }
 
 impl WhisperClient {
@@ -43,7 +45,14 @@ impl WhisperClient {
         Ok(Self {
             config: config.clone(),
             http,
+            vocabulary: Vocabulary::new(glossary::glossary_path()),
         })
+    }
+
+    /// Reads the glossary from `path` instead of the data directory.
+    pub fn with_glossary_path(mut self, path: std::path::PathBuf) -> Self {
+        self.vocabulary = Vocabulary::new(path);
+        self
     }
 
     pub async fn transcribe(
@@ -79,11 +88,23 @@ impl WhisperClient {
         }
 
         let url = normalize_endpoint(&provider.endpoint);
+        let vocabulary = if provider.send_vocabulary {
+            self.vocabulary.current()
+        } else {
+            None
+        };
+        let vocabulary = vocabulary
+            .map(|terms| {
+                debug!(terms = terms.len(), "sending glossary vocabulary");
+                serde_json::to_string(&terms)
+            })
+            .transpose()
+            .map_err(|err| anyhow!("failed to encode vocabulary: {err}"))?;
 
         let mut attempts = 0;
         let resp = loop {
             attempts += 1;
-            let form = build_form(req, model)?;
+            let form = build_form(req, model, vocabulary.as_deref())?;
             debug!(url = %url, model = %model, attempt = attempts, "sending request");
 
             let send = self
@@ -181,7 +202,7 @@ async fn read_response(
     }
 }
 
-fn build_form(req: &TranscriptionRequest, model: &str) -> Result<Form> {
+fn build_form(req: &TranscriptionRequest, model: &str, vocabulary: Option<&str>) -> Result<Form> {
     let file = Part::stream_with_length(req.audio_data.clone(), req.audio_data.len() as u64)
         .file_name(
             std::path::Path::new(&req.filename)
@@ -199,6 +220,9 @@ fn build_form(req: &TranscriptionRequest, model: &str) -> Result<Form> {
 
     if !req.language.is_empty() {
         form = form.text("language", req.language.clone());
+    }
+    if let Some(vocabulary) = vocabulary {
+        form = form.text("vocabulary", vocabulary.to_owned());
     }
 
     Ok(form)
@@ -296,6 +320,72 @@ mod tests {
             "en",
         ] {
             assert!(multipart.contains(expected), "missing {expected}");
+        }
+    }
+
+    fn form_field(multipart: &str, name: &str) -> Option<String> {
+        let header = format!("name=\"{name}\"\r\n\r\n");
+        let start = multipart.find(&header)? + header.len();
+        let end = multipart[start..].find("\r\n")?;
+        Some(multipart[start..start + end].to_string())
+    }
+
+    #[tokio::test]
+    async fn vocabulary_field_follows_provider_flag_and_glossary_file() {
+        /// name, send_vocabulary, stored terms (None: no file), expected field
+        type Case = (
+            &'static str,
+            bool,
+            Option<&'static [&'static str]>,
+            Option<&'static str>,
+        );
+        let cases: &[Case] = &[
+            ("flag off", false, Some(&["Claude"]), None),
+            ("file missing", true, None, None),
+            ("empty list disables boosting", true, Some(&[]), Some("[]")),
+            (
+                "terms in order",
+                true,
+                Some(&["Claude", "tmux"]),
+                Some(r#"["Claude","tmux"]"#),
+            ),
+        ];
+        for (name, send_vocabulary, terms, expected) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("glossary.json");
+            if let Some(terms) = terms {
+                std::fs::write(
+                    &path,
+                    serde_json::to_vec(&serde_json::json!({"version": 1, "terms": terms})).unwrap(),
+                )
+                .unwrap();
+            }
+            let body = br#"{"text":"hello"}"#;
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+            let (mut client, _, server) =
+                mock_provider([response.as_bytes(), body].concat(), false).await;
+            client
+                .config
+                .providers
+                .get_mut("openai")
+                .unwrap()
+                .send_vocabulary = *send_vocabulary;
+            let client = client.with_glossary_path(path);
+
+            client
+                .transcribe(&CancellationToken::new(), &request())
+                .await
+                .unwrap();
+            let multipart = String::from_utf8(server.await.unwrap()).unwrap();
+            assert_eq!(
+                form_field(&multipart, "vocabulary").as_deref(),
+                *expected,
+                "{name}"
+            );
+            assert_eq!(
+                form_field(&multipart, "model").as_deref(),
+                Some("test-model")
+            );
         }
     }
 

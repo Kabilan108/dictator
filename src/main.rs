@@ -11,7 +11,7 @@ use clap_complete::Shell;
 
 use dictator::ipc::{self, Client};
 use dictator::utils::{self, exit_if_error};
-use dictator::{daemon, storage};
+use dictator::{daemon, glossary, storage};
 
 const VERSION: &str = match option_env!("DICTATOR_VERSION") {
     Some(v) => v,
@@ -104,11 +104,30 @@ enum Commands {
         #[arg(short = 't', long = "text")]
         text: bool,
     },
+    /// edit the vocabulary glossary
+    ///
+    /// terms in the glossary are sent with every transcription request to
+    /// providers that set send_vocabulary, so the server spells them right.
+    /// changes apply to the next transcription; the daemon needs no restart.
+    Glossary {
+        #[command(subcommand)]
+        action: GlossaryAction,
+    },
     /// Generate the autocompletion script for the specified shell
     Completion {
         #[arg(value_enum)]
         shell: Shell,
     },
+}
+
+#[derive(Subcommand)]
+enum GlossaryAction {
+    /// print the terms, one per line
+    List,
+    /// add a term (quote terms that contain spaces)
+    Add { term: String },
+    /// remove a term, ignoring case
+    Remove { term: String },
 }
 
 #[derive(Subcommand)]
@@ -285,6 +304,39 @@ fn run_transcripts(num: i64, text_only: bool) {
     }
 }
 
+fn run_glossary(action: GlossaryAction) {
+    let path = glossary::glossary_path();
+    let result = match action {
+        GlossaryAction::List => {
+            match exit_if_error(glossary::load(&path), 1) {
+                None => eprintln!(
+                    "no glossary at {}; the server uses its default list",
+                    path.display()
+                ),
+                Some(terms) if terms.is_empty() => {
+                    eprintln!("the glossary is empty, so boosting is off")
+                }
+                Some(terms) => {
+                    for term in terms {
+                        println!("{term}");
+                    }
+                }
+            }
+            return;
+        }
+        GlossaryAction::Add { term } => glossary::add(&path, &term)
+            .map(|terms| format!("added; {} of {} terms", terms.len(), glossary::MAX_TERMS)),
+        GlossaryAction::Remove { term } => glossary::remove(&path, &term).map(|terms| {
+            if terms.is_empty() {
+                "removed; the glossary is now empty, so boosting is off".to_string()
+            } else {
+                format!("removed; {} of {} terms", terms.len(), glossary::MAX_TERMS)
+            }
+        }),
+    };
+    println!("{}", exit_if_error(result, 1));
+}
+
 async fn run_daemon() {
     exit_if_error(utils::ensure_directories(), 1);
     let cfg = exit_if_error(utils::get_config(), 1);
@@ -301,6 +353,7 @@ fn main() {
         Commands::Version => println!("{VERSION}"),
         Commands::Init => run_init(),
         Commands::Transcripts { num, text } => run_transcripts(num, text),
+        Commands::Glossary { action } => run_glossary(action),
         Commands::Completion { shell } => {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "dictator", &mut std::io::stdout());
@@ -360,6 +413,7 @@ fn run_async(command: Commands, daemon_runtime: bool) {
             Commands::Version
             | Commands::Init
             | Commands::Transcripts { .. }
+            | Commands::Glossary { .. }
             | Commands::Completion { .. } => unreachable!("sync command routed to async runtime"),
         }
     });

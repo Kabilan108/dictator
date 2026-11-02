@@ -108,7 +108,11 @@ in
     settings = lib.mkOption {
       type = lib.types.nullOr settingsFormat.type;
       default = null;
-      description = "Configuration for Dictator written to config.json.";
+      description = ''
+        Configuration for Dictator written to config.json. Provider entries pass
+        through as written, including `send_vocabulary`, which sends the glossary
+        in $XDG_DATA_HOME/dictator/glossary.json to providers that accept it.
+      '';
       example = {
         enable_osd = true;
         notifications = "errors_only";

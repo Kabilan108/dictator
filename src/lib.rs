@@ -4,6 +4,7 @@
 //! compose them:
 //!
 //! - [`daemon`]: state machine and orchestration
+//! - [`glossary`]: user vocabulary sent to providers that boost terms
 //! - [`ipc`]: unix-socket protocol between cli and daemon
 //! - [`audio`]: recording and Whisper API transcription
 //! - [`typing`]: clipboard + paste simulation
@@ -14,6 +15,7 @@
 
 pub mod audio;
 pub mod daemon;
+pub mod glossary;
 pub mod ipc;
 pub mod notifier;
 pub mod retry;
