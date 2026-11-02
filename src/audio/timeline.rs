@@ -1,9 +1,11 @@
 //! Sample timeline shared by a capture stream and the recording attached to it.
 //!
-//! Each chunk read from parec re-anchors the sample count to the monotonic
-//! clock at its arrival. A command's arrival instant therefore maps to a
-//! sample index through the newest chunk only, so clock drift and dropped
-//! samples earlier in a long-running stream never shift the mapping.
+//! A command's arrival instant maps to a sample index through the capture
+//! clock. Each chunk's arrival minus its position in the sample count is that
+//! clock plus the chunk's delivery delay, which is never negative. The
+//! minimum over the last [`CLOCK_WINDOW`] of chunks therefore comes from the
+//! least-delayed one: a backlog read late cannot pull the mapping backward,
+//! while the short window still follows clock drift and dropped samples.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -24,6 +26,8 @@ pub const GATE_WINDOW: Duration = Duration::from_millis(30);
 /// stalled stream must not place a start command far beyond the received
 /// audio, or the recording would skip what arrives when delivery resumes.
 const MAX_LEAD: Duration = Duration::from_millis(100);
+/// Chunks considered when estimating the capture clock.
+const CLOCK_WINDOW: Duration = Duration::from_secs(2);
 /// Running window sums are recomputed this often to bound rounding drift.
 const RESYNC_SAMPLES: usize = 4096;
 
@@ -46,8 +50,12 @@ pub(crate) struct Timeline {
     ring_capacity: usize,
     /// Index of the next sample to arrive.
     total: u64,
-    /// Arrival instant of the newest chunk and `total` after it.
-    anchor: Option<(Instant, u64)>,
+    /// Arrival of the first chunk; clock offsets are measured from it.
+    reference: Option<Instant>,
+    last_arrival: Option<Instant>,
+    /// Recent `(arrival, arrival - capture position)` pairs in nanoseconds,
+    /// with increasing offsets, so the front is the window's minimum.
+    offsets: VecDeque<(Instant, i128)>,
     session: Option<SessionCapture>,
     ended: bool,
     error: Option<String>,
@@ -111,7 +119,9 @@ impl Timeline {
             ring: VecDeque::with_capacity(ring_capacity),
             ring_capacity,
             total: 0,
-            anchor: None,
+            reference: None,
+            last_arrival: None,
+            offsets: VecDeque::new(),
             session: None,
             ended: false,
             error: None,
@@ -127,7 +137,28 @@ impl Timeline {
         self.ring.drain(..overflow);
         self.ring.extend(keep.iter().copied());
         self.total += samples.len() as u64;
-        self.anchor = Some((arrived, self.total));
+        self.track_clock(arrived);
+    }
+
+    fn track_clock(&mut self, arrived: Instant) {
+        let reference = *self.reference.get_or_insert(arrived);
+        let offset = signed_nanos(reference, arrived) - self.position_ns(self.total);
+        while self.offsets.back().is_some_and(|&(_, back)| back >= offset) {
+            self.offsets.pop_back();
+        }
+        self.offsets.push_back((arrived, offset));
+        while self
+            .offsets
+            .front()
+            .is_some_and(|&(at, _)| arrived.saturating_duration_since(at) > CLOCK_WINDOW)
+        {
+            self.offsets.pop_front();
+        }
+        self.last_arrival = Some(arrived);
+    }
+
+    fn position_ns(&self, index: u64) -> i128 {
+        i128::from(index) * 1_000_000_000 / i128::from(self.sample_rate.max(1))
     }
 
     #[cfg(test)]
@@ -136,7 +167,7 @@ impl Timeline {
     }
 
     pub fn last_chunk_at(&self) -> Option<Instant> {
-        self.anchor.map(|(arrived, _)| arrived)
+        self.last_arrival
     }
 
     pub fn has_session(&self) -> bool {
@@ -166,14 +197,13 @@ impl Timeline {
         samples_for(MAX_LEAD, self.sample_rate)
     }
 
-    /// Maps a monotonic instant to a sample index through the newest chunk.
+    /// Maps a monotonic instant to a sample index through the capture clock.
     fn index_at(&self, at: Instant) -> Option<u64> {
-        let (arrived, index) = self.anchor?;
-        Some(if at >= arrived {
-            index.saturating_add(samples_for(at - arrived, self.sample_rate))
-        } else {
-            index.saturating_sub(samples_for(arrived - at, self.sample_rate))
-        })
+        let reference = self.reference?;
+        let &(_, offset) = self.offsets.front()?;
+        let capture_ns = signed_nanos(reference, at) - offset;
+        let index = capture_ns * i128::from(self.sample_rate) / 1_000_000_000;
+        Some(u64::try_from(index.max(0)).unwrap_or(u64::MAX))
     }
 
     /// Attaches a recording whose start command arrived at `at`, keeping up
@@ -256,6 +286,14 @@ impl Timeline {
             preroll,
             speech_end,
         })
+    }
+}
+
+fn signed_nanos(from: Instant, to: Instant) -> i128 {
+    if to >= from {
+        (to - from).as_nanos() as i128
+    } else {
+        -((from - to).as_nanos() as i128)
     }
 }
 
@@ -446,6 +484,44 @@ mod tests {
         let captured = timeline.take_session().unwrap();
         assert_eq!(captured.speech_end, 22_400 - 8_000);
         assert_eq!(captured.tail(), 3_200);
+    }
+
+    #[test]
+    fn backlog_read_late_does_not_move_the_stop_backward() {
+        let mut timeline = Timeline::new(RATE, 32_000);
+        let epoch = Instant::now();
+        feed(&mut timeline, epoch, 16_000);
+        timeline.begin_session(epoch + ms(500), 0, usize::MAX);
+        // Delivery paused after 1.0 s; at 1.4 s the reader takes the first
+        // queued chunk, and the stop is handled before the rest is read.
+        let late = epoch + ms(1400);
+        timeline.push(&[0.0; 160], late);
+        let end = timeline.end_session(late, 3_200).unwrap();
+        assert_eq!(end, 22_400 + 3_200);
+        timeline.push(&vec![0.0; 9_440], late);
+        assert!(timeline.reached(end));
+        let captured = timeline.take_session().unwrap();
+        assert_eq!(captured.speech_end, 22_400 - 8_000);
+        assert_eq!(captured.tail(), 3_200);
+    }
+
+    #[test]
+    fn mapping_follows_dropped_samples_within_the_clock_window() {
+        let mut timeline = Timeline::new(RATE, 160_000);
+        let epoch = Instant::now();
+        feed(&mut timeline, epoch, 16_000);
+        // 200 ms of samples were lost: from now on, sample i arrives at
+        // (i + 3_200) / 16 kHz.
+        for _ in 0..300 {
+            let end = timeline.total as usize + 160;
+            timeline.push(&[0.0; 160], epoch + duration_for(end + 3_200, RATE));
+        }
+        let now = epoch + duration_for(timeline.total as usize + 3_200, RATE);
+        timeline.begin_session(now, 0, usize::MAX);
+        assert_eq!(
+            timeline.session.as_ref().unwrap().speech_start,
+            timeline.total
+        );
     }
 
     #[test]
