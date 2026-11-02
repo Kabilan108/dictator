@@ -318,8 +318,9 @@ impl Supervisor {
                 }
             }
             Event::Retry => {
+                // A stream that just opened has no audio yet but is not broken.
                 let current = self.shared.current.lock().unwrap().clone();
-                if current.is_none_or(|warm| !warm.stream.is_live(now)) {
+                if current.is_none_or(|warm| warm.stream.is_stalled(now, STALL_GRACE)) {
                     self.retry_at = Some(self.retry_at.map_or(now, |at| at.min(now)));
                 }
             }
@@ -370,14 +371,14 @@ impl Supervisor {
         let (microphone, fingerprint) = match (self.backend.resolve)() {
             Ok(resolution) => (resolution.microphone, resolution.fingerprint),
             Err(err) => {
-                let live = self
+                let working = self
                     .shared
                     .current
                     .lock()
                     .unwrap()
                     .as_ref()
-                    .is_some_and(|warm| warm.stream.is_live(Instant::now()));
-                if live {
+                    .is_some_and(|warm| !warm.stream.is_stalled(Instant::now(), STALL_GRACE));
+                if working {
                     // Keep a working stream through a transient pactl failure.
                     warn!(err = %format!("{err:#}"), "failed to re-resolve warm microphone");
                     self.schedule_retry();
@@ -737,6 +738,26 @@ mod tests {
             opened[2] - opened[1] >= Duration::from_millis(1_800),
             "{opened:?}"
         );
+    }
+
+    #[test]
+    fn a_start_before_the_first_chunk_does_not_tear_down_a_new_stream() {
+        // Audio begins half a second after the stream opens, and lookups fail
+        // after the first, as during a transient pactl problem.
+        let fake = fake("sleep 0.5; while :; do head -c 6400 /dev/zero || exit 1; sleep 0.1; done");
+        let warm = started(&fake);
+        wait_for(|| warm.shared.current.lock().unwrap().is_some());
+        *fake.selected.lock().unwrap() = Err("temporary pactl failure".into());
+
+        // Starts during the silent opening fall back to cold starts and must
+        // not make the supervisor replace the stream.
+        for _ in 0..20 {
+            let _ = warm.acquire(Instant::now());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        wait_for(|| live_source(&warm).as_deref() == Some("laptop"));
+        assert_eq!(fake.resolves.load(Ordering::SeqCst), 1);
+        warm.shutdown();
     }
 
     #[test]
