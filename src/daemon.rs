@@ -15,7 +15,7 @@ use crate::ipc::{self, CommandHandler, DaemonState, Server, StatusData};
 use crate::notifier::Notifier;
 use crate::storage::Db;
 use crate::typing::Typer;
-use crate::utils::{Config, NotificationMode};
+use crate::utils::{Config, NotificationMode, get_path_to_recording};
 use crate::visual::{self, Sink, SocketSink, StateEvent, StateValue};
 
 pub const ERROR_DISPLAY_DURATION: Duration = Duration::from_secs(5);
@@ -774,9 +774,13 @@ impl Daemon {
     /// written, uploaded or added to history in that case.
     fn save_recording(&self, stopped_at: Instant) -> Result<Option<(Vec<u8>, String)>> {
         let (audio_data, audio_path) = match self.recorder.stop(stopped_at) {
-            Ok(StopOutcome::Recorded { wav, path, summary }) => {
+            Ok(StopOutcome::Recorded {
+                wav,
+                started,
+                summary,
+            }) => {
                 log_capture("recording captured", &summary, None);
-                (wav, path)
+                (wav, get_path_to_recording(started)?)
             }
             Ok(StopOutcome::Discarded { verdict, summary }) => {
                 log_capture("recording discarded", &summary, Some(verdict.as_str()));

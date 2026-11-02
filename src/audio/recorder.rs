@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{fs::OpenOptions, io::Write};
@@ -16,7 +16,7 @@ use super::timeline::{
     self, Captured, GATE_WINDOW, PREROLL, RING, TAIL, Verdict, duration_for, samples_for,
 };
 use super::warm::{Hold, WarmMic, WarmStatus};
-use crate::utils::{AudioConfig, get_path_to_recording, validate_audio_config};
+use crate::utils::{AudioConfig, validate_audio_config};
 
 pub use super::capture::{LevelObserver, LevelSample, calculate_level};
 
@@ -48,7 +48,8 @@ pub struct CaptureSummary {
 pub enum StopOutcome {
     Recorded {
         wav: Vec<u8>,
-        path: PathBuf,
+        /// Wall-clock time of the start command, for naming the file.
+        started: DateTime<Local>,
         summary: CaptureSummary,
     },
     /// Too short or silent; nothing was encoded or saved.
@@ -299,9 +300,12 @@ impl Recorder {
         let wav = self
             .encode_samples_to_wav(captured.samples)
             .map_err(|e| anyhow!("failed to encode to WAV: {e}"))?;
-        let path = get_path_to_recording(start_time)?;
         info!(bytes = wav.len(), "recording stopped");
-        Ok(StopOutcome::Recorded { wav, path, summary })
+        Ok(StopOutcome::Recorded {
+            wav,
+            started: start_time,
+            summary,
+        })
     }
 
     fn finish(&self, session: &Session, at: Instant) -> Captured {
