@@ -1,13 +1,17 @@
 //! The Dictation pane: the live meter and its one action, the last result and
-//! the most recent recordings.
+//! the most recent recordings. What the daemon is doing shows in the
+//! sidebar's status row, not here.
 
 use rune::{El, TextStyle, Tx, col, row, text};
 use rune_kit::ButtonVariant;
 
 use crate::ipc::DaemonState;
 
+use crate::provider::CheckOutcome;
+
 use super::backend::{Recording, Request, Status};
 use super::controls::{self, GUTTER, Paint, ROW_PX, SECTION_GAP, Tone};
+use super::logic::{ErrorKind, ErrorSummary};
 use super::{Pane, Ui, charts, icons, logic};
 
 const TIMER: TextStyle = TextStyle::new(28.0, 500.0).lh(34.0);
@@ -46,30 +50,77 @@ fn banners(ui: &Ui, p: Paint) -> Vec<El> {
         Some(status) => banners.extend(recovery(p, status)),
     }
     if ui.status.is_some()
-        && ui
-            .connection
-            .as_ref()
-            .is_some_and(|report| report.provider.is_err())
+        && let Some(summary) = provider_problem(ui)
     {
-        let action = controls::small_button(
-            p,
-            "open-settings",
-            "Switch provider",
-            ButtonVariant::Neutral,
-            |ui: &mut Ui, tx: &mut Tx| {
-                tx.instant();
-                ui.set_pane(Pane::Settings);
-            },
-        );
-        banners.push(controls::banner(
+        banners.push(controls::error_callout(
             p,
             "provider-down",
-            "The transcription server is unreachable. Recordings will fail until it is back.",
-            Tone::Warn,
-            Some(action),
+            &summary,
+            vec![settings_button(p, "Open settings")],
         ));
     }
     banners
+}
+
+/// The last provider check's failure, said as the reason recordings will
+/// fail.
+fn provider_problem(ui: &Ui) -> Option<ErrorSummary> {
+    let check = &ui.connection.as_ref()?.check;
+    let provider = &check.provider;
+    let (title, kind) = match check.outcome {
+        CheckOutcome::Ready | CheckOutcome::Reachable => return None,
+        CheckOutcome::KeyRejected => (format!("{provider} rejected the API key"), ErrorKind::Key),
+        CheckOutcome::Unreachable => (format!("Can't reach {provider}"), ErrorKind::Provider),
+        CheckOutcome::Failed => (
+            format!("{provider} is answering with errors"),
+            ErrorKind::Provider,
+        ),
+        CheckOutcome::Unusable => (format!("{provider} is not set up"), ErrorKind::Provider),
+    };
+    let detail = if check.message.is_empty() {
+        "Recordings will fail until this is fixed.".to_string()
+    } else {
+        format!(
+            "{} Recordings will fail until this is fixed.",
+            end_sentence(&check.message)
+        )
+    };
+    Some(ErrorSummary {
+        title,
+        detail,
+        kind,
+        raw: None,
+    })
+}
+
+fn end_sentence(text: &str) -> String {
+    let text = text.trim_end();
+    if text.ends_with(['.', '!', '?', '…']) {
+        text.to_string()
+    } else {
+        format!("{text}.")
+    }
+}
+
+fn settings_button(p: Paint, label: &str) -> El {
+    controls::small_button(
+        p,
+        "open-settings",
+        label,
+        ButtonVariant::Neutral,
+        |ui: &mut Ui, tx: &mut Tx| {
+            tx.instant();
+            ui.set_pane(Pane::Settings);
+        },
+    )
+}
+
+/// What fixes `summary`, when the app can take the user there.
+pub(super) fn fix_actions(p: Paint, summary: &ErrorSummary) -> Vec<El> {
+    match summary.kind {
+        ErrorKind::Key | ErrorKind::Provider => vec![settings_button(p, "Settings")],
+        ErrorKind::Other => Vec::new(),
+    }
 }
 
 /// Text the daemon transcribed but could not save or paste, so it is not
@@ -103,40 +154,32 @@ fn recovery(p: Paint, status: &Status) -> Option<El> {
     ))
 }
 
-/// The meter, what the daemon is doing, and the action that fits it.
+/// The meter across the card, the timer and the action that fits the
+/// daemon's state, and why the last action or recording failed.
 fn stage(ui: &Ui, p: Paint) -> El {
     let state = ui.state();
     let recording = state == Some(DaemonState::Recording);
-    let (headline, tone) = match state {
-        None => ("Daemon unavailable", Tone::Bad),
-        Some(DaemonState::Idle) => ("Ready", Tone::Neutral),
-        Some(DaemonState::Recording) => ("Listening", Tone::Bad),
-        Some(DaemonState::Transcribing) => ("Transcribing…", Tone::Accent),
-        Some(DaemonState::Typing) => ("Pasting…", Tone::Accent),
-        Some(DaemonState::Error) => ("Last recording failed", Tone::Warn),
-    };
     let timer = text(logic::format_duration(ui.elapsed_ms()))
         .key("timer")
         .font(p.numeric(TIMER))
         .color(if recording { p.strong() } else { p.faint() });
-    let caption = controls::tone_tag(p, headline, tone).key("state");
 
     let mut actions = Vec::new();
     match state {
         Some(DaemonState::Recording) => {
             actions.push(controls::button(
                 p,
-                "dictation-toggle",
-                "Stop and transcribe",
-                ButtonVariant::Contrast,
-                |ui: &mut Ui, _: &mut Tx| ui.backend.send(Request::Toggle),
-            ));
-            actions.push(controls::button(
-                p,
                 "dictation-cancel",
                 "Cancel",
                 ButtonVariant::Ghost,
-                |ui: &mut Ui, _: &mut Tx| ui.backend.send(Request::Cancel),
+                |ui: &mut Ui, _: &mut Tx| ui.act(Request::Cancel),
+            ));
+            actions.push(controls::button(
+                p,
+                "dictation-toggle",
+                "Stop and transcribe",
+                ButtonVariant::Contrast,
+                |ui: &mut Ui, _: &mut Tx| ui.act(Request::Toggle),
             ));
         }
         Some(DaemonState::Transcribing) => actions.push(controls::button(
@@ -144,44 +187,72 @@ fn stage(ui: &Ui, p: Paint) -> El {
             "dictation-cancel",
             "Cancel",
             ButtonVariant::Neutral,
-            |ui: &mut Ui, _: &mut Tx| ui.backend.send(Request::Cancel),
+            |ui: &mut Ui, _: &mut Tx| ui.act(Request::Cancel),
         )),
         Some(DaemonState::Idle | DaemonState::Error) => actions.push(controls::button(
             p,
             "dictation-toggle",
             "Start dictation",
             ButtonVariant::Contrast,
-            |ui: &mut Ui, _: &mut Tx| ui.backend.send(Request::Toggle),
+            |ui: &mut Ui, _: &mut Tx| ui.act(Request::Toggle),
         )),
         Some(DaemonState::Typing) | None => {}
     }
 
-    let error = ui
-        .status
-        .as_ref()
-        .filter(|status| status.state == DaemonState::Error && !status.error.is_empty())
-        .map(|status| controls::note(p, "error", &status.error, Tone::Bad));
+    let failure = stage_failure(ui).map(|summary| {
+        let actions = fix_actions(p, &summary);
+        controls::error_callout(p, "error", &summary, actions)
+    });
 
     controls::raised(p, "stage").child(
         col()
             .px(ROW_PX)
-            .pt(26.0)
-            .pb(22.0)
-            .gap(18.0)
-            .items_center()
+            .pt(20.0)
+            .pb(16.0)
+            .gap(16.0)
             .child(charts::level_meter(p, state, &ui.level_history))
-            .child(col().gap(6.0).items_center().child(timer).child(caption))
-            .children(error)
             .child(
                 row()
-                    .key("actions")
-                    .min_h(32.0)
-                    .gap(8.0)
+                    .key("controls")
+                    .gap(16.0)
                     .center_y()
-                    .children(actions),
+                    .child(
+                        col()
+                            .grow(1.0)
+                            .shrink()
+                            .min_w(0.0)
+                            .gap(2.0)
+                            .child(timer)
+                            .child(source_line(ui, p)),
+                    )
+                    .child(
+                        row()
+                            .key("actions")
+                            .min_h(32.0)
+                            .gap(8.0)
+                            .center_y()
+                            .children(actions),
+                    ),
             )
-            .child(source_line(ui, p)),
+            .children(failure),
     )
+}
+
+/// A refused action, or the daemon's error while it is in its error state.
+/// A failed transcription is left to the Last result card below, so the
+/// same failure does not show twice.
+fn stage_failure(ui: &Ui) -> Option<ErrorSummary> {
+    if let Some(error) = &ui.action_error {
+        return Some(logic::describe_error(error));
+    }
+    let status = ui.status.as_ref()?;
+    if status.state != DaemonState::Error || status.error.is_empty() {
+        return None;
+    }
+    let shown_below = ui.recent.first().is_some_and(|last| {
+        last.failed && !last.error.is_empty() && status.error.ends_with(&last.error)
+    });
+    (!shown_below).then(|| logic::describe_error(&status.error))
 }
 
 /// Which provider the next recording goes to.
@@ -193,20 +264,43 @@ fn source_line(ui: &Ui, p: Paint) -> El {
             format!("{} · {}", settings.provider, settings.model)
         }
     };
-    text(line).key("source").font(p.k.ty.small).color(p.faint())
+    text(line)
+        .key("source")
+        .font(p.k.ty.small)
+        .color(p.faint())
+        .truncate()
 }
 
 fn last_result(p: Paint, last: &Recording) -> El {
     let id = last.id;
     let body = if last.failed {
-        text(logic::single_line(&last.error)).color(p.danger())
+        let summary = logic::describe_error(&last.error);
+        let mut actions = Vec::new();
+        if !last.audio_path.as_os_str().is_empty() {
+            actions.push(controls::small_button(
+                p,
+                "retry-last",
+                "Retry",
+                ButtonVariant::Neutral,
+                move |ui: &mut Ui, _: &mut Tx| ui.act(Request::Retry(id)),
+            ));
+        }
+        actions.extend(fix_actions(p, &summary));
+        controls::error_callout(p, "last-result-error", &summary, actions)
     } else if last.text.trim().is_empty() {
-        text("No speech was transcribed").color(p.faint())
+        text("No speech was transcribed")
+            .key("last-result-text")
+            .font(p.k.ty.body.lh(22.0))
+            .color(p.faint())
     } else {
         text(last.text.clone())
+            .key("last-result-text")
+            .font(p.k.ty.body.lh(22.0))
             .color(p.text())
             .selectable(true)
             .selection_color(p.k.selection())
+            .wrap()
+            .max_lines(6)
     };
     let copied = last.text.clone();
     let mut actions = Vec::new();
@@ -242,28 +336,18 @@ fn last_result(p: Paint, last: &Recording) -> El {
         "last-result",
         "Last result",
         Some(accessory),
-        col()
-            .px(ROW_PX)
-            .py(14.0)
-            .gap(10.0)
-            .child(
-                body.key("last-result-text")
-                    .font(p.k.ty.body.lh(22.0))
-                    .wrap()
-                    .max_lines(6),
-            )
-            .child(
-                row()
-                    .gap(8.0)
-                    .center_y()
-                    .child(
-                        text(meta)
-                            .font(p.numeric(p.k.ty.small))
-                            .color(p.faint())
-                            .grow(1.0),
-                    )
-                    .children(actions),
-            ),
+        col().px(ROW_PX).py(14.0).gap(10.0).child(body).child(
+            row()
+                .gap(8.0)
+                .center_y()
+                .child(
+                    text(meta)
+                        .font(p.numeric(p.k.ty.small))
+                        .color(p.faint())
+                        .grow(1.0),
+                )
+                .children(actions),
+        ),
     )
 }
 
@@ -301,7 +385,7 @@ fn recent(ui: &Ui, p: Paint) -> El {
 fn recent_row(p: Paint, recording: &Recording) -> El {
     let id = recording.id;
     let snippet = if recording.failed {
-        text(logic::single_line(&recording.error)).color(p.danger())
+        text(logic::describe_error(&recording.error).line()).color(p.danger())
     } else if recording.text.trim().is_empty() {
         text("No speech was transcribed").color(p.faint())
     } else {

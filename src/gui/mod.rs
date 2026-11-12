@@ -18,9 +18,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rune::{Anim, AppSpec, Cx, El, Icon, KeyEvent, TextEdit, TextStyle, Tx, col, icon, row, text};
+use rune::{
+    Anim, AppSpec, Cx, El, Icon, KeyEvent, TextEdit, TextStyle, Tx, col, el, icon, row, text,
+};
 
 use crate::ipc::DaemonState;
+use crate::provider::{CheckOutcome, ProviderCheck};
 
 use backend::{
     Backend, ConnectionReport, Detail, Filter, Glossary, Microphone, Page, ProviderInfo, Recording,
@@ -33,7 +36,7 @@ use playback::{AudioPlayer, waveform};
 
 const APP_ID: &str = "org.dictator.Dictator";
 const RECENT_LIMIT: usize = 6;
-const LEVEL_HISTORY: usize = 64;
+const LEVEL_HISTORY: usize = 96;
 const WAVEFORM_BUCKETS: usize = 96;
 /// The size the window opens at. It maps fixed at this size, which makes a
 /// tiling compositor float it as is rather than hand it a column to shrink
@@ -140,6 +143,8 @@ struct Ui {
     recent: Vec<Recording>,
     connection: Option<ConnectionReport>,
     connection_pending: bool,
+    /// Why the last start, stop, cancel or retry was refused.
+    action_error: Option<String>,
 
     filter: Filter,
     page_index: usize,
@@ -207,6 +212,7 @@ impl Ui {
             recent: Vec::new(),
             connection: None,
             connection_pending: false,
+            action_error: None,
             filter: Filter::All,
             page_index: 0,
             page: None,
@@ -284,6 +290,12 @@ impl Ui {
             self.status_pending = true;
             self.last_status_request = Instant::now();
         }
+    }
+
+    /// Sends a start, stop, cancel or retry, forgetting the last refusal.
+    fn act(&mut self, request: Request) {
+        self.action_error = None;
+        self.backend.send(request);
     }
 
     fn request_recent(&mut self) {
@@ -602,7 +614,11 @@ impl Ui {
             logic::push_level(&mut self.level_history, true, sample);
             changed = true;
         }
-        if let Some(state) = update.state
+        // Only a change counts: the feed keeps its last state, and a retry
+        // ends without an OSD idle event, so reapplying it every frame pinned
+        // the app to "Transcribing" over the polled status.
+        if update.state_changed
+            && let Some(state) = update.state
             && let Some(status) = self.status.as_mut()
             && status.state != state
         {
@@ -743,6 +759,11 @@ impl Ui {
                         if status.state != DaemonState::Recording {
                             self.level_history.clear();
                         }
+                        let failed_now = status.state == DaemonState::Error
+                            && self.state() != Some(DaemonState::Error);
+                        if failed_now {
+                            self.check_connection();
+                        }
                         let known = self
                             .active_provider()
                             .map(|provider| provider.name.as_str());
@@ -762,6 +783,7 @@ impl Ui {
                 }
             }
             Reply::Action(result) => {
+                self.action_error = result.as_ref().err().cloned();
                 self.notice = logic::action_notice(result);
                 self.request_status();
             }
@@ -843,34 +865,54 @@ impl Ui {
         }
     }
 
-    /// Daemon and provider health for the sidebar: a tone and two lines.
-    fn health(&self) -> (Tone, String, String) {
+    /// What the sidebar's status row says: the daemon's state while it
+    /// works, otherwise whether the provider will take a recording.
+    fn health(&self) -> Health {
         let provider = self
             .active_provider()
             .map(|provider| provider.name.clone())
             .unwrap_or_else(|| self.backend.managed_settings.provider.clone());
+        let check = self.connection.as_ref().map(|report| &report.check);
+        let mut help = check.map_or_else(
+            || "The provider has not been checked yet".to_string(),
+            |check| {
+                let (_, verdict, message) = describe_check(check);
+                let mut line = format!("{provider}: {verdict}");
+                if !message.is_empty() {
+                    line.push_str(&format!(". {message}"));
+                }
+                line
+            },
+        );
+        help.push_str("\nClick to check again");
         let Some(status) = &self.status else {
-            return (Tone::Bad, "Daemon not running".to_string(), provider);
+            return Health {
+                tone: Tone::Bad,
+                label: "Daemon offline",
+                provider,
+                help: "The dictator daemon is not running".to_string(),
+            };
         };
-        let daemon = match status.state {
-            DaemonState::Idle => "Ready",
-            DaemonState::Recording => "Recording",
-            DaemonState::Transcribing => "Transcribing",
-            DaemonState::Typing => "Pasting",
-            DaemonState::Error => "Error",
+        let (tone, label) = match status.state {
+            DaemonState::Recording => (Tone::Bad, "Recording"),
+            DaemonState::Transcribing => (Tone::Accent, "Transcribing"),
+            DaemonState::Typing => (Tone::Accent, "Pasting"),
+            DaemonState::Error => (Tone::Warn, "Failed"),
+            DaemonState::Idle => match check.map(|check| check.outcome) {
+                None => (Tone::Neutral, "Checking…"),
+                Some(CheckOutcome::Ready | CheckOutcome::Reachable) => (Tone::Good, "Ready"),
+                Some(CheckOutcome::KeyRejected) => (Tone::Bad, "Key rejected"),
+                Some(CheckOutcome::Unreachable) => (Tone::Bad, "Unreachable"),
+                Some(CheckOutcome::Failed) => (Tone::Warn, "Provider error"),
+                Some(CheckOutcome::Unusable) => (Tone::Warn, "Not set up"),
+            },
         };
-        let (tone, reach) = match &self.connection {
-            Some(report) if report.provider.is_ok() => (Tone::Good, "reachable"),
-            Some(_) => (Tone::Bad, "unreachable"),
-            None => (Tone::Neutral, "checking"),
-        };
-        let tone = match status.state {
-            DaemonState::Recording => Tone::Bad,
-            DaemonState::Transcribing | DaemonState::Typing => Tone::Accent,
-            DaemonState::Error => Tone::Warn,
-            DaemonState::Idle => tone,
-        };
-        (tone, daemon.to_string(), format!("{provider} · {reach}"))
+        Health {
+            tone,
+            label,
+            provider,
+            help,
+        }
     }
 
     /// Scene helper: History with the newest successful recording selected.
@@ -905,6 +947,42 @@ impl Ui {
     }
 }
 
+struct Health {
+    tone: Tone,
+    label: &'static str,
+    provider: String,
+    help: String,
+}
+
+/// A provider check in words: its tone, a short verdict and the provider's
+/// message (empty when there is nothing more to say).
+fn describe_check(check: &ProviderCheck) -> (Tone, String, String) {
+    let message = check.message.clone();
+    match check.outcome {
+        CheckOutcome::Ready => (
+            Tone::Good,
+            format!("Key accepted · {} ms", check.latency_ms),
+            String::new(),
+        ),
+        CheckOutcome::Reachable => (
+            Tone::Neutral,
+            "Reachable · key not checked".to_string(),
+            "The daemon could not check the key, so only the endpoint was tried.".to_string(),
+        ),
+        CheckOutcome::KeyRejected => (Tone::Bad, "API key rejected".to_string(), message),
+        CheckOutcome::Unreachable => (Tone::Bad, "Unreachable".to_string(), message),
+        CheckOutcome::Failed => (
+            Tone::Warn,
+            check.status.map_or_else(
+                || "Error".to_string(),
+                |status| format!("Error · HTTP {status}"),
+            ),
+            message,
+        ),
+        CheckOutcome::Unusable => (Tone::Warn, "Not set up".to_string(), message),
+    }
+}
+
 /// A named fixture a headless render starts from.
 type Scene = (&'static str, fn(&mut Ui));
 
@@ -919,6 +997,18 @@ const SCENES: &[Scene] = &[
         }
         if let Some(status) = ui.status.as_mut() {
             status.duration_ms = 12_400;
+        }
+    }),
+    ("dictation-error", |ui| {
+        ui.settle();
+        if let Some(last) = ui.recent.first_mut() {
+            last.failed = true;
+            last.text.clear();
+            last.error = backend::demo_failure(0);
+        }
+        if let Some(status) = ui.status.as_mut() {
+            status.state = DaemonState::Error;
+            status.error = format!("transcription failed: {}", backend::demo_failure(0));
         }
     }),
     ("history", |ui| ui.open_first_transcript()),
@@ -945,6 +1035,13 @@ const SCENES: &[Scene] = &[
         ui.settle();
     }),
     ("settings", |ui| {
+        ui.set_pane(Pane::Settings);
+        ui.settle();
+    }),
+    ("settings-key-rejected", |ui| {
+        ui.settle();
+        ui.backend.send(Request::SetProvider("openai".to_string()));
+        ui.settle();
         ui.set_pane(Pane::Settings);
         ui.settle();
     }),
@@ -1047,7 +1144,7 @@ fn sidebar(ui: &Ui, p: Paint) -> El {
         .px(10.0)
         .gap(9.0)
         .center_y()
-        .child(charts::brand_mark(p, ui.state()))
+        .child(icon(&icons::BRAND, 24.0).key("mark").a11y_hidden())
         .child(
             text("Dictator")
                 .font(TextStyle::new(14.0, 600.0))
@@ -1059,29 +1156,7 @@ fn sidebar(ui: &Ui, p: Paint) -> El {
         .focus_group()
         .gap(2.0)
         .children(Pane::ALL.into_iter().map(|pane| nav_row(ui, p, pane)));
-    let (tone, daemon, provider) = ui.health();
-    let footer = col()
-        .key("health")
-        .px(10.0)
-        .py(10.0)
-        .gap(3.0)
-        .radius(p.k.radius.md)
-        .hover(p.k.c.hover)
-        .help("Check the connection again")
-        .on_press(|ui: &mut Ui| ui.check_connection())
-        .child(
-            row()
-                .gap(7.0)
-                .center_y()
-                .child(controls::status_dot(p, tone))
-                .child(text(daemon).font(p.k.ty.small_medium).color(p.text())),
-        )
-        .child(
-            text(provider)
-                .font(p.k.ty.small)
-                .color(p.muted())
-                .truncate(),
-        );
+    let footer = status_row(ui, p);
     col()
         .key("sidebar")
         .role("navigation")
@@ -1092,6 +1167,50 @@ fn sidebar(ui: &Ui, p: Paint) -> El {
         .child(nav)
         .child(rune::spacer())
         .child(footer)
+}
+
+/// One row: a haloed dot in the state's tone, what the app is doing or
+/// whether it can record, and the provider recordings go to.
+fn status_row(ui: &Ui, p: Paint) -> El {
+    let health = ui.health();
+    let ink = health.tone.color(p);
+    let dot = row()
+        .size(16.0, 16.0)
+        .radius(8.0)
+        .fill(ink.alpha(0.2))
+        .center()
+        .a11y_hidden()
+        .child(el().size(8.0, 8.0).radius(4.0).fill(ink));
+    row()
+        .key("health")
+        .role("status")
+        .label(format!("{} · {}", health.label, health.provider))
+        .h(40.0)
+        .px(10.0)
+        .gap(9.0)
+        .center_y()
+        .radius(p.k.radius.md)
+        .fill(p.k.c.surface_raised_base)
+        .border(p.hair, p.k.c.border_weak)
+        .hover(p.k.c.hover)
+        .help(health.help)
+        .on_press(|ui: &mut Ui| ui.check_connection())
+        .child(dot)
+        .child(
+            text(health.label)
+                .font(p.k.ty.small_medium)
+                .color(p.strong())
+                .truncate()
+                .grow(1.0)
+                .shrink(),
+        )
+        .child(
+            text(health.provider)
+                .font(p.k.ty.small)
+                .color(p.muted())
+                .truncate()
+                .shrink(),
+        )
 }
 
 fn nav_row(ui: &Ui, p: Paint, pane: Pane) -> El {

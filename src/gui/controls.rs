@@ -7,7 +7,8 @@ use rune_kit::{
     ScrollBarStyle,
 };
 
-use super::Ui;
+use super::logic::ErrorSummary;
+use super::{Ui, icons};
 
 pub(super) const GUTTER: f32 = 28.0;
 pub(super) const SECTION_GAP: f32 = 24.0;
@@ -276,7 +277,51 @@ pub(super) fn note(p: Paint, key: &str, message: &str, tone: Tone) -> El {
         .key(key)
         .font(p.k.ty.small.lh(16.0))
         .color(color)
-        .wrap()
+        .wrap_anywhere()
+}
+
+/// A failure: what went wrong in a few words, the provider's own message
+/// under it, and what can be done about it.
+pub(super) fn error_callout(p: Paint, key: &str, summary: &ErrorSummary, actions: Vec<El>) -> El {
+    let detail = (!summary.detail.is_empty()).then(|| {
+        text(summary.detail.clone())
+            .key("detail")
+            .font(p.k.ty.small.lh(17.0))
+            .color(p.muted())
+            .wrap_anywhere()
+            .max_lines(3)
+    });
+    row()
+        .key(key)
+        .px(14.0)
+        .py(12.0)
+        .gap(12.0)
+        .center_y()
+        .radius(p.k.radius.md)
+        .fill(p.k.c.danger.bg)
+        .border(p.hair, p.k.c.danger.border)
+        .child(
+            icon(&icons::ALERT, 16.0)
+                .color(p.danger())
+                .self_start()
+                .mt(1.0),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .shrink()
+                .min_w(0.0)
+                .gap(3.0)
+                .child(
+                    text(summary.title.clone())
+                        .key("title")
+                        .font(p.k.ty.ui_medium)
+                        .color(p.strong())
+                        .wrap(),
+                )
+                .children(detail),
+        )
+        .children((!actions.is_empty()).then(|| row().gap(6.0).center_y().children(actions)))
 }
 
 /// A full-width notice at the top of a pane.
@@ -343,21 +388,6 @@ pub(super) fn scroll_fill(p: Paint, key: &str, content: El) -> El {
         .grow(1.0)
         .shrink()
         .min_h(0.0)
-}
-
-/// A scroll viewport no taller than `max_h`, for a long list inside a card.
-/// It hugs short content, so a list of three rows leaves no empty space.
-pub(super) fn scroll_capped(p: Paint, key: &str, max_h: f32, content: El) -> El {
-    col()
-        .key(key)
-        .max_h(max_h)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .scroll_edge_fade(10.0)
-        .child(content)
-        .scroll_bar_styled(scroll_style(p))
-        .max_h(max_h)
 }
 
 fn scroll_style(p: Paint) -> ScrollBarStyle {

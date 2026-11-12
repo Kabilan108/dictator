@@ -67,6 +67,10 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn get_active_provider(&self) -> Option<String> {
         None
     }
+    /// Checks `name`, or the active provider for `None`, with its key.
+    fn check_provider(&self, _name: Option<&str>) -> Result<ProviderCheck> {
+        bail!("provider checks are not supported")
+    }
 }
 
 struct Running {
@@ -444,6 +448,24 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command, received_at: Ins
                             .data
                             .insert(DATA_KEY_PROVIDER.into(), active.name.clone());
                     }
+                }
+                Err(e) => err = Some(e),
+            }
+        }
+        ACTION_CHECK_PROVIDER => {
+            let result = match cmd.args.as_slice() {
+                [] => handler.check_provider(None),
+                [name] => handler.check_provider(Some(name)),
+                _ => Err(anyhow!(
+                    "{ACTION_CHECK_PROVIDER} takes at most one argument: the provider name"
+                )),
+            };
+            match result.and_then(|check| serde_json::to_string(&check).map_err(Into::into)) {
+                Ok(encoded) => {
+                    response.success = true;
+                    response
+                        .data
+                        .insert(DATA_KEY_PROVIDER_CHECK.into(), encoded);
                 }
                 Err(e) => err = Some(e),
             }

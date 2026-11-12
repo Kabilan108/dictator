@@ -1,4 +1,5 @@
-//! Line icons on a 24 point grid, drawn in the current text colour.
+//! Line icons on a 24 point grid, drawn in the current text colour, and the
+//! app's full-colour mark.
 
 use rune::Icon;
 
@@ -78,6 +79,15 @@ line_icon!(
     ]
 );
 line_icon!(CLOSE, "dictator-close", ["M18 6 6 18", "m6 6 12 12"]);
+line_icon!(
+    ALERT,
+    "dictator-alert",
+    [
+        "M12 21a9 9 0 1 0 0-18a9 9 0 1 0 0 18z",
+        "M12 8v4.5",
+        "M12 16h.01",
+    ]
+);
 line_icon!(CHEVRON_UP, "dictator-chevron-up", ["m18 15-6-6-6 6"]);
 line_icon!(CHEVRON_DOWN, "dictator-chevron-down", ["m6 9 6 6 6-6"]);
 line_icon!(CHEVRON_LEFT, "dictator-chevron-left", ["m15 18-6-6 6-6"]);
@@ -105,3 +115,33 @@ solid_icon!(
         "M14 4h3a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-3a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1z",
     ]
 );
+
+/// The app's mark: three level bars on a dark tile. `assets/dictator.svg`,
+/// the icon the desktop entry shows, wraps this same body.
+pub(super) const BRAND_BODY: &str = concat!(
+    r##"<defs><linearGradient id="dictator-tile" x1="0" y1="0" x2="0" y2="1">"##,
+    r##"<stop offset="0" stop-color="#3d3d3d"/><stop offset="1" stop-color="#1f1f1f"/>"##,
+    r##"</linearGradient></defs>"##,
+    r##"<rect x="1" y="1" width="22" height="22" rx="6" fill="url(#dictator-tile)"/>"##,
+    r##"<rect x="1.25" y="1.25" width="21.5" height="21.5" rx="5.75" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="0.5"/>"##,
+    r##"<path d="M7.5 9v6M12 6v12M16.5 8v8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>"##,
+);
+
+pub(super) static BRAND: Icon = Icon {
+    name: "dictator-brand",
+    view: 24.0,
+    body: BRAND_BODY,
+};
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_installed_icon_is_the_in_app_mark() {
+        let asset = include_str!("../../assets/dictator.svg");
+        assert!(asset.contains(r#"viewBox="0 0 24 24""#));
+        assert!(
+            asset.contains(super::BRAND_BODY),
+            "assets/dictator.svg drifted from BRAND_BODY"
+        );
+    }
+}

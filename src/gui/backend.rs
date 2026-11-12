@@ -7,6 +7,7 @@ use std::time::Instant;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 
 use crate::ipc::{Client, DaemonState};
+use crate::provider::{CheckOutcome, ProviderCheck};
 use crate::storage::{
     DailyActivity, Db, HistoryFilter, HistoryQuery, RecordingDetail, RecordingStats,
     RecordingStatus,
@@ -171,9 +172,16 @@ pub struct Status {
 #[derive(Clone, Debug)]
 pub struct ConnectionReport {
     pub daemon: Result<(), String>,
-    pub provider: Result<String, String>,
-    pub endpoint_host: String,
+    pub check: ProviderCheck,
     pub checked_at: DateTime<Utc>,
+}
+
+/// The config default, checked without its key while the daemon cannot
+/// check it.
+#[derive(Clone, Debug, Default)]
+struct Fallback {
+    provider: String,
+    endpoint: String,
 }
 
 #[derive(Debug)]
@@ -256,14 +264,17 @@ impl Backend {
         let (request_tx, request_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let managed_settings = read_managed_settings(demo);
-        let default_endpoint = managed_settings.endpoint.clone();
+        let fallback = Fallback {
+            provider: managed_settings.provider.clone(),
+            endpoint: managed_settings.endpoint.clone(),
+        };
         thread::Builder::new()
             .name("dictator-gui-backend".to_string())
             .spawn(move || {
                 if demo {
                     run_demo_worker(request_rx, reply_tx);
                 } else {
-                    run_live_worker(request_rx, reply_tx, default_endpoint);
+                    run_live_worker(request_rx, reply_tx, fallback);
                 }
             })
             .expect("failed to start GUI backend worker");
@@ -287,8 +298,7 @@ impl Backend {
     }
 }
 
-/// `default_endpoint` is probed by a connection check while the daemon is down.
-fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, default_endpoint: String) {
+fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, fallback: Fallback) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -306,9 +316,9 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, default_
         let kind = live_request_kind(&request);
         reopen_database_for_request(&request, &mut db, &mut db_error, open_database);
         let reply = if let Some(db) = db.as_ref() {
-            handle_live(db, &runtime, &default_endpoint, request)
+            handle_live(db, &runtime, &fallback, request)
         } else if kind == LiveRequestKind::Service {
-            handle_live_service(&runtime, &default_endpoint, request)
+            handle_live_service(&runtime, &fallback, request)
         } else {
             failed_reply(request, &db_error)
         };
@@ -419,7 +429,7 @@ fn failed_reply(request: Request, message: &str) -> Reply {
 fn handle_live(
     db: &Db,
     runtime: &tokio::runtime::Runtime,
-    default_endpoint: &str,
+    fallback: &Fallback,
     request: Request,
 ) -> Reply {
     match request {
@@ -512,7 +522,7 @@ fn handle_live(
                 })
                 .map_err(|error| error.to_string()),
         ),
-        request => handle_live_service(runtime, default_endpoint, request),
+        request => handle_live_service(runtime, fallback, request),
     }
 }
 
@@ -526,23 +536,44 @@ fn remove_audio_file(path: &std::path::Path) {
     }
 }
 
-async fn probe_provider(endpoint: &str) -> Result<String, String> {
+/// Checks `endpoint` without a key: any answer means it is reachable.
+async fn probe_provider(provider: &str, endpoint: &str) -> ProviderCheck {
+    let mut check = ProviderCheck {
+        provider: provider.to_string(),
+        host: endpoint_host(endpoint),
+        outcome: CheckOutcome::Unusable,
+        status: None,
+        latency_ms: 0,
+        message: String::new(),
+    };
     if endpoint.trim().is_empty() {
-        return Err("no provider endpoint configured".to_string());
+        check.message = "no provider endpoint configured".to_string();
+        return check;
     }
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|error| error.to_string())?;
+    {
+        Ok(client) => client,
+        Err(error) => {
+            check.message = error.to_string();
+            return check;
+        }
+    };
     let started = Instant::now();
-    match client.get(endpoint.trim()).send().await {
-        Ok(response) => Ok(format!(
-            "HTTP {} in {} ms",
-            response.status().as_u16(),
-            started.elapsed().as_millis()
-        )),
-        Err(error) => Err(short_request_error(&error)),
+    let result = client.get(endpoint.trim()).send().await;
+    check.latency_ms = started.elapsed().as_millis() as u64;
+    match result {
+        Ok(response) => {
+            check.outcome = CheckOutcome::Reachable;
+            check.status = Some(response.status().as_u16());
+        }
+        Err(error) => {
+            check.outcome = CheckOutcome::Unreachable;
+            check.message = crate::audio::describe_request_error(&error);
+        }
     }
+    check
 }
 
 fn endpoint_host(endpoint: &str) -> String {
@@ -550,23 +581,6 @@ fn endpoint_host(endpoint: &str) -> String {
         .ok()
         .and_then(|url| url.host_str().map(str::to_string))
         .unwrap_or_default()
-}
-
-fn short_request_error(error: &reqwest::Error) -> String {
-    let kind = if error.is_timeout() {
-        "timed out"
-    } else if error.is_connect() {
-        "connection failed"
-    } else if error.is_builder() {
-        "invalid endpoint"
-    } else {
-        "request failed"
-    };
-    let mut source: &dyn std::error::Error = error;
-    while let Some(next) = source.source() {
-        source = next;
-    }
-    format!("{kind}: {source}")
 }
 
 /// The daemon's error, or a short note that it is not running.
@@ -579,16 +593,19 @@ fn daemon_error(error: anyhow::Error) -> String {
     }
 }
 
-/// The endpoint of the provider the daemon is using, or `default_endpoint`
-/// when the daemon cannot say.
-async fn active_endpoint(client: &Client, default_endpoint: &str) -> String {
+/// The provider the daemon is using, or the config default when the daemon
+/// cannot say.
+async fn active_provider(client: &Client, fallback: &Fallback) -> Fallback {
     client
         .providers()
         .await
         .ok()
         .and_then(|providers| providers.into_iter().find(|provider| provider.active))
-        .map(|provider| provider.endpoint)
-        .unwrap_or_else(|| default_endpoint.to_string())
+        .map(|provider| Fallback {
+            provider: provider.name,
+            endpoint: provider.endpoint,
+        })
+        .unwrap_or_else(|| fallback.clone())
 }
 
 fn map_provider(provider: crate::ipc::ProviderSummary) -> ProviderInfo {
@@ -606,7 +623,7 @@ fn map_provider(provider: crate::ipc::ProviderSummary) -> ProviderInfo {
 
 fn handle_live_service(
     runtime: &tokio::runtime::Runtime,
-    default_endpoint: &str,
+    fallback: &Fallback,
     request: Request,
 ) -> Reply {
     match request {
@@ -663,22 +680,27 @@ fn handle_live_service(
                 .map_err(|error| error.to_string()),
         ),
         Request::CheckConnection => Reply::Connection(Ok(runtime.block_on(async {
-            let daemon = Client::new()
+            let client = Client::new();
+            let daemon = client
                 .status()
                 .await
                 .and_then(parse_status)
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let endpoint = if daemon.is_ok() {
-                active_endpoint(&Client::new(), default_endpoint).await
-            } else {
-                default_endpoint.to_string()
+            let check = match &daemon {
+                Ok(()) => match client.check_provider(None).await {
+                    Ok(check) => check,
+                    Err(error) => {
+                        tracing::debug!(%error, "daemon cannot check providers; probing without the key");
+                        let active = active_provider(&client, fallback).await;
+                        probe_provider(&active.provider, &active.endpoint).await
+                    }
+                },
+                Err(_) => probe_provider(&fallback.provider, &fallback.endpoint).await,
             };
-            let provider = probe_provider(&endpoint).await;
             ConnectionReport {
                 daemon,
-                provider,
-                endpoint_host: endpoint_host(&endpoint),
+                check,
                 checked_at: Utc::now(),
             }
         }))),
@@ -1232,12 +1254,7 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
             }
             Request::CheckConnection => Reply::Connection(Ok(ConnectionReport {
                 daemon: Ok(()),
-                provider: Ok("HTTP 405 in 84 ms".to_string()),
-                endpoint_host: providers
-                    .iter()
-                    .find(|provider| provider.active)
-                    .map(|provider| endpoint_host(&provider.endpoint))
-                    .unwrap_or_default(),
+                check: demo_check(providers.iter().find(|provider| provider.active)),
                 checked_at: Utc::now(),
             })),
             Request::Glossary => Reply::Glossary(Ok(Glossary::from_stored(Some(glossary.clone())))),
@@ -1383,6 +1400,57 @@ fn demo_providers() -> Vec<ProviderInfo> {
     ]
 }
 
+/// The demo's OpenAI key is a stale one, so switching to it shows how a
+/// refused key looks.
+fn demo_check(active: Option<&ProviderInfo>) -> ProviderCheck {
+    let Some(active) = active else {
+        return ProviderCheck {
+            provider: String::new(),
+            host: String::new(),
+            outcome: CheckOutcome::Unusable,
+            status: None,
+            latency_ms: 0,
+            message: "no provider is active".to_string(),
+        };
+    };
+    let rejected = active.name == "openai";
+    ProviderCheck {
+        provider: active.name.clone(),
+        host: endpoint_host(&active.endpoint),
+        outcome: if rejected {
+            CheckOutcome::KeyRejected
+        } else {
+            CheckOutcome::Ready
+        },
+        status: Some(if rejected { 401 } else { 422 }),
+        latency_ms: if rejected { 182 } else { 84 },
+        message: if rejected {
+            crate::provider::provider_message(DEMO_KEY_REJECTED.as_bytes())
+        } else {
+            String::new()
+        },
+    }
+}
+
+const DEMO_KEY_REJECTED: &str = r#"{
+  "error": {
+    "message": "Incorrect API key provided: sk-proj-************************************************************Xk2Q. You can find your API key at https://platform.openai.com/account/api-keys.",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key",
+    "param": null
+  },
+  "status": 401
+}"#;
+
+/// What the daemon records for a failed demo recording.
+pub(super) fn demo_failure(index: i64) -> String {
+    if index % 2 == 0 {
+        format!("API request failed with status 401: {DEMO_KEY_REJECTED}")
+    } else {
+        "request failed after 2 attempts: error sending request for url (https://siren.example.test/v1/audio/transcriptions): operation timed out".to_string()
+    }
+}
+
 /// Mirrors the daemon's checks and messages.
 fn demo_set_provider(
     providers: &mut [ProviderInfo],
@@ -1439,7 +1507,7 @@ fn demo_recordings() -> Vec<Recording> {
                 },
                 failed,
                 error: if failed {
-                    "transcription failed: provider timeout".to_string()
+                    demo_failure(index / 53)
                 } else {
                     String::new()
                 },
@@ -1915,18 +1983,31 @@ mod tests {
     async fn connection_check_probes_the_daemons_active_provider() {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("dictator.sock");
-        let default = "https://siren.example.test/v1";
+        let default = Fallback {
+            provider: "siren".to_string(),
+            endpoint: "https://siren.example.test/v1".to_string(),
+        };
 
         let missing = Client::with_path(dir.path().join("missing.sock"));
-        assert_eq!(active_endpoint(&missing, default).await, default);
+        assert_eq!(active_provider(&missing, &default).await.provider, "siren");
 
         let server =
             crate::ipc::Server::with_path(std::sync::Arc::new(ProviderHandler), socket.clone());
         server.start().await.unwrap();
-        let endpoint = active_endpoint(&Client::with_path(socket), default).await;
+        let client = Client::with_path(socket);
+        let active = active_provider(&client, &default).await;
+        let unsupported = client.check_provider(None).await.unwrap_err();
         server.stop().await.unwrap();
-        assert_eq!(endpoint, "https://api.openai.com/v1/audio/transcriptions");
-        assert_eq!(endpoint_host(&endpoint), "api.openai.com");
+        assert_eq!(active.provider, "openai");
+        assert_eq!(
+            active.endpoint,
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            unsupported.to_string(),
+            "provider checks are not supported",
+            "an older handler refuses the check, so the app falls back to probing"
+        );
     }
 
     #[test]
@@ -1967,7 +2048,9 @@ mod tests {
         let Reply::Connection(Ok(report)) = reply_rx.recv().unwrap() else {
             panic!("expected a connection report");
         };
-        assert_eq!(report.endpoint_host, "api.openai.com");
+        assert_eq!(report.check.host, "api.openai.com");
+        assert_eq!(report.check.outcome, CheckOutcome::KeyRejected);
+        assert!(report.check.message.contains("sk-proj-…Xk2Q"));
 
         for (name, expected) in [
             (
@@ -2106,9 +2189,10 @@ mod tests {
                 .unwrap();
         });
 
-        let report = probe_provider(&endpoint).await.expect("405 is reachable");
-        assert!(report.starts_with("HTTP 405 in "), "{report}");
-        assert!(report.ends_with(" ms"), "{report}");
+        let check = probe_provider("siren", &endpoint).await;
+        assert_eq!(check.outcome, CheckOutcome::Reachable);
+        assert_eq!(check.status, Some(405));
+        assert_eq!(check.provider, "siren");
     }
 
     #[tokio::test]
@@ -2117,12 +2201,16 @@ mod tests {
         let endpoint = format!("http://{}/v1", closed.local_addr().unwrap());
         drop(closed);
 
-        let error = probe_provider(&endpoint).await.unwrap_err();
-        assert!(error.starts_with("connection failed: "), "{error}");
-        assert_eq!(
-            probe_provider("  ").await.unwrap_err(),
-            "no provider endpoint configured"
+        let check = probe_provider("siren", &endpoint).await;
+        assert_eq!(check.outcome, CheckOutcome::Unreachable);
+        assert!(
+            check.message.starts_with("connection failed: "),
+            "{}",
+            check.message
         );
+        let check = probe_provider("siren", "  ").await;
+        assert_eq!(check.outcome, CheckOutcome::Unusable);
+        assert_eq!(check.message, "no provider endpoint configured");
     }
 
     #[test]
@@ -2182,17 +2270,24 @@ mod tests {
             .save_failed_attempt(500, Some("/tmp/failed.wav"), "boom", Some("m"), None)
             .unwrap();
 
-        let Reply::Recent(Ok(recent)) =
-            handle_live(&db, &runtime, "", Request::Recent { limit: 1 })
-        else {
+        let Reply::Recent(Ok(recent)) = handle_live(
+            &db,
+            &runtime,
+            &Fallback::default(),
+            Request::Recent { limit: 1 },
+        ) else {
             panic!("expected recent reply");
         };
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].id, failed);
         assert!(recent[0].failed);
 
-        let Reply::Recent(Ok(all)) = handle_live(&db, &runtime, "", Request::Recent { limit: 0 })
-        else {
+        let Reply::Recent(Ok(all)) = handle_live(
+            &db,
+            &runtime,
+            &Fallback::default(),
+            Request::Recent { limit: 0 },
+        ) else {
             panic!("expected recent reply");
         };
         assert_eq!(all.len(), 1, "a zero limit is clamped to one");
@@ -2239,17 +2334,17 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            handle_live(&db, &runtime, "", Request::Delete(id)),
+            handle_live(&db, &runtime, &Fallback::default(), Request::Delete(id)),
             Reply::Deleted(Ok(deleted)) if deleted == id
         ));
         assert!(!audio.exists());
         assert!(matches!(
-            handle_live(&db, &runtime, "", Request::Delete(missing_audio)),
+            handle_live(&db, &runtime, &Fallback::default(), Request::Delete(missing_audio)),
             Reply::Deleted(Ok(deleted)) if deleted == missing_audio
         ));
         assert!(
             matches!(
-                handle_live(&db, &runtime, "", Request::Delete(id)),
+                handle_live(&db, &runtime, &Fallback::default(), Request::Delete(id)),
                 Reply::Deleted(Ok(deleted)) if deleted == id
             ),
             "deleting an already-deleted recording is idempotent"

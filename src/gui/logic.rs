@@ -1,5 +1,5 @@
 //! View-independent logic for the desktop app: reply bookkeeping, draft
-//! tracking, the word diff and display formatting.
+//! tracking, the word diff, error summaries and display formatting.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -432,6 +432,143 @@ pub(super) fn format_uptime(seconds: u64) -> String {
     }
 }
 
+/// What fixes a failure, which decides the action the view offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ErrorKind {
+    /// The provider refused the key.
+    Key,
+    /// The provider could not be reached, has no such endpoint, or is not
+    /// configured.
+    Provider,
+    Other,
+}
+
+/// An error from the daemon or a provider, said in a few words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ErrorSummary {
+    pub(super) title: String,
+    pub(super) detail: String,
+    pub(super) kind: ErrorKind,
+    /// The provider's reply, when it holds more than `detail` shows.
+    pub(super) raw: Option<String>,
+}
+
+impl ErrorSummary {
+    /// Title and detail on one line, for a list row.
+    pub(super) fn line(&self) -> String {
+        if self.detail.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{} · {}", self.title, self.detail)
+        }
+    }
+}
+
+const HTTP_FAILURE: &str = "API request failed with status ";
+
+/// Reads the daemon's error strings: `transcription failed: ...`, a
+/// provider's HTTP reply (`API request failed with status 401: {json}`),
+/// request failures and configuration problems.
+pub(super) fn describe_error(error: &str) -> ErrorSummary {
+    let error = error.trim();
+    let rest = strip_prefix_ignore_case(error, "transcription failed: ").unwrap_or(error);
+    let summary = |title: &str, detail: &str, kind| ErrorSummary {
+        title: title.to_string(),
+        detail: crate::provider::provider_message(detail.as_bytes()),
+        kind,
+        raw: None,
+    };
+
+    if let Some(at) = rest.find(HTTP_FAILURE)
+        && let Some((code, body)) = rest[at + HTTP_FAILURE.len()..].split_once(':')
+        && let Ok(status) = code.trim().parse::<u16>()
+    {
+        return http_failure(status, body);
+    }
+    if let Some(at) = rest
+        .find(": request failed")
+        .map(|at| at + 2)
+        .or_else(|| strip_prefix_ignore_case(rest, "request failed").map(|_| 0))
+    {
+        let rest = &rest[at..];
+        let cause = rest.split_once(": ").map_or(rest, |(_, cause)| cause);
+        let title = if rest.contains("timed out") {
+            "Provider timed out"
+        } else {
+            "Couldn't reach the provider"
+        };
+        return summary(title, cause, ErrorKind::Provider);
+    }
+    if rest.starts_with("provider '")
+        && let Some((_, problem)) = rest
+            .split_once("cannot be used: ")
+            .or_else(|| rest.contains("not found").then_some(("", rest)))
+    {
+        return summary("Provider not configured", problem, ErrorKind::Provider);
+    }
+    if let Some(cause) = strip_prefix_ignore_case(rest, "failed to decode response: ") {
+        return summary(
+            "Unreadable reply from the provider",
+            cause,
+            ErrorKind::Other,
+        );
+    }
+    if rest.eq_ignore_ascii_case("transcription cancelled") {
+        return summary("Cancelled", "", ErrorKind::Other);
+    }
+    match rest.split_once(": ") {
+        Some((head, tail)) if head.len() <= 40 && !head.contains(['{', '(']) => {
+            summary(&capitalize(head), tail, ErrorKind::Other)
+        }
+        _ if rest.len() < error.len() => summary("Transcription failed", rest, ErrorKind::Other),
+        _ if rest.len() <= 60 && !rest.contains(['{', '(']) => {
+            summary(&capitalize(rest), "", ErrorKind::Other)
+        }
+        _ => summary("Something went wrong", rest, ErrorKind::Other),
+    }
+}
+
+/// A provider's HTTP error reply: a title for the status, its message and
+/// the reply itself.
+fn http_failure(status: u16, body: &str) -> ErrorSummary {
+    let (title, kind) = match status {
+        401 => ("API key rejected", ErrorKind::Key),
+        403 => ("Access denied", ErrorKind::Key),
+        404 | 405 => ("Endpoint not found", ErrorKind::Provider),
+        408 | 504 => ("Provider timed out", ErrorKind::Other),
+        413 => ("Recording too large for the provider", ErrorKind::Other),
+        429 => ("Rate limited or out of quota", ErrorKind::Other),
+        500..=599 => ("Provider error", ErrorKind::Other),
+        _ => ("Provider refused the recording", ErrorKind::Other),
+    };
+    let body = body.trim();
+    let message = crate::provider::provider_message(body.as_bytes());
+    let detail = if message.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("{message} (HTTP {status})")
+    };
+    ErrorSummary {
+        title: title.to_string(),
+        detail,
+        kind,
+        raw: (!body.is_empty() && body != message).then(|| crate::provider::collapse_masks(body)),
+    }
+}
+
+fn strip_prefix_ignore_case<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
+    text.get(..prefix.len())
+        .filter(|head| head.eq_ignore_ascii_case(prefix))
+        .map(|_| &text[prefix.len()..])
+}
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(chars).collect()
+    })
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
@@ -701,5 +838,116 @@ mod state_tests {
         assert_eq!(typing_glossary_error("   "), "");
         assert_eq!(typing_glossary_error("tmux"), "");
         assert!(typing_glossary_error(&"x".repeat(65)).contains("at most 64"));
+    }
+}
+
+#[cfg(test)]
+mod error_tests {
+    use super::*;
+
+    const OPENAI_401: &str = r#"API request failed with status 401: {
+  "error": {
+    "message": "Incorrect API key provided: sk-proj-**************************abcd. You can find your API key at https://platform.openai.com/account/api-keys.",
+    "type": "invalid_request_error",
+    "code": "invalid_api_key",
+    "param": null
+  },
+  "status": 401
+}"#;
+
+    #[test]
+    fn provider_replies_become_a_title_and_the_providers_message() {
+        let summary = describe_error(&format!("transcription failed: {OPENAI_401}"));
+        assert_eq!(summary.title, "API key rejected");
+        assert_eq!(summary.kind, ErrorKind::Key);
+        assert_eq!(
+            summary.detail,
+            "Incorrect API key provided: sk-proj-…abcd. You can find your API key at \
+             https://platform.openai.com/account/api-keys. (HTTP 401)"
+        );
+        let raw = summary.raw.as_deref().unwrap();
+        assert!(raw.contains("\"invalid_api_key\""), "{raw}");
+        assert!(raw.contains("sk-proj-…abcd"), "{raw}");
+
+        let siren =
+            describe_error(r#"API request failed with status 503: {"detail":"model loading"}"#);
+        assert_eq!(
+            (siren.title.as_str(), siren.detail.as_str(), siren.kind),
+            (
+                "Provider error",
+                "model loading (HTTP 503)",
+                ErrorKind::Other
+            )
+        );
+        let retried = describe_error(&format!("failed to transcribe /tmp/a.wav: {OPENAI_401}"));
+        assert_eq!(
+            (retried.title.as_str(), retried.kind),
+            ("API key rejected", ErrorKind::Key)
+        );
+        let bare = describe_error("API request failed with status 404: ");
+        assert_eq!(
+            (bare.title.as_str(), bare.detail.as_str()),
+            ("Endpoint not found", "HTTP 404")
+        );
+        assert_eq!(bare.raw, None);
+    }
+
+    #[test]
+    fn other_daemon_errors_get_a_readable_title() {
+        let cases = [
+            (
+                "transcription failed: request failed after 2 attempts: error sending request for url (http://x/v1): operation timed out",
+                "Provider timed out",
+                ErrorKind::Provider,
+            ),
+            (
+                "request failed: error sending request: connection refused",
+                "Couldn't reach the provider",
+                ErrorKind::Provider,
+            ),
+            (
+                "provider 'groq' cannot be used: GROQ_API_KEY is not set in the daemon's environment",
+                "Provider not configured",
+                ErrorKind::Provider,
+            ),
+            (
+                "provider 'gone' not found",
+                "Provider not configured",
+                ErrorKind::Provider,
+            ),
+            ("transcription cancelled", "Cancelled", ErrorKind::Other),
+            (
+                "recording failed: no microphone is connected",
+                "Recording failed",
+                ErrorKind::Other,
+            ),
+            (
+                "cannot toggle in current state: transcribing",
+                "Cannot toggle in current state",
+                ErrorKind::Other,
+            ),
+            (
+                "transcription failed: something odd {x}",
+                "Transcription failed",
+                ErrorKind::Other,
+            ),
+            ("no input", "No input", ErrorKind::Other),
+        ];
+        for (error, title, kind) in cases {
+            let summary = describe_error(error);
+            assert_eq!(
+                (summary.title.as_str(), summary.kind),
+                (title, kind),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            describe_error("recording failed: no microphone is connected").line(),
+            "Recording failed · no microphone is connected"
+        );
+        assert_eq!(
+            describe_error("transcription cancelled").line(),
+            "Cancelled"
+        );
     }
 }
