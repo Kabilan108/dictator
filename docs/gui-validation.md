@@ -1,8 +1,9 @@
-# Native GUI validation
+# Desktop app validation
 
-The GPUI desktop app follows the accepted prototype in `mockups/gui-mockup.html`.
-The historical video notes in `mockups/video-feedback.md` describe the prototype
-review, including ideas superseded by later decisions.
+The desktop app is drawn with [Rune](https://github.com/anomalyco/rune). It
+replaced the earlier GPUI app and keeps that app's backend worker, playback and
+level feed. `mockups/gui-mockup.html` and `mockups/video-feedback.md` describe
+the prototype the first version followed; they are history, not a spec.
 
 ## Automated checks
 
@@ -14,68 +15,53 @@ direnv exec "$PWD" cargo build --features gui --bins
 nix build .#gui
 ```
 
-The full GUI-feature test suite passed 187 tests, with 6 helper/probe entries ignored by default.
-Formatting and all-target Clippy passed with warnings denied.
-The Nix GUI package also passed its release-profile tests and launched on this
-machine without a development shell or an inherited `LD_LIBRARY_PATH`.
-
 The GUI workflow integration test uses private temporary XDG directories and a
 loopback HTTP provider. It checks failed and successful retries, stable recording
 identity and capture time, completion generations, cancellation, measured request
-latency, persistence failures, and revision save/conflict/restore behavior. The
-CLI compatibility tests run with GUI features enabled as well.
+latency, persistence failures, and revision save/conflict/restore behavior.
 
-## Desktop acceptance on NixOS and niri
+View-independent logic (reply bookkeeping, drafts, the word diff, formatting,
+histogram bins) is unit-tested in `src/gui/logic.rs` and `src/gui/charts.rs`.
 
-Tested with a real GPUI main window at 1120×700:
+## Looking at a change
 
-- Dictation, History, Stats, and Settings render with bundled IBM Plex Mono and
-  Geist. Dictation is the default tab. Stats fits within the default
-  window: five summary tiles, 30-day activity and time-of-day charts, then the
-  latency histogram beside recording-length figures and the model table.
-- Dictation: Start recording drove the live daemon through the same toggle IPC
-  as the shortcut; the meter and elapsed time updated during capture and the
-  finished transcript appeared under Last result and at the top of Recent
-  dictations. Check connection reported the real provider host as reachable
-  (HTTP 405 without credentials) with the measured round trip.
-- Deleting a recording from History after the inline confirmation removed the
-  row, its revision and attempt rows, the legacy compatibility transcript, and
-  the WAV file; the list re-selected the next recording.
-- A real microphone capture reached an isolated local transcription provider.
-  The new recording became visible and selected on completion, with an empty
-  search field. The activity indicator appeared left of search during capture.
-- A provider failure stayed in history. Retrying it retained the ID and capture
-  timestamp, added an attempt, and did not paste text again.
-- Editing created a revision while preserving the original model output. The
-  compatibility CLI transcript contained the edited text. The detail pane shows
-  one diff, the model transcript against the current text, and only when they
-  differ; the revision list and restore action were removed as unhelpful.
-- Playback, pause, and waveform seeking controlled a real `ffplay` process.
-- Microphone capture delivered PCM before cancellation. This probe used an
-  isolated preferences directory. Bluetooth identity/reconnect behavior was
-  tested with fixtures; no Bluetooth microphone was connected during validation.
+Every pane has fixture scenes that render headlessly, with no window, from the
+demo backend:
 
-Desktop test audio, history, preferences, and provider configuration were isolated
-from the user's data. Clipboard/paste commands from the test daemon were
-intercepted. The installed Home Manager daemon was not replaced or activated.
+```sh
+dictator-gui --demo --list-scenes
+dictator-gui --demo --snap out.png --scene settings --theme light --scale 2
+dictator-gui --demo --snap out.png --scene settings --size 940x1120
+```
 
-GPUI 0.2.2 does not request an initial size for any window. On niri, Dictator
-uses the compositor's IPC to size the main window to 924×740 after it opens.
-Other compositors may need a window rule for `Dictator`.
+Scenes: `dictation`, `recording`, `history`, `history-edited`, `history-delete`, `history-failed`,
+`stats`, `settings`, `settings-editing`. A scene is a fixture, not end-to-end
+proof: the real window, input and a live daemon still need a person.
 
-GPUI's Linux backend stops its event loop when the last window closes, so
-closing the main window ends the process. The GUI is opened on demand from the
+## Checked for the Rune rebuild (NixOS, niri)
+
+- Each scene above rendered in the dark and light themes and was inspected.
+- The real window, started with `--demo`, opened floating at 940×700. niri
+  reported a single open event at that size and no later resize, with the
+  user's old `org.dictator.Dictator` window rule (924×740) still in place. The
+  window maps at a fixed size, which tiling compositors float; it becomes
+  resizable after its first frame. No window rule is needed.
+- The app starts on Dictation.
+
+## Not rechecked
+
+These were accepted on the GPUI app and exercise code the rebuild did not
+change (the backend worker, `playback.rs`, the daemon), but nobody has repeated
+them through the new views:
+
+- recording through the window against a live daemon, and the meter following
+  the OSD socket's level stream;
+- playback, pause and waveform seeking against a real `ffplay` process;
+- saving an edit, retrying a failed recording, and deleting one, on real data;
+- switching provider, forgetting a microphone and renaming a glossary term
+  against a live daemon (covered by unit and IPC tests and by the demo backend);
+- a daemon restart while the window stays open.
+
+Closing the window ends the process. The GUI is opened on demand from the
 desktop shell's dictation panel, which also owns the bar indicator and quick
 recording controls.
-
-Review follow-up checks covered unavailable desktop notifications, stalled Pulse
-and Niri subprocesses, deferred editor/search events, legacy failure discovery,
-and cancellation during capture-failure persistence. A temporary systemd user
-unit could write the exact Dictator app directories while an unrelated home-file
-write was denied. The retry workflow passed 50 consecutive focused runs after
-one unreproduced timeout, followed by a successful full suite.
-
-A final native lifecycle check restarted the isolated daemon while the main
-window remained open. History, statistics, and
-recording controls stayed available. A subprocess regression and a negative-control
-probe verified that opening another database connection preserves process locks.

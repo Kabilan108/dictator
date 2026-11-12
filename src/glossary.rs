@@ -128,6 +128,37 @@ pub fn delete_term(terms: &mut Vec<String>, raw: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Replaces the first entry matching `from` (ignoring case and surrounding
+/// whitespace) with `to`, keeping its position. `to` may differ from `from`
+/// only in case, but must not duplicate another term. Other entries matching
+/// `from` are duplicates and are dropped.
+pub fn replace_term(terms: &mut Vec<String>, from: &str, to: &str) -> Result<(), String> {
+    let to = normalize_term(to)?;
+    let Some(index) = terms.iter().position(|existing| same_term(existing, from)) else {
+        return Err(format!("\"{}\" is not in the glossary", from.trim()));
+    };
+    if terms
+        .iter()
+        .any(|existing| !same_term(existing, from) && same_term(existing, &to))
+    {
+        return Err(format!("\"{to}\" is already in the glossary"));
+    }
+    *terms = std::mem::take(terms)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(position, existing)| {
+            if position == index {
+                Some(to.clone())
+            } else if same_term(&existing, from) {
+                None
+            } else {
+                Some(existing)
+            }
+        })
+        .collect();
+    Ok(())
+}
+
 /// Reads the stored terms as written. `None` means the file does not exist.
 pub fn load(path: &Path) -> Result<Option<Vec<String>>> {
     match File::open(path) {
@@ -162,6 +193,11 @@ pub fn add(path: &Path, raw: &str) -> Result<Vec<String>> {
 /// term leaves an empty list, which turns boosting off.
 pub fn remove(path: &Path, raw: &str) -> Result<Vec<String>> {
     edit(path, |terms| delete_term(terms, raw))
+}
+
+/// Renames a term in the file and returns the new list.
+pub fn rename(path: &Path, from: &str, to: &str) -> Result<Vec<String>> {
+    edit(path, |terms| replace_term(terms, from, to))
 }
 
 fn edit(
@@ -425,6 +461,102 @@ mod tests {
             insert_term(&mut full, "one more"),
             Err(format!("The glossary is full ({MAX_TERMS} terms)"))
         );
+    }
+
+    #[test]
+    fn replace_term_keeps_position_and_rejects_conflicts() {
+        /// name, stored, from, to, expected list or error
+        type Case = (
+            &'static str,
+            &'static [&'static str],
+            &'static str,
+            &'static str,
+            Result<&'static [&'static str], &'static str>,
+        );
+        let cases: &[Case] = &[
+            (
+                "keeps position",
+                &["Claude", "tmux", "Sietch"],
+                "tmux",
+                " Zellij ",
+                Ok(&["Claude", "Zellij", "Sietch"]),
+            ),
+            (
+                "case-only change",
+                &["Claude", "tmux"],
+                "TMUX",
+                "Tmux",
+                Ok(&["Claude", "Tmux"]),
+            ),
+            (
+                "unchanged",
+                &["Claude"],
+                "claude",
+                "Claude",
+                Ok(&["Claude"]),
+            ),
+            (
+                "hand-edited duplicates collapse",
+                &["claude", "tmux", "CLAUDE"],
+                "Claude",
+                "Claude",
+                Ok(&["Claude", "tmux"]),
+            ),
+            (
+                "duplicates another term",
+                &["Claude", "tmux"],
+                "tmux",
+                "claude",
+                Err("\"claude\" is already in the glossary"),
+            ),
+            (
+                "missing term",
+                &["Claude"],
+                " zellij ",
+                "Zellij",
+                Err("\"zellij\" is not in the glossary"),
+            ),
+            (
+                "invalid replacement",
+                &["Claude"],
+                "Claude",
+                "  ",
+                Err("A term cannot be empty"),
+            ),
+        ];
+        for (name, stored, from, to, expected) in cases {
+            let mut terms = strings(stored);
+            let result = replace_term(&mut terms, from, to);
+            match expected {
+                Ok(list) => {
+                    assert_eq!(result, Ok(()), "{name}");
+                    assert_eq!(terms, strings(list), "{name}");
+                }
+                Err(message) => {
+                    assert_eq!(result, Err(message.to_string()), "{name}");
+                    assert_eq!(terms, strings(stored), "{name}: list unchanged");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rename_rewrites_the_file_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(GLOSSARY_FILE);
+        add(&path, "Claude").unwrap();
+        add(&path, "tmux").unwrap();
+
+        assert_eq!(
+            rename(&path, "claude", "Claude Code").unwrap(),
+            strings(&["Claude Code", "tmux"])
+        );
+        assert_eq!(
+            load(&path).unwrap(),
+            Some(strings(&["Claude Code", "tmux"]))
+        );
+        assert!(rename(&path, "tmux", "claude code").is_err());
+        assert!(rename(dir.path().join("missing.json").as_path(), "a", "b").is_err());
     }
 
     #[test]

@@ -96,17 +96,35 @@ pub struct Microphone {
     pub bluetooth: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderInfo {
+    pub name: String,
+    pub model: String,
+    pub endpoint: String,
+    pub usable: bool,
+    /// Why it cannot be selected; empty when usable.
+    pub problem: String,
+    pub active: bool,
+    pub is_default: bool,
+    pub send_vocabulary: bool,
+}
+
+/// The read-only view of `config.json`.
 #[derive(Clone, Debug, Default)]
 pub struct ManagedSettings {
     pub managed_by_home_manager: bool,
+    /// The config default provider. The daemon may be using another one;
+    /// ask with [`Request::Providers`].
     pub provider: String,
+    /// The config default provider's model.
     pub model: String,
+    /// The config default provider's endpoint.
     pub endpoint: String,
     pub timeout_seconds: i64,
     pub max_duration_minutes: i64,
     pub paste_shortcut: String,
     pub notifications: String,
-    /// Whether the active provider receives the glossary.
+    /// Whether the config default provider receives the glossary.
     pub send_vocabulary: bool,
 }
 
@@ -145,6 +163,9 @@ pub struct Status {
     pub last_recording_generation: u64,
     pub audio_level_rms: f32,
     pub audio_level_peak: f32,
+    /// The provider the daemon will use next; empty from a daemon that
+    /// predates runtime switching.
+    pub provider: String,
 }
 
 #[derive(Clone, Debug)]
@@ -176,6 +197,12 @@ pub enum Request {
     Stats,
     Microphones,
     ReorderMicrophones(Vec<String>),
+    /// Answered with [`Reply::Microphones`].
+    RemoveMicrophone(String),
+    /// Answered with [`Reply::Providers`].
+    Providers,
+    /// Answered with [`Reply::Providers`].
+    SetProvider(String),
     Status,
     Toggle,
     Cancel,
@@ -188,6 +215,11 @@ pub enum Request {
     Glossary,
     AddGlossaryTerm(String),
     RemoveGlossaryTerm(String),
+    /// Answered with [`Reply::Glossary`].
+    RenameGlossaryTerm {
+        from: String,
+        to: String,
+    },
 }
 
 /// Replies cross an mpsc channel a few times per second, so the size spread
@@ -209,6 +241,8 @@ pub enum Reply {
     /// Kept apart from `Glossary` so the view clears its input only after a
     /// successful add.
     GlossaryAdded(Result<Glossary, String>),
+    /// Answers [`Request::Providers`] and [`Request::SetProvider`].
+    Providers(Result<Vec<ProviderInfo>, String>),
 }
 
 pub struct Backend {
@@ -222,14 +256,14 @@ impl Backend {
         let (request_tx, request_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         let managed_settings = read_managed_settings(demo);
-        let endpoint = managed_settings.endpoint.clone();
+        let default_endpoint = managed_settings.endpoint.clone();
         thread::Builder::new()
             .name("dictator-gui-backend".to_string())
             .spawn(move || {
                 if demo {
                     run_demo_worker(request_rx, reply_tx);
                 } else {
-                    run_live_worker(request_rx, reply_tx, endpoint);
+                    run_live_worker(request_rx, reply_tx, default_endpoint);
                 }
             })
             .expect("failed to start GUI backend worker");
@@ -253,7 +287,8 @@ impl Backend {
     }
 }
 
-fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, endpoint: String) {
+/// `default_endpoint` is probed by a connection check while the daemon is down.
+fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, default_endpoint: String) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -271,9 +306,9 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, endpoint
         let kind = live_request_kind(&request);
         reopen_database_for_request(&request, &mut db, &mut db_error, open_database);
         let reply = if let Some(db) = db.as_ref() {
-            handle_live(db, &runtime, &endpoint, request)
+            handle_live(db, &runtime, &default_endpoint, request)
         } else if kind == LiveRequestKind::Service {
-            handle_live_service(&runtime, &endpoint, request)
+            handle_live_service(&runtime, &default_endpoint, request)
         } else {
             failed_reply(request, &db_error)
         };
@@ -300,6 +335,10 @@ fn live_request_kind(request: &Request) -> LiveRequestKind {
         }
         Request::Microphones
         | Request::ReorderMicrophones(_)
+        | Request::RemoveMicrophone(_)
+        | Request::Providers
+        | Request::SetProvider(_)
+        | Request::RenameGlossaryTerm { .. }
         | Request::Status
         | Request::Toggle
         | Request::Cancel
@@ -360,16 +399,17 @@ fn failed_reply(request: Request, message: &str) -> Reply {
         }
         Request::Stats => Reply::Stats(Err(message.to_string())),
         Request::Recent { .. } => Reply::Recent(Err(message.to_string())),
-        Request::Microphones | Request::ReorderMicrophones(_) => {
+        Request::Microphones | Request::ReorderMicrophones(_) | Request::RemoveMicrophone(_) => {
             Reply::Microphones(Err(message.to_string()))
         }
+        Request::Providers | Request::SetProvider(_) => Reply::Providers(Err(message.to_string())),
         Request::Status => Reply::Status(Err(message.to_string())),
         Request::Toggle | Request::Cancel | Request::Retry(_) => {
             Reply::Action(Err(message.to_string()))
         }
         Request::Delete(_) => Reply::Deleted(Err(message.to_string())),
         Request::CheckConnection => Reply::Connection(Err(message.to_string())),
-        Request::Glossary | Request::RemoveGlossaryTerm(_) => {
+        Request::Glossary | Request::RemoveGlossaryTerm(_) | Request::RenameGlossaryTerm { .. } => {
             Reply::Glossary(Err(message.to_string()))
         }
         Request::AddGlossaryTerm(_) => Reply::GlossaryAdded(Err(message.to_string())),
@@ -379,7 +419,7 @@ fn failed_reply(request: Request, message: &str) -> Reply {
 fn handle_live(
     db: &Db,
     runtime: &tokio::runtime::Runtime,
-    endpoint: &str,
+    default_endpoint: &str,
     request: Request,
 ) -> Reply {
     match request {
@@ -472,7 +512,7 @@ fn handle_live(
                 })
                 .map_err(|error| error.to_string()),
         ),
-        request => handle_live_service(runtime, endpoint, request),
+        request => handle_live_service(runtime, default_endpoint, request),
     }
 }
 
@@ -529,9 +569,44 @@ fn short_request_error(error: &reqwest::Error) -> String {
     format!("{kind}: {source}")
 }
 
+/// The daemon's error, or a short note that it is not running.
+fn daemon_error(error: anyhow::Error) -> String {
+    let message = format!("{error:#}");
+    if message.starts_with("failed to connect to daemon") {
+        "The dictator daemon is not running".to_string()
+    } else {
+        message
+    }
+}
+
+/// The endpoint of the provider the daemon is using, or `default_endpoint`
+/// when the daemon cannot say.
+async fn active_endpoint(client: &Client, default_endpoint: &str) -> String {
+    client
+        .providers()
+        .await
+        .ok()
+        .and_then(|providers| providers.into_iter().find(|provider| provider.active))
+        .map(|provider| provider.endpoint)
+        .unwrap_or_else(|| default_endpoint.to_string())
+}
+
+fn map_provider(provider: crate::ipc::ProviderSummary) -> ProviderInfo {
+    ProviderInfo {
+        name: provider.name,
+        model: provider.model,
+        endpoint: provider.endpoint,
+        usable: provider.usable,
+        problem: provider.problem,
+        active: provider.active,
+        is_default: provider.is_default,
+        send_vocabulary: provider.send_vocabulary,
+    }
+}
+
 fn handle_live_service(
     runtime: &tokio::runtime::Runtime,
-    endpoint: &str,
+    default_endpoint: &str,
     request: Request,
 ) -> Reply {
     match request {
@@ -544,6 +619,23 @@ fn handle_live_service(
             crate::audio::reorder_microphones(&ids)
                 .map(|prefs| prefs.microphones.into_iter().map(map_microphone).collect())
                 .map_err(|error| error.to_string()),
+        ),
+        Request::RemoveMicrophone(id) => Reply::Microphones(
+            crate::audio::remove_microphone(&id)
+                .map(|prefs| prefs.microphones.into_iter().map(map_microphone).collect())
+                .map_err(|error| error.to_string()),
+        ),
+        Request::Providers => Reply::Providers(
+            runtime
+                .block_on(Client::new().providers())
+                .map(|providers| providers.into_iter().map(map_provider).collect())
+                .map_err(daemon_error),
+        ),
+        Request::SetProvider(name) => Reply::Providers(
+            runtime
+                .block_on(Client::new().use_provider(&name))
+                .map(|providers| providers.into_iter().map(map_provider).collect())
+                .map_err(daemon_error),
         ),
         Request::Status => Reply::Status(runtime.block_on(async {
             Client::new()
@@ -577,11 +669,16 @@ fn handle_live_service(
                 .and_then(parse_status)
                 .map(|_| ())
                 .map_err(|error| error.to_string());
-            let provider = probe_provider(endpoint).await;
+            let endpoint = if daemon.is_ok() {
+                active_endpoint(&Client::new(), default_endpoint).await
+            } else {
+                default_endpoint.to_string()
+            };
+            let provider = probe_provider(&endpoint).await;
             ConnectionReport {
                 daemon,
                 provider,
-                endpoint_host: endpoint_host(endpoint),
+                endpoint_host: endpoint_host(&endpoint),
                 checked_at: Utc::now(),
             }
         }))),
@@ -597,6 +694,11 @@ fn handle_live_service(
         ),
         Request::RemoveGlossaryTerm(term) => Reply::Glossary(
             crate::glossary::remove(&crate::glossary::glossary_path(), &term)
+                .map(|terms| Glossary::from_stored(Some(terms)))
+                .map_err(|error| format!("{error:#}")),
+        ),
+        Request::RenameGlossaryTerm { from, to } => Reply::Glossary(
+            crate::glossary::rename(&crate::glossary::glossary_path(), &from, &to)
                 .map(|terms| Glossary::from_stored(Some(terms)))
                 .map_err(|error| format!("{error:#}")),
         ),
@@ -675,6 +777,11 @@ fn parse_status(response: crate::ipc::Response) -> anyhow::Result<Status> {
             .data
             .get(crate::ipc::DATA_KEY_AUDIO_LEVEL_PEAK)
             .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+        provider: response
+            .data
+            .get(crate::ipc::DATA_KEY_PROVIDER)
+            .cloned()
             .unwrap_or_default(),
     })
 }
@@ -805,7 +912,7 @@ fn read_managed_settings(demo: bool) -> ManagedSettings {
     if demo {
         return ManagedSettings {
             managed_by_home_manager: true,
-            provider: "Siren".to_string(),
+            provider: "siren".to_string(),
             model: "whisper-large-v3-turbo".to_string(),
             endpoint: "https://siren.example.test/v1/audio/transcriptions".to_string(),
             timeout_seconds: 60,
@@ -930,32 +1037,9 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
         .iter()
         .map(|recording| (recording.id, demo_initial_revisions(recording)))
         .collect();
-    let mut microphones = vec![
-        Microphone {
-            id: "usb".to_string(),
-            name: "USB microphone".to_string(),
-            connected: true,
-            is_default: false,
-            bluetooth: false,
-        },
-        Microphone {
-            id: "headset".to_string(),
-            name: "Bluetooth headset".to_string(),
-            connected: true,
-            is_default: false,
-            bluetooth: true,
-        },
-        Microphone {
-            id: "builtin".to_string(),
-            name: "Built-in microphone".to_string(),
-            connected: true,
-            is_default: true,
-            bluetooth: false,
-        },
-    ];
-    let mut glossary: Vec<String> = ["Claude", "tmux", "Sietch", "home-manager"]
-        .map(str::to_string)
-        .to_vec();
+    let mut microphones = demo_microphones();
+    let mut providers = demo_providers();
+    let mut glossary: Vec<String> = DEMO_GLOSSARY.map(str::to_string).to_vec();
     let mut status = Status {
         state: DaemonState::Idle,
         duration_ms: 0,
@@ -966,6 +1050,7 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
         last_recording_generation: 0,
         audio_level_rms: 0.0,
         audio_level_peak: 0.0,
+        provider: "siren".to_string(),
     };
     while let Ok(request) = requests.recv() {
         let reply = match request {
@@ -1090,6 +1175,30 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
                 });
                 Reply::Microphones(Ok(microphones.clone()))
             }
+            Request::RemoveMicrophone(id) => Reply::Microphones(
+                match microphones
+                    .iter()
+                    .position(|microphone| microphone.id == id)
+                {
+                    Some(index) if microphones[index].connected => Err(format!(
+                        "\"{}\" is connected; disconnect it before removing it, or it is added back on the next discovery",
+                        microphones[index].name
+                    )),
+                    Some(index) => {
+                        microphones.remove(index);
+                        Ok(microphones.clone())
+                    }
+                    None => Err(format!("no saved microphone has the id {id:?}")),
+                },
+            ),
+            Request::Providers => Reply::Providers(Ok(providers.clone())),
+            Request::SetProvider(name) => {
+                let result = demo_set_provider(&mut providers, &name);
+                if let Some(active) = providers.iter().find(|provider| provider.active) {
+                    status.provider.clone_from(&active.name);
+                }
+                Reply::Providers(result)
+            }
             Request::Status => Reply::Status(Ok(status.clone())),
             Request::Toggle => {
                 status.state = if status.state == DaemonState::Recording {
@@ -1124,7 +1233,11 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
             Request::CheckConnection => Reply::Connection(Ok(ConnectionReport {
                 daemon: Ok(()),
                 provider: Ok("HTTP 405 in 84 ms".to_string()),
-                endpoint_host: "siren.example.test".to_string(),
+                endpoint_host: providers
+                    .iter()
+                    .find(|provider| provider.active)
+                    .map(|provider| endpoint_host(&provider.endpoint))
+                    .unwrap_or_default(),
                 checked_at: Utc::now(),
             })),
             Request::Glossary => Reply::Glossary(Ok(Glossary::from_stored(Some(glossary.clone())))),
@@ -1136,11 +1249,166 @@ fn run_demo_worker(requests: Receiver<Request>, replies: Sender<Reply>) {
                 crate::glossary::delete_term(&mut glossary, &term)
                     .map(|()| Glossary::from_stored(Some(glossary.clone()))),
             ),
+            Request::RenameGlossaryTerm { from, to } => Reply::Glossary(
+                crate::glossary::replace_term(&mut glossary, &from, &to)
+                    .map(|()| Glossary::from_stored(Some(glossary.clone()))),
+            ),
         };
         if replies.send(reply).is_err() {
             break;
         }
     }
+}
+
+const DEMO_GLOSSARY: [&str; 30] = [
+    "Claude",
+    "tmux",
+    "Sietch",
+    "home-manager",
+    "NixOS",
+    "PipeWire",
+    "Wayland",
+    "niri",
+    "Tailscale",
+    "Kubernetes",
+    "PostgreSQL",
+    "SQLite",
+    "rustfmt",
+    "clippy",
+    "tokio",
+    "serde",
+    "GPUI",
+    "Zellij",
+    "Neovim",
+    "ripgrep",
+    "Grafana",
+    "Prometheus",
+    "OAuth",
+    "WebSocket",
+    "GraphQL",
+    "TypeScript",
+    "Vite",
+    "pnpm",
+    "Hyprland",
+    "Whisper",
+];
+
+fn demo_microphones() -> Vec<Microphone> {
+    let microphone = |id: &str, name: &str, connected, is_default, bluetooth| Microphone {
+        id: id.to_string(),
+        name: name.to_string(),
+        connected,
+        is_default,
+        bluetooth,
+    };
+    vec![
+        microphone(
+            "usb:046d:0825:046d_C270_HD_WEBCAM_4F2C0660",
+            "Webcam C270 Mono",
+            true,
+            false,
+            false,
+        ),
+        microphone(
+            "bus:pci-0000:c1:00.6",
+            "Ryzen HD Audio Controller Analog Stereo",
+            true,
+            true,
+            false,
+        ),
+        microphone(
+            "bluetooth:88:C9:E8:16:C7:9C",
+            "WH-1000XM4",
+            true,
+            false,
+            true,
+        ),
+        microphone("usb:0d8c:0014", "BY-GM18CU Mono", false, false, false),
+        microphone(
+            "usb:b58e:9e84:REV8-2024",
+            "Yeti Stereo Microphone",
+            false,
+            false,
+            false,
+        ),
+        microphone(
+            "bluetooth:F4:65:A6:0B:21:9E",
+            "AirPods Pro",
+            false,
+            false,
+            true,
+        ),
+        microphone(
+            "bus:pci-0000:c3:00.4-usb-0:1.2:1.0",
+            "USB Audio Device Mono",
+            false,
+            false,
+            false,
+        ),
+    ]
+}
+
+fn demo_providers() -> Vec<ProviderInfo> {
+    vec![
+        ProviderInfo {
+            name: "groq".to_string(),
+            model: "whisper-large-v3".to_string(),
+            endpoint: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            usable: false,
+            problem: "GROQ_API_KEY is not set in the daemon's environment".to_string(),
+            active: false,
+            is_default: false,
+            send_vocabulary: false,
+        },
+        ProviderInfo {
+            name: "openai".to_string(),
+            model: "gpt-4o-transcribe".to_string(),
+            endpoint: "https://api.openai.com/v1/audio/transcriptions".to_string(),
+            usable: true,
+            problem: String::new(),
+            active: false,
+            is_default: false,
+            send_vocabulary: false,
+        },
+        ProviderInfo {
+            name: "siren".to_string(),
+            model: "whisper-large-v3-turbo".to_string(),
+            endpoint: "https://siren.example.test/v1/audio/transcriptions".to_string(),
+            usable: true,
+            problem: String::new(),
+            active: true,
+            is_default: true,
+            send_vocabulary: true,
+        },
+    ]
+}
+
+/// Mirrors the daemon's checks and messages.
+fn demo_set_provider(
+    providers: &mut [ProviderInfo],
+    name: &str,
+) -> Result<Vec<ProviderInfo>, String> {
+    let name = name.trim();
+    let Some(selected) = providers.iter().find(|provider| provider.name == name) else {
+        let known: Vec<&str> = providers
+            .iter()
+            .map(|provider| provider.name.as_str())
+            .collect();
+        return Err(format!(
+            "unknown provider '{name}'; configured providers: {}",
+            known.join(", ")
+        ));
+    };
+    if !selected.usable {
+        return Err(format!(
+            "provider '{name}' cannot be used: {}",
+            selected.problem
+        ));
+    }
+    for provider in providers.iter_mut() {
+        provider.active = provider.name == name;
+    }
+    Ok(providers.to_vec())
 }
 
 fn demo_recordings() -> Vec<Recording> {
@@ -1561,6 +1829,260 @@ mod tests {
             panic!("expected the glossary");
         };
         assert_eq!(removed, initial);
+
+        drop(request_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn new_requests_route_to_services_and_fail_in_kind() {
+        let requests = || {
+            [
+                Request::Providers,
+                Request::SetProvider("openai".into()),
+                Request::RemoveMicrophone("usb:1".into()),
+                Request::RenameGlossaryTerm {
+                    from: "a".into(),
+                    to: "b".into(),
+                },
+            ]
+        };
+        for request in requests() {
+            assert_eq!(live_request_kind(&request), LiveRequestKind::Service);
+        }
+        let replies: Vec<_> = requests()
+            .into_iter()
+            .map(|request| failed_reply(request, "down"))
+            .collect();
+        assert!(matches!(&replies[0], Reply::Providers(Err(error)) if error == "down"));
+        assert!(matches!(&replies[1], Reply::Providers(Err(error)) if error == "down"));
+        assert!(matches!(&replies[2], Reply::Microphones(Err(error)) if error == "down"));
+        assert!(matches!(&replies[3], Reply::Glossary(Err(error)) if error == "down"));
+    }
+
+    #[test]
+    fn daemon_errors_are_short_when_the_daemon_is_down() {
+        assert_eq!(
+            daemon_error(anyhow::anyhow!(
+                "failed to connect to daemon: No such file or directory (os error 2)"
+            )),
+            "The dictator daemon is not running"
+        );
+        assert_eq!(
+            daemon_error(anyhow::anyhow!("unknown provider 'x'")),
+            "unknown provider 'x'"
+        );
+    }
+
+    struct ProviderHandler;
+
+    impl crate::ipc::CommandHandler for ProviderHandler {
+        fn handle_start(&self, _received_at: Instant) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn handle_stop(&self, _received_at: Instant) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn handle_toggle(&self, _received_at: Instant) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn handle_cancel(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn get_status(&self) -> crate::ipc::StatusData {
+            crate::ipc::StatusData {
+                state: DaemonState::Idle,
+                recording_duration: None,
+                last_error: None,
+                uptime: std::time::Duration::ZERO,
+            }
+        }
+        fn list_providers(&self) -> anyhow::Result<Vec<crate::ipc::ProviderSummary>> {
+            Ok(vec![crate::ipc::ProviderSummary {
+                name: "openai".into(),
+                model: "gpt-4o-transcribe".into(),
+                endpoint: "https://api.openai.com/v1/audio/transcriptions".into(),
+                usable: true,
+                problem: String::new(),
+                active: true,
+                is_default: false,
+                send_vocabulary: false,
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn connection_check_probes_the_daemons_active_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("dictator.sock");
+        let default = "https://siren.example.test/v1";
+
+        let missing = Client::with_path(dir.path().join("missing.sock"));
+        assert_eq!(active_endpoint(&missing, default).await, default);
+
+        let server =
+            crate::ipc::Server::with_path(std::sync::Arc::new(ProviderHandler), socket.clone());
+        server.start().await.unwrap();
+        let endpoint = active_endpoint(&Client::with_path(socket), default).await;
+        server.stop().await.unwrap();
+        assert_eq!(endpoint, "https://api.openai.com/v1/audio/transcriptions");
+        assert_eq!(endpoint_host(&endpoint), "api.openai.com");
+    }
+
+    #[test]
+    fn demo_providers_switch_and_reject_unusable_ones() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+        let active = |providers: &[ProviderInfo]| {
+            providers
+                .iter()
+                .filter(|provider| provider.active)
+                .map(|provider| provider.name.clone())
+                .collect::<Vec<_>>()
+        };
+
+        request_tx.send(Request::Providers).unwrap();
+        let Reply::Providers(Ok(initial)) = reply_rx.recv().unwrap() else {
+            panic!("expected providers");
+        };
+        let siren = initial.iter().find(|p| p.name == "siren").unwrap();
+        assert!(siren.is_default && siren.active && siren.usable && siren.send_vocabulary);
+        assert!(initial.iter().any(|p| p.name == "openai" && p.usable));
+        assert!(
+            initial
+                .iter()
+                .any(|p| !p.usable && !p.problem.is_empty() && p.problem.contains("not set"))
+        );
+
+        request_tx
+            .send(Request::SetProvider("openai".into()))
+            .unwrap();
+        let Reply::Providers(Ok(switched)) = reply_rx.recv().unwrap() else {
+            panic!("expected providers");
+        };
+        assert_eq!(active(&switched), ["openai"]);
+
+        request_tx.send(Request::CheckConnection).unwrap();
+        let Reply::Connection(Ok(report)) = reply_rx.recv().unwrap() else {
+            panic!("expected a connection report");
+        };
+        assert_eq!(report.endpoint_host, "api.openai.com");
+
+        for (name, expected) in [
+            (
+                "groq",
+                "provider 'groq' cannot be used: GROQ_API_KEY is not set in the daemon's environment",
+            ),
+            (
+                "nope",
+                "unknown provider 'nope'; configured providers: groq, openai, siren",
+            ),
+        ] {
+            request_tx.send(Request::SetProvider(name.into())).unwrap();
+            let Reply::Providers(Err(error)) = reply_rx.recv().unwrap() else {
+                panic!("expected an error for {name}");
+            };
+            assert_eq!(error, expected);
+        }
+        request_tx.send(Request::Providers).unwrap();
+        let Reply::Providers(Ok(after)) = reply_rx.recv().unwrap() else {
+            panic!("expected providers");
+        };
+        assert_eq!(
+            active(&after),
+            ["openai"],
+            "a rejected switch changes nothing"
+        );
+
+        drop(request_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn demo_microphones_fill_a_list_and_remove_only_disconnected_ones() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+
+        request_tx.send(Request::Microphones).unwrap();
+        let Reply::Microphones(Ok(initial)) = reply_rx.recv().unwrap() else {
+            panic!("expected microphones");
+        };
+        assert!(initial.len() >= 5);
+        assert!(initial.iter().any(|m| m.connected && !m.bluetooth));
+        assert!(initial.iter().any(|m| !m.connected));
+        assert!(initial.iter().any(|m| m.is_default));
+        assert!(initial.iter().any(|m| m.bluetooth));
+
+        let disconnected = initial.iter().find(|m| !m.connected).unwrap().clone();
+        request_tx
+            .send(Request::RemoveMicrophone(disconnected.id.clone()))
+            .unwrap();
+        let Reply::Microphones(Ok(removed)) = reply_rx.recv().unwrap() else {
+            panic!("expected microphones");
+        };
+        assert_eq!(removed.len(), initial.len() - 1);
+        assert!(removed.iter().all(|m| m.id != disconnected.id));
+
+        let connected = initial.iter().find(|m| m.connected).unwrap().clone();
+        request_tx
+            .send(Request::RemoveMicrophone(connected.id.clone()))
+            .unwrap();
+        let Reply::Microphones(Err(error)) = reply_rx.recv().unwrap() else {
+            panic!("expected an error");
+        };
+        assert!(error.contains("is connected"), "{error}");
+        request_tx
+            .send(Request::RemoveMicrophone(disconnected.id))
+            .unwrap();
+        assert!(matches!(
+            reply_rx.recv().unwrap(),
+            Reply::Microphones(Err(_))
+        ));
+
+        drop(request_tx);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn demo_glossary_renames_with_the_real_rules() {
+        let (request_tx, request_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let worker = thread::spawn(move || run_demo_worker(request_rx, reply_tx));
+
+        request_tx.send(Request::Glossary).unwrap();
+        let Reply::Glossary(Ok(initial)) = reply_rx.recv().unwrap() else {
+            panic!("expected the glossary");
+        };
+        assert_eq!(initial.terms.len(), 30);
+        assert_eq!(
+            crate::glossary::sanitize(&initial.terms).1,
+            Vec::<String>::new()
+        );
+
+        request_tx
+            .send(Request::RenameGlossaryTerm {
+                from: "tmux".into(),
+                to: " Tmux ".into(),
+            })
+            .unwrap();
+        let Reply::Glossary(Ok(renamed)) = reply_rx.recv().unwrap() else {
+            panic!("expected the glossary");
+        };
+        assert_eq!(renamed.terms[1], "Tmux");
+        assert_eq!(renamed.terms.len(), initial.terms.len());
+
+        request_tx
+            .send(Request::RenameGlossaryTerm {
+                from: "Tmux".into(),
+                to: "claude".into(),
+            })
+            .unwrap();
+        let Reply::Glossary(Err(error)) = reply_rx.recv().unwrap() else {
+            panic!("expected a duplicate error");
+        };
+        assert_eq!(error, "\"claude\" is already in the glossary");
 
         drop(request_tx);
         worker.join().unwrap();

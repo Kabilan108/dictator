@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::utils::{CONFIG_DIR, bounded_output};
 
 const PREFERENCES_VERSION: u32 = 1;
+const USB_ID_PREFIX: &str = "usb:";
 const PREFERENCES_FILE: &str = "preferences.json";
 const PACTL_TIMEOUT: Duration = Duration::from_secs(2);
 const PACTL_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
@@ -56,6 +57,16 @@ pub fn reorder_microphones(ordered_ids: &[String]) -> Result<MicrophonePreferenc
     DeviceManager::system().reorder(ordered_ids, &discovery)
 }
 
+/// Removes a disconnected microphone from the priority list.
+///
+/// A connected microphone cannot be removed, because the next discovery
+/// would add it back at the end of the list.
+pub fn remove_microphone(id: &str) -> Result<MicrophonePreferences> {
+    let discovery = discover_microphones()?;
+    let _guard = PREFERENCES_LOCK.lock().unwrap();
+    DeviceManager::system().remove(id, &discovery)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedMicrophone {
     pub id: String,
@@ -68,8 +79,10 @@ pub(crate) struct ResolvedMicrophone {
 pub(crate) struct Resolution {
     pub microphone: ResolvedMicrophone,
     /// Taken under the preferences lock after any write the resolution made
-    /// (seeding the file, appending a new device), so that write does not
-    /// look like a later priority change.
+    /// (seeding the file, appending a new device, moving saved USB entries to
+    /// port-independent ids), so that write does not look like a later
+    /// priority change. Each of those writes happens once: resolving again
+    /// with the same devices leaves the file untouched.
     pub fingerprint: Option<Fingerprint>,
 }
 
@@ -134,7 +147,8 @@ impl DeviceManager {
 
     fn preferences(&self, discovery: &Discovery) -> Result<MicrophonePreferences> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let (saved, changed) = self.load_and_reconcile(discovery)?;
+        let (saved, discovery, changed) = self.load_and_reconcile(discovery)?;
+        let discovery = &discovery;
         if changed {
             write_preferences(&self.preferences_path, &saved)?;
         }
@@ -147,7 +161,8 @@ impl DeviceManager {
         discovery: &Discovery,
     ) -> Result<MicrophonePreferences> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let (mut saved, reconciled) = self.load_and_reconcile(discovery)?;
+        let (mut saved, discovery, reconciled) = self.load_and_reconcile(discovery)?;
+        let discovery = &discovery;
         validate_reorder(&saved.microphones, ordered_ids)?;
         let order_changed = saved
             .microphones
@@ -170,9 +185,36 @@ impl DeviceManager {
         Ok(view_preferences(&saved, discovery))
     }
 
+    fn remove(&self, id: &str, discovery: &Discovery) -> Result<MicrophonePreferences> {
+        let _file_lock = lock_preferences(&self.preferences_path)?;
+        let (mut saved, discovery, _) = self.load_and_reconcile(discovery)?;
+        let discovery = &discovery;
+        if let Some(connected) = discovery
+            .microphones
+            .iter()
+            .find(|microphone| microphone.id == id)
+        {
+            bail!(
+                "\"{}\" is connected; disconnect it before removing it, or it is added back on the next discovery",
+                connected.name
+            );
+        }
+        let Some(index) = saved
+            .microphones
+            .iter()
+            .position(|microphone| microphone.id == id)
+        else {
+            bail!("no saved microphone has the id {id:?}");
+        };
+        saved.microphones.remove(index);
+        write_preferences(&self.preferences_path, &saved)?;
+        Ok(view_preferences(&saved, discovery))
+    }
+
     fn resolve(&self, discovery: &Discovery) -> Result<Resolution> {
         let _file_lock = lock_preferences(&self.preferences_path)?;
-        let (saved, changed) = self.load_and_reconcile(discovery)?;
+        let (saved, discovery, changed) = self.load_and_reconcile(discovery)?;
+        let discovery = &discovery;
         if changed {
             write_preferences(&self.preferences_path, &saved)?;
         }
@@ -195,12 +237,18 @@ impl DeviceManager {
         })
     }
 
-    fn load_and_reconcile(&self, discovery: &Discovery) -> Result<(SavedPreferences, bool)> {
+    /// Returns the saved list, the discovery aligned to the ids it was saved
+    /// under, and whether the list needs writing.
+    fn load_and_reconcile(
+        &self,
+        discovery: &Discovery,
+    ) -> Result<(SavedPreferences, Discovery, bool)> {
         let loaded = read_preferences(&self.preferences_path)?;
         let missing = loaded.is_none();
         let mut saved = loaded.unwrap_or_default();
-        let changed = reconcile(&mut saved, discovery);
-        Ok((saved, missing || changed))
+        let discovery = keep_saved_discriminators(discovery, &saved);
+        let changed = reconcile(&mut saved, &discovery);
+        Ok((saved, discovery, missing || changed))
     }
 }
 
@@ -268,6 +316,8 @@ struct DiscoveredMicrophone {
     name: String,
     source_name: String,
     bluetooth: bool,
+    /// The port-dependent `bus:` id older versions saved for this USB device.
+    legacy_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -336,8 +386,7 @@ fn discover_microphones_with(
 fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Result<Discovery> {
     let values: Vec<Value> =
         serde_json::from_slice(data).context("failed to parse pactl microphone data")?;
-    let mut by_id: HashMap<String, DiscoveredMicrophone> = HashMap::new();
-    let mut order = Vec::new();
+    let mut found: Vec<(DiscoveredMicrophone, String)> = Vec::new();
 
     for source in values {
         let Some(source_name) = source.get("name").and_then(Value::as_str) else {
@@ -360,6 +409,19 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
 
         let id = stable_device_id(properties, source_name);
         let bluetooth = is_bluetooth(properties, source_name);
+        let property = |key: &str| {
+            properties
+                .and_then(|values| values.get(key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+        };
+        let legacy_id = property("device.bus_path")
+            .filter(|_| id.starts_with(USB_ID_PREFIX))
+            .map(|path| format!("bus:{path}"));
+        let card = property("device.bus_path")
+            .or_else(|| property("device.name"))
+            .unwrap_or(source_name)
+            .to_owned();
         let name = source
             .get("description")
             .and_then(Value::as_str)
@@ -372,13 +434,23 @@ fn discovery_from_pactl_json(data: &[u8], default_source: Option<String>) -> Res
             .unwrap_or(source_name)
             .to_owned();
         let microphone = DiscoveredMicrophone {
-            id: id.clone(),
+            id,
             name,
             source_name: source_name.to_owned(),
             bluetooth,
+            legacy_id,
         };
+        found.push((microphone, card));
+    }
+    disambiguate_identical_usb_devices(&mut found);
+
+    let mut by_id: HashMap<String, DiscoveredMicrophone> = HashMap::new();
+    let mut order = Vec::new();
+    for (microphone, _) in found {
+        let id = microphone.id.clone();
+        let is_default = default_source.as_deref() == Some(microphone.source_name.as_str());
         match by_id.get_mut(&id) {
-            Some(existing) if default_source.as_deref() == Some(source_name) => {
+            Some(existing) if is_default => {
                 *existing = microphone;
             }
             Some(_) => {}
@@ -513,6 +585,9 @@ fn stable_device_id(
     {
         return format!("bluetooth:{address}");
     }
+    if let Some(id) = usb_device_id(&property) {
+        return id;
+    }
     if let Some(path) = property("device.bus_path") {
         return format!("bus:{path}");
     }
@@ -522,13 +597,181 @@ fn stable_device_id(
     format!("source:{source_name}")
 }
 
+/// Identifies a USB device by what it reports about itself rather than the
+/// port it is plugged into: vendor and product id, plus the serial when the
+/// device has one. `None` when it reports neither ids nor a serial.
+fn usb_device_id<'a>(property: &impl Fn(&str) -> Option<&'a str>) -> Option<String> {
+    if property("device.bus") != Some("usb") {
+        return None;
+    }
+    let hex = |key: &str| {
+        property(key).map(|value| value.trim().trim_start_matches("0x").to_ascii_lowercase())
+    };
+    match (
+        hex("device.vendor.id"),
+        hex("device.product.id"),
+        property("device.serial"),
+    ) {
+        (Some(vendor), Some(product), Some(serial)) => {
+            Some(format!("{USB_ID_PREFIX}{vendor}:{product}:{serial}"))
+        }
+        (Some(vendor), Some(product), None) => Some(format!("{USB_ID_PREFIX}{vendor}:{product}")),
+        (_, _, Some(serial)) => Some(format!("{USB_ID_PREFIX}serial:{serial}")),
+        _ => None,
+    }
+}
+
+/// Two identical devices plugged in at once report the same USB identity.
+/// The card at the lowest bus path keeps the plain id; each other card gets
+/// its bus path appended, so neither is dropped. Sources of one card (its
+/// profiles) share a bus path and stay merged.
+fn disambiguate_identical_usb_devices(found: &mut [(DiscoveredMicrophone, String)]) {
+    let mut cards: HashMap<String, std::collections::BTreeSet<String>> = HashMap::new();
+    for (microphone, card) in found.iter() {
+        if microphone.id.starts_with(USB_ID_PREFIX) {
+            cards
+                .entry(microphone.id.clone())
+                .or_default()
+                .insert(card.clone());
+        }
+    }
+    for (microphone, card) in found.iter_mut() {
+        let Some(group) = cards.get(&microphone.id) else {
+            continue;
+        };
+        if group.len() > 1 && group.first() != Some(card) {
+            microphone.id = format!("{}@{card}", microphone.id);
+        }
+    }
+}
+
+/// When one of two identical devices is unplugged, the one left would take
+/// the plain id and lose the rank saved under its `@<bus path>` id. A lone
+/// device at a port with such a saved entry keeps that id instead.
+fn keep_saved_discriminators(discovery: &Discovery, saved: &SavedPreferences) -> Discovery {
+    let mut aligned = discovery.clone();
+    let connected: HashSet<&str> = discovery
+        .microphones
+        .iter()
+        .map(|microphone| microphone.id.as_str())
+        .collect();
+    for microphone in &mut aligned.microphones {
+        let Some(path) = microphone
+            .legacy_id
+            .as_deref()
+            .and_then(|legacy| legacy.strip_prefix("bus:"))
+        else {
+            continue;
+        };
+        if microphone.id.contains('@') {
+            continue;
+        }
+        let discriminated = format!("{}@{path}", microphone.id);
+        if !connected.contains(discriminated.as_str())
+            && saved
+                .microphones
+                .iter()
+                .any(|entry| entry.id == discriminated)
+        {
+            microphone.id = discriminated;
+        }
+    }
+    aligned
+}
+
+/// A `bus:` id for a USB port, as saved before USB devices had port-independent ids.
+fn is_legacy_usb_id(id: &str) -> bool {
+    id.starts_with("bus:") && id.contains("-usb-")
+}
+
+/// Moves saved rankings from port-based USB ids to the current ids.
+///
+/// A connected USB device with no saved entry adopts the entry saved under its
+/// own old bus path, or else the highest-ranked old USB entry with its name.
+/// Old USB entries sharing a name with each other or with a device adopted
+/// here are taken to be one device seen at several ports: they collapse into
+/// the highest-ranked of them. A port id cannot tell that case from two
+/// units of one model, so a second unit loses its old rank and is appended
+/// when it is next connected. Running it again changes nothing.
+fn migrate_usb_ids(saved: &mut SavedPreferences, discovery: &Discovery) -> bool {
+    let current: HashSet<&str> = discovery
+        .microphones
+        .iter()
+        .map(|microphone| microphone.id.as_str())
+        .collect();
+    let stale_legacy = |entry: &SavedMicrophone| {
+        is_legacy_usb_id(&entry.id) && !current.contains(entry.id.as_str())
+    };
+    let mut adopted: HashSet<String> = HashSet::new();
+    for device in &discovery.microphones {
+        let Some(legacy_id) = device.legacy_id.as_deref() else {
+            continue;
+        };
+        if saved.microphones.iter().any(|entry| entry.id == device.id) {
+            continue;
+        }
+        let index = saved
+            .microphones
+            .iter()
+            .position(|entry| entry.id == legacy_id && stale_legacy(entry))
+            .or_else(|| {
+                saved
+                    .microphones
+                    .iter()
+                    .position(|entry| entry.name == device.name && stale_legacy(entry))
+            });
+        if let Some(index) = index {
+            let entry = &mut saved.microphones[index];
+            entry.id.clone_from(&device.id);
+            entry.name.clone_from(&device.name);
+            adopted.insert(device.id.clone());
+        }
+    }
+
+    struct Group {
+        slot: usize,
+        has_adopted: bool,
+    }
+    let before = saved.microphones.len();
+    let mut groups: HashMap<String, Group> = HashMap::new();
+    let mut kept: Vec<SavedMicrophone> = Vec::with_capacity(before);
+    for entry in saved.microphones.drain(..) {
+        let is_adopted = adopted.contains(&entry.id);
+        if !is_adopted && !stale_legacy(&entry) {
+            kept.push(entry);
+            continue;
+        }
+        match groups.get_mut(&entry.name) {
+            Some(group) if !(is_adopted && group.has_adopted) => {
+                if is_adopted {
+                    kept[group.slot].id = entry.id;
+                    group.has_adopted = true;
+                }
+            }
+            Some(_) => kept.push(entry),
+            None => {
+                groups.insert(
+                    entry.name.clone(),
+                    Group {
+                        slot: kept.len(),
+                        has_adopted: is_adopted,
+                    },
+                );
+                kept.push(entry);
+            }
+        }
+    }
+    saved.microphones = kept;
+    !adopted.is_empty() || saved.microphones.len() != before
+}
+
 fn reconcile(saved: &mut SavedPreferences, discovery: &Discovery) -> bool {
     let discovered: HashMap<_, _> = discovery
         .microphones
         .iter()
         .map(|microphone| (microphone.id.as_str(), microphone))
         .collect();
-    let mut changed = false;
+    let mut changed = migrate_usb_ids(saved, discovery);
     for microphone in &mut saved.microphones {
         if let Some(current) = discovered.get(microphone.id.as_str())
             && microphone.name != current.name
@@ -1143,6 +1386,395 @@ mod tests {
                 .mode()
                 & 0o777,
             0o600
+        );
+    }
+
+    /// The user's saved list after one webcam and one microphone were each
+    /// plugged into three different USB ports.
+    const LEGACY_PREFERENCES: &str = r#"{
+      "version": 1,
+      "microphones": [
+        {"id": "bus:pci-0000:c3:00.3-usb-0:1.3.1:1.2", "name": "Webcam C270 Mono"},
+        {"id": "bus:pci-0000:c3:00.4-usb-0:1.4:1.0", "name": "BY-GM18CU Mono"},
+        {"id": "bus:pci-0000:c3:00.4-usb-0:1.3.2:1.2", "name": "Webcam C270 Mono"},
+        {"id": "bus:pci-0000:c1:00.3-usb-0:2:1.0", "name": "BY-GM18CU Mono"},
+        {"id": "bus:pci-0000:c3:00.3-usb-0:1.4:1.0", "name": "BY-GM18CU Mono"},
+        {"id": "bus:pci-0000:c1:00.6", "name": "Ryzen HD Audio Controller Analog Stereo"},
+        {"id": "bluetooth:88:C9:E8:16:C7:9C", "name": "WH-1000XM4"},
+        {"id": "bus:pci-0000:c3:00.3-usb-0:1.3.2:1.2", "name": "Webcam C270 Mono"}
+      ]
+    }"#;
+
+    const C270_ID: &str = "usb:046d:0825:046d_C270_HD_WEBCAM_4F2C0660";
+
+    fn ryzen_source() -> Value {
+        serde_json::json!({
+            "name": "alsa_input.pci-0000_c1_00.6.analog-stereo",
+            "description": "Ryzen HD Audio Controller Analog Stereo",
+            "monitor_source": "",
+            "properties": {
+                "device.bus": "pci",
+                "device.bus_path": "pci-0000:c1:00.6",
+                "device.vendor.id": "0x1022",
+                "device.product.id": "0x15e3",
+                "device.name": "alsa_card.pci-0000_c1_00.6"
+            }
+        })
+    }
+
+    fn c270_source(bus_path: &str, serial: Option<&str>) -> Value {
+        let mut properties = serde_json::json!({
+            "device.bus": "usb",
+            "device.bus_path": bus_path,
+            "device.vendor.id": "0x046d",
+            "device.product.id": "0x0825",
+            "device.name": "alsa_card.usb-046d_C270_HD_WEBCAM_4F2C0660-02"
+        });
+        if let Some(serial) = serial {
+            properties["device.serial"] = serial.into();
+        }
+        serde_json::json!({
+            "name": format!("alsa_input.usb-046d_C270-{bus_path}.mono-fallback"),
+            "description": "Webcam C270 Mono",
+            "monitor_source": "",
+            "properties": properties
+        })
+    }
+
+    fn by_source(bus_path: &str) -> Value {
+        serde_json::json!({
+            "name": "alsa_input.usb-BY-GM18CU.mono-fallback",
+            "description": "BY-GM18CU Mono",
+            "monitor_source": "",
+            "properties": {
+                "device.bus": "usb",
+                "device.bus_path": bus_path,
+                "device.vendor.id": "0x0d8c",
+                "device.product.id": "0x0014",
+                "device.name": "alsa_card.usb-BY-GM18CU-00"
+            }
+        })
+    }
+
+    fn discovery_of(sources: &[Value]) -> Discovery {
+        discovery_from_pactl_json(&serde_json::to_vec(sources).unwrap(), None).unwrap()
+    }
+
+    fn saved_entries(saved: &SavedPreferences) -> Vec<(&str, &str)> {
+        saved
+            .microphones
+            .iter()
+            .map(|microphone| (microphone.id.as_str(), microphone.name.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn usb_devices_get_port_independent_ids() {
+        let id = |properties: serde_json::Value| {
+            let properties =
+                serde_json::from_value::<serde_json::Map<String, Value>>(properties).unwrap();
+            stable_device_id(Some(&properties), "alsa_input.source")
+        };
+        let cases = [
+            (
+                "vendor, product and serial",
+                serde_json::json!({
+                    "device.bus": "usb",
+                    "device.bus_path": "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+                    "device.serial": "046d_C270_HD_WEBCAM_4F2C0660",
+                    "device.vendor.id": "0x046d",
+                    "device.product.id": "0x0825",
+                    "device.name": "alsa_card.usb-046d_C270_HD_WEBCAM_4F2C0660-02"
+                }),
+                C270_ID,
+            ),
+            (
+                "no serial",
+                serde_json::json!({
+                    "device.bus": "usb",
+                    "device.bus_path": "pci-0000:c3:00.4-usb-0:1.4:1.0",
+                    "device.vendor.id": "0x0D8C",
+                    "device.product.id": "0x0014"
+                }),
+                "usb:0d8c:0014",
+            ),
+            (
+                "serial only",
+                serde_json::json!({
+                    "device.bus": "usb",
+                    "device.bus_path": "pci-0000:c3:00.4-usb-0:1.4:1.0",
+                    "device.serial": "ABC123"
+                }),
+                "usb:serial:ABC123",
+            ),
+            (
+                "usb without identity keeps the bus path",
+                serde_json::json!({
+                    "device.bus": "usb",
+                    "device.bus_path": "pci-0000:c3:00.4-usb-0:1.4:1.0",
+                    "device.vendor.id": "0x0d8c"
+                }),
+                "bus:pci-0000:c3:00.4-usb-0:1.4:1.0",
+            ),
+            (
+                "pci keeps the bus path",
+                serde_json::json!({
+                    "device.bus": "pci",
+                    "device.bus_path": "pci-0000:c1:00.6",
+                    "device.vendor.id": "0x1022",
+                    "device.product.id": "0x15e3"
+                }),
+                "bus:pci-0000:c1:00.6",
+            ),
+            (
+                "bluetooth is unchanged",
+                serde_json::json!({
+                    "device.bus": "bluetooth",
+                    "device.string": "88:C9:E8:16:C7:9C",
+                    "device.vendor.id": "0x054c"
+                }),
+                "bluetooth:88:C9:E8:16:C7:9C",
+            ),
+        ];
+        for (name, properties, expected) in cases {
+            assert_eq!(id(properties), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn legacy_usb_entries_migrate_without_losing_rank() {
+        let mut saved: SavedPreferences = serde_json::from_str(LEGACY_PREFERENCES).unwrap();
+        let connected = discovery_of(&[
+            ryzen_source(),
+            c270_source(
+                "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+                Some("046d_C270_HD_WEBCAM_4F2C0660"),
+            ),
+        ]);
+
+        assert!(reconcile(&mut saved, &connected));
+        let expected = [
+            (C270_ID, "Webcam C270 Mono"),
+            ("bus:pci-0000:c3:00.4-usb-0:1.4:1.0", "BY-GM18CU Mono"),
+            (
+                "bus:pci-0000:c1:00.6",
+                "Ryzen HD Audio Controller Analog Stereo",
+            ),
+            ("bluetooth:88:C9:E8:16:C7:9C", "WH-1000XM4"),
+        ];
+        assert_eq!(saved_entries(&saved), expected);
+        assert!(!reconcile(&mut saved, &connected), "migration runs once");
+
+        // The microphone comes back on yet another port.
+        let plugged = discovery_of(&[
+            ryzen_source(),
+            c270_source(
+                "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+                Some("046d_C270_HD_WEBCAM_4F2C0660"),
+            ),
+            by_source("pci-0000:c1:00.4-usb-0:3:1.0"),
+        ]);
+        assert!(reconcile(&mut saved, &plugged));
+        assert_eq!(saved.microphones[1].id, "usb:0d8c:0014");
+        assert_eq!(saved.microphones.len(), 4);
+        assert!(!reconcile(&mut saved, &plugged));
+    }
+
+    #[test]
+    fn adoption_prefers_the_old_bus_path_but_keeps_the_highest_rank() {
+        let mut saved: SavedPreferences = serde_json::from_str(LEGACY_PREFERENCES).unwrap();
+        // Plugged into the port of the second-ranked C270 entry.
+        let connected = discovery_of(&[c270_source(
+            "pci-0000:c3:00.4-usb-0:1.3.2:1.2",
+            Some("046d_C270_HD_WEBCAM_4F2C0660"),
+        )]);
+
+        assert!(reconcile(&mut saved, &connected));
+        let ids: Vec<_> = saved.microphones.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                C270_ID,
+                "bus:pci-0000:c3:00.4-usb-0:1.4:1.0",
+                "bus:pci-0000:c1:00.6",
+                "bluetooth:88:C9:E8:16:C7:9C",
+            ]
+        );
+    }
+
+    #[test]
+    fn migration_writes_once_and_keeps_the_resolution_fingerprint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        fs::write(&path, LEGACY_PREFERENCES).unwrap();
+        let manager = DeviceManager::at(path.clone());
+        let connected = discovery_of(&[
+            ryzen_source(),
+            c270_source(
+                "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+                Some("046d_C270_HD_WEBCAM_4F2C0660"),
+            ),
+        ]);
+
+        let migrated = manager.resolve(&connected).unwrap();
+        assert_eq!(migrated.microphone.id, C270_ID);
+        assert_eq!(migrated.fingerprint, fingerprint_at(&path));
+        assert_eq!(
+            read_preferences(&path).unwrap().unwrap().microphones.len(),
+            4
+        );
+
+        let again = manager.resolve(&connected).unwrap();
+        assert_eq!(again.fingerprint, migrated.fingerprint);
+    }
+
+    #[test]
+    fn identical_usb_devices_connected_together_stay_distinct() {
+        let serial = Some("046d_C270_HD_WEBCAM_4F2C0660");
+        let cases = [("same serial", serial), ("no serial", None)];
+        for (name, serial) in cases {
+            // A second profile of the first card is the same device.
+            let mut second_profile = c270_source("pci-0000:c3:00.3-usb-0:1.3.1:1.2", serial);
+            second_profile["name"] = "alsa_input.usb-046d_C270.analog-stereo".into();
+            let discovery = discovery_of(&[
+                c270_source("pci-0000:c3:00.4-usb-0:1.3.2:1.2", serial),
+                c270_source("pci-0000:c3:00.3-usb-0:1.3.1:1.2", serial),
+                second_profile,
+            ]);
+            let base = match serial {
+                Some(serial) => format!("usb:046d:0825:{serial}"),
+                None => "usb:046d:0825".to_string(),
+            };
+            let mut ids: Vec<_> = discovery
+                .microphones
+                .iter()
+                .map(|microphone| microphone.id.clone())
+                .collect();
+            ids.sort();
+            let expected = vec![
+                base.clone(),
+                format!("{base}@pci-0000:c3:00.4-usb-0:1.3.2:1.2"),
+            ];
+            assert_eq!(ids, expected, "{name}");
+        }
+
+        // Both adopt their own legacy entries and neither is collapsed.
+        let mut saved: SavedPreferences = serde_json::from_str(LEGACY_PREFERENCES).unwrap();
+        let both = discovery_of(&[
+            c270_source("pci-0000:c3:00.3-usb-0:1.3.1:1.2", serial),
+            c270_source("pci-0000:c3:00.4-usb-0:1.3.2:1.2", serial),
+        ]);
+        assert!(reconcile(&mut saved, &both));
+        let webcams: Vec<_> = saved
+            .microphones
+            .iter()
+            .filter(|microphone| microphone.name == "Webcam C270 Mono")
+            .map(|microphone| microphone.id.clone())
+            .collect();
+        assert_eq!(
+            webcams,
+            [
+                C270_ID.to_string(),
+                format!("{C270_ID}@pci-0000:c3:00.4-usb-0:1.3.2:1.2"),
+            ]
+        );
+        assert!(!reconcile(&mut saved, &both));
+    }
+
+    #[test]
+    fn an_identical_device_keeps_its_rank_when_its_twin_is_unplugged() {
+        let (first, second) = (
+            "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+            "pci-0000:c3:00.4-usb-0:1.3.2:1.2",
+        );
+        let second_id = format!("usb:046d:0825@{second}");
+        let saved = SavedPreferences {
+            microphones: vec![
+                SavedMicrophone {
+                    id: second_id.clone(),
+                    name: "Webcam C270 Mono".into(),
+                },
+                SavedMicrophone {
+                    id: "bus:pci-0000:c1:00.6".into(),
+                    name: "Built-in".into(),
+                },
+                SavedMicrophone {
+                    id: "usb:046d:0825".into(),
+                    name: "Webcam C270 Mono".into(),
+                },
+            ],
+            ..SavedPreferences::default()
+        };
+        let cases = [
+            ("twin unplugged", vec![second], vec![second_id.as_str()]),
+            ("other one unplugged", vec![first], vec!["usb:046d:0825"]),
+            (
+                "both connected",
+                vec![first, second],
+                vec!["usb:046d:0825", second_id.as_str()],
+            ),
+        ];
+        for (name, ports, expected) in cases {
+            let sources: Vec<_> = ports.iter().map(|port| c270_source(port, None)).collect();
+            let aligned = keep_saved_discriminators(&discovery_of(&sources), &saved);
+            let mut ids: Vec<_> = aligned
+                .microphones
+                .iter()
+                .map(|microphone| microphone.id.as_str())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, expected, "{name}");
+            let mut reconciled = saved.clone();
+            assert!(!reconcile(&mut reconciled, &aligned), "{name}");
+        }
+    }
+
+    #[test]
+    fn remove_microphone_drops_disconnected_entries_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(PREFERENCES_FILE);
+        fs::write(&path, LEGACY_PREFERENCES).unwrap();
+        let manager = DeviceManager::at(path.clone());
+        let connected = discovery_of(&[
+            ryzen_source(),
+            c270_source(
+                "pci-0000:c3:00.3-usb-0:1.3.1:1.2",
+                Some("046d_C270_HD_WEBCAM_4F2C0660"),
+            ),
+        ]);
+
+        let view = manager
+            .remove("bus:pci-0000:c3:00.4-usb-0:1.4:1.0", &connected)
+            .unwrap();
+        let names: Vec<_> = view.microphones.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Webcam C270 Mono",
+                "Ryzen HD Audio Controller Analog Stereo",
+                "WH-1000XM4",
+            ]
+        );
+        assert_eq!(
+            read_preferences(&path).unwrap().unwrap().microphones.len(),
+            3
+        );
+
+        let before = fs::read(&path).unwrap();
+        let connected_error = manager.remove(C270_ID, &connected).unwrap_err().to_string();
+        assert_eq!(
+            connected_error,
+            "\"Webcam C270 Mono\" is connected; disconnect it before removing it, or it is added back on the next discovery"
+        );
+        let unknown_error = manager
+            .remove("bus:gone", &connected)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(unknown_error, "no saved microphone has the id \"bus:gone\"");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "failed removals do not write"
         );
     }
 

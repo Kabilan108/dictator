@@ -2,15 +2,19 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+pub use crate::provider::ProviderSummary;
 
 /// Request from cli to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
     /// unique identifier for request correlation
     pub id: String,
-    /// command action: start, stop, toggle, cancel, status, retry, mic
+    /// command action: start, stop, toggle, cancel, status, retry, mic,
+    /// providers, use_provider
     pub action: String,
     /// optional command arguments
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -80,6 +84,12 @@ pub const ACTION_RETRY: &str = "retry";
 /// Takes one argument: [`MIC_RELEASE`] or [`MIC_RESUME`].
 pub const ACTION_MIC: &str = "mic";
 
+/// Lists the configured transcription providers in [`DATA_KEY_PROVIDERS`].
+pub const ACTION_PROVIDERS: &str = "providers";
+/// Takes one argument, a provider name, and makes it the provider for the
+/// next transcription. Replies like [`ACTION_PROVIDERS`].
+pub const ACTION_USE_PROVIDER: &str = "use_provider";
+
 pub const MIC_RELEASE: &str = "release";
 pub const MIC_RESUME: &str = "resume";
 
@@ -123,6 +133,10 @@ pub const DATA_KEY_LAST_RECORDING_GENERATION: &str = "last_recording_generation"
 pub const DATA_KEY_AUDIO_LEVEL_RMS: &str = "audio_level_rms";
 pub const DATA_KEY_AUDIO_LEVEL_PEAK: &str = "audio_level_peak";
 pub const DATA_KEY_MICROPHONE: &str = "microphone";
+/// The active provider's name.
+pub const DATA_KEY_PROVIDER: &str = "provider";
+/// A JSON array of [`ProviderSummary`] values.
+pub const DATA_KEY_PROVIDERS: &str = "providers";
 
 // Error messages
 pub const ERR_INVALID_COMMAND: &str = "invalid command";
@@ -131,3 +145,16 @@ pub const ERR_NOT_RECORDING: &str = "not currently recording";
 pub const ERR_RECORDING_FAILED: &str = "recording failed";
 pub const ERR_TRANSCRIPTION_FAILED: &str = "transcription failed";
 pub const ERR_TYPING_FAILED: &str = "typing failed";
+
+/// Reads the provider list from a [`ACTION_PROVIDERS`] or
+/// [`ACTION_USE_PROVIDER`] reply.
+pub fn decode_providers(response: &Response) -> Result<Vec<ProviderSummary>> {
+    if !response.success {
+        bail!("{}", response.error);
+    }
+    let encoded = response
+        .data
+        .get(DATA_KEY_PROVIDERS)
+        .ok_or_else(|| anyhow!("daemon reply has no provider list"))?;
+    serde_json::from_str(encoded).context("daemon sent an invalid provider list")
+}

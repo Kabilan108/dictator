@@ -52,6 +52,8 @@ pub struct Provider {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ApiConfig {
+    /// The default provider. The daemon can switch to another configured
+    /// provider at runtime; see [`crate::provider`].
     pub active_provider: String,
     pub timeout: i64,
     pub providers: BTreeMap<String, Provider>,
@@ -230,6 +232,19 @@ pub fn expand_env_substitutions(value: &str) -> (String, Vec<String>) {
     out.push_str(&value[last..]);
 
     (out, missing)
+}
+
+/// Variables named by `${env:VAR}` references still present in `value`, which
+/// after [`expand_env_substitutions`] are the ones that were not set.
+pub fn unresolved_env_references(value: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for caps in ENV_KEY_PATTERN.captures_iter(value) {
+        let name = caps[1].to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
 }
 
 fn resolve_provider_keys(config: &mut Config) -> Result<()> {

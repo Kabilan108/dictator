@@ -9,9 +9,10 @@ A voice typing daemon for Linux that enables voice typing anywhere the cursor is
 
 ## Desktop app
 
-The optional GPUI desktop app provides transcript history, playback, editing and
-revision comparison, recording controls, and statistics.
-The daemon continues to own recording, transcription and insertion.
+The optional desktop app, drawn with [Rune](https://github.com/anomalyco/rune),
+provides transcript history, playback, editing and revision comparison,
+recording controls, statistics, and the settings that can change while the
+daemon runs. The daemon continues to own recording, transcription and insertion.
 
 ```bash
 # Native development build and launch
@@ -22,6 +23,10 @@ direnv exec "$PWD" cargo run --features gui --bin dictator-gui -- --demo
 
 # Nix GUI package, separate from the headless daemon package
 nix run .#gui
+
+# Headless render of a fixture scene, with no window (see --list-scenes)
+direnv exec "$PWD" cargo run --features gui --bin dictator-gui -- \
+  --demo --snap /tmp/settings.png --scene settings --theme dark
 ```
 
 The GUI is a plain windowed app: open it on demand and it exits when its
@@ -33,7 +38,13 @@ priorities and terminal recording updates.
 For Home Manager, enable `services.dictator.gui.enable = true` alongside the
 existing daemon configuration to install `dictator-gui`.
 
-The Settings screen displays daemon configuration read-only. Microphone
+The window opens floating at its own size on tiling compositors (niri, sway,
+Hyprland), so it needs no window rule, and it follows the system's light or
+dark appearance.
+
+The Settings screen switches the transcription provider, orders and forgets
+microphones, and edits the glossary; each change applies to the next recording
+with no restart. The remaining daemon configuration is shown read-only. Microphone
 priorities live in a separate app-owned preferences file; Home Manager's
 `config.json` is never rewritten by the GUI. Discovery retains disconnected
 devices and their order, appends new devices, and resolves an input when a new
@@ -295,7 +306,7 @@ Notes:
 - `services.dictator.settings` or `services.dictator.configFile` is required when enabling the module.
 - `displayServer` controls the default runtime dependencies and environment (Wayland vs X11).
 - If you already manage a config file, set `services.dictator.configFile = /path/to/config.json;`.
-- `settings` is written to `config.json` as is, so provider options such as `send_vocabulary = true;` pass through. The glossary itself lives in the data directory, outside Home Manager's control (see [Vocabulary glossary](#vocabulary-glossary)).
+- `settings` is written to `config.json` as is, so provider options such as `send_vocabulary = true;` pass through. `api.active_provider` is the default provider; `dictator provider use` can switch to another configured provider without a rebuild (see [Switching providers](#switching-providers)). The glossary itself lives in the data directory, outside Home Manager's control (see [Vocabulary glossary](#vocabulary-glossary)).
 - To use `${env:VAR}` in the config, set `services.dictator.environmentFile` (supports strings like `${XDG_RUNTIME_DIR}/...`) or `services.dictator.environment`.
 - The service sandbox derives its writable config, data, and state directories
   from Home Manager's XDG paths, or from absolute `XDG_CONFIG_HOME`,
@@ -378,7 +389,7 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `stop` | Stop recording and start transcription |
 | `toggle` | Toggle between recording and idle states |
 | `cancel` | Cancel any ongoing operation |
-| `status` | Show daemon status, uptime and microphone state |
+| `status` | Show daemon status, uptime, microphone state and provider |
 | `mic release` | Close the warm microphone, for example before locking the screen |
 | `mic resume` | Reopen the warm microphone after `mic release` |
 | `transcripts` | Manage transcript history |
@@ -386,12 +397,17 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `glossary list` | Print the vocabulary glossary, one term per line |
 | `glossary add <TERM>` | Add a term to the glossary; quote terms with spaces |
 | `glossary remove <TERM>` | Remove a term, ignoring case |
+| `glossary rename <FROM> <TO>` | Replace a term in place, keeping its position |
+| `provider [list]` | List the configured providers, marking the active one and the default |
+| `provider use <NAME>` | Switch the daemon to another configured provider |
 
 ### Microphone capture
 
 While the session is unlocked, the daemon keeps one `parec` stream open on the selected microphone and holds the last 10 seconds in memory. A recording starts 450 ms before the start command reached the daemon and ends 200 ms after the stop command, so a first or last word spoken right at the keypress survives. If the warm stream is closed or broken when a recording starts, the daemon opens a new capture as before; that recording has no pre-roll.
 
 The microphone is the first connected input in the priority list (see the desktop app's settings), then the system default. Bluetooth inputs are never used, even when listed first or set as the default. If only Bluetooth inputs are connected, the recording fails with `no non-Bluetooth microphone available`. Before a recording uses the warm stream, and whenever inputs change, the daemon asks the sound server which source the warm stream and the recording's stream are recording from. PulseAudio moves a stream to the default source when its microphone is unplugged; a stream found on any source but its own is closed, its buffer is dropped, and a recording using it fails. Plugging in a microphone, removing one, or changing the default source moves the warm stream to the new selection within about a second. A priority change in the desktop app takes effect at the next recording.
+
+The priority list lives in `$XDG_CONFIG_HOME/dictator/preferences.json`. A USB microphone is identified by its vendor id, product id and serial number, so it keeps its place when plugged into another port. Lists saved by earlier versions identified USB devices by port, and a device moved between ports appeared once per port. The first time the daemon or the desktop app sees such a device connected, its entry takes the new id and keeps the rank of the entry saved for its current port, or else of the highest-ranked old entry with the same name; other old USB entries with that name are merged into it. Old entries for a device that is not connected are merged by name and take the new id when it is next plugged in. Two identical devices connected at once stay separate entries; the second gets its port appended to its id. Built-in and Bluetooth inputs keep their ids. A disconnected microphone can be removed from the list in the desktop app; a connected one cannot, because the next discovery would add it back.
 
 Close the warm stream while the screen is locked by wrapping the locker:
 
@@ -426,7 +442,7 @@ When the daemon cannot connect to the provider at all, it tries once more after 
 
 Only one CLI retry can run at a time. Ctrl-C cancels the request and keeps an existing failure available for another attempt. If the provider succeeds but history cannot be saved, the command still prints the recovered text, reports the storage error on stderr, and exits with a nonzero status.
 
-The command contacts the configured transcription provider directly and works without a running daemon. Run it with the same configuration and API key environment variables as the daemon. Variables loaded only by systemd's `EnvironmentFile` are not inherited by your terminal.
+The command contacts the transcription provider directly and works without a running daemon. It uses the provider chosen with `dictator provider use` when that provider's key is available in your environment, otherwise the config default. Run it with the same configuration and API key environment variables as the daemon. Variables loaded only by systemd's `EnvironmentFile` are not inherited by your terminal.
 
 Automatic failure tracking starts with this version of the daemon. For recordings from earlier versions, pass the WAV path explicitly. Recordings are stored under `$XDG_DATA_HOME/dictator/recordings`, or `~/.local/share/dictator/recordings` by default.
 
@@ -475,7 +491,27 @@ Configuration file location: `$XDG_CONFIG_HOME/dictator/config.json`, defaulting
 
 Audio output is mono 16-bit PCM; `channels` must be `1` and `bit_depth` must be `16`. Capture is limited to 32 Mi samples, about 34 minutes at 16 kHz. Reaching `max_duration_min` stops capture and transcribes the recording. The recording buffer grows with the recording, so a long `max_duration_min` costs no memory until it is used; the warm stream itself holds 10 seconds (640 KB at 16 kHz).
 
-The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the active provider key references missing environment variables, config loading fails. The supplied systemd user service loads variables from `~/.config/dictator/environment` when that file exists.
+The `api.providers.<name>.key` field supports `${env:VAR_NAME}` substitutions. If the default provider's key references missing environment variables, config loading fails. Other providers may reference unset variables; they cannot be selected until the variable is set. The supplied systemd user service loads variables from `~/.config/dictator/environment` when that file exists.
+
+### Switching providers
+
+`api.active_provider` is the default. To use another configured provider, for example when your own server is down, switch the running daemon:
+
+```bash
+dictator provider            # list providers; * marks the active one
+dictator provider use openai # use openai from the next transcription on
+dictator provider use siren  # back to the default
+```
+
+The desktop app's settings offer the same choice. A provider can be selected when it has an endpoint and a key, and every `${env:VAR}` in its key is set in the daemon's environment; the list shows the reason for any provider that cannot be selected. The switch applies to the next transcription and to retries. A recording already being transcribed finishes with the provider it started with.
+
+The daemon saves the choice in `$XDG_CONFIG_HOME/dictator/runtime.json`, which it may write even when Home Manager owns `config.json`, and keeps it across restarts:
+
+```json
+{"version": 1, "active_provider": "openai"}
+```
+
+Selecting the default again deletes the override, so a later change to `api.active_provider` takes effect. If `runtime.json` names a provider that is no longer configured or cannot be used, the daemon logs a warning and starts with the default.
 
 The `typing.shortcut` field selects the default simulated paste shortcut. It accepts `"ctrl_v"` or `"ctrl_shift_v"` and defaults to `"ctrl_shift_v"`. Under Niri, `typing.niri_app_shortcuts` can override that shortcut for the focused application's Niri `app_id`; the example uses Ctrl+V for T3 Code, where Ctrl+Shift+V pastes twice. Applications without an override use `typing.shortcut`, and X11 always uses `typing.shortcut`. The daemon finds the compositor through `NIRI_SOCKET` when set, otherwise through `$XDG_RUNTIME_DIR/niri.<WAYLAND_DISPLAY>.*.sock`, so the override also works from a systemd service that does not import `NIRI_SOCKET`.
 
@@ -489,7 +525,7 @@ The `notifications` field controls desktop notifications:
 
 ### Vocabulary glossary
 
-[siren](https://github.com/Kabilan108/siren) can boost the spelling of a list of terms: names, tools, jargon. Dictator keeps that list in `$XDG_DATA_HOME/dictator/glossary.json` (default `~/.local/share/dictator/glossary.json`), outside the config directory, so you can edit it while Home Manager owns `config.json`. Edit it from the Glossary section of the desktop app's settings or with `dictator glossary add|remove|list`:
+[siren](https://github.com/Kabilan108/siren) can boost the spelling of a list of terms: names, tools, jargon. Dictator keeps that list in `$XDG_DATA_HOME/dictator/glossary.json` (default `~/.local/share/dictator/glossary.json`), outside the config directory, so you can edit it while Home Manager owns `config.json`. Edit it from the Glossary section of the desktop app's settings or with `dictator glossary add|remove|rename|list`:
 
 ```json
 {
@@ -579,3 +615,4 @@ Run `dictator --log-level DEBUG daemon` for diagnostic output.
 - Database stored in `~/.local/share/dictator/app.db`
 - Vocabulary glossary stored in `~/.local/share/dictator/glossary.json`
 - Config stored in `$XDG_CONFIG_HOME/dictator/config.json`, with `~/.config` as the default config root
+- Provider override stored in `$XDG_CONFIG_HOME/dictator/runtime.json`, microphone priority in `preferences.json` next to it

@@ -149,6 +149,18 @@ impl Client {
         self.send_command(ACTION_STATUS, &[]).await
     }
 
+    pub async fn providers(&self) -> Result<Vec<ProviderSummary>> {
+        decode_providers(&self.send_command(ACTION_PROVIDERS, &[]).await?)
+    }
+
+    pub async fn use_provider(&self, name: &str) -> Result<Vec<ProviderSummary>> {
+        decode_providers(
+            &self
+                .send_command(ACTION_USE_PROVIDER, &[name.to_string()])
+                .await?,
+        )
+    }
+
     pub async fn is_connected(&self) -> bool {
         matches!(
             tokio::time::timeout(CONNECTION_TIMEOUT, self.connect()).await,

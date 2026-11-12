@@ -57,6 +57,16 @@ pub trait CommandHandler: Send + Sync + 'static {
     fn get_microphone_status(&self) -> Option<String> {
         None
     }
+    fn list_providers(&self) -> Result<Vec<ProviderSummary>> {
+        bail!("provider selection is not supported")
+    }
+    /// Selects the provider for the next transcription; returns the new list.
+    fn use_provider(&self, _name: &str) -> Result<Vec<ProviderSummary>> {
+        bail!("provider selection is not supported")
+    }
+    fn get_active_provider(&self) -> Option<String> {
+        None
+    }
 }
 
 struct Running {
@@ -412,6 +422,32 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command, received_at: Ins
                 Err(e) => err = Some(e),
             }
         }
+        ACTION_PROVIDERS | ACTION_USE_PROVIDER => {
+            let result = match (cmd.action.as_str(), cmd.args.as_slice()) {
+                (ACTION_PROVIDERS, []) => handler.list_providers(),
+                (ACTION_PROVIDERS, _) => Err(anyhow!("{ACTION_PROVIDERS} takes no arguments")),
+                (_, [name]) => handler.use_provider(name),
+                _ => Err(anyhow!(
+                    "{ACTION_USE_PROVIDER} expects one argument: the provider name"
+                )),
+            };
+            match result.and_then(|providers| {
+                serde_json::to_string(&providers)
+                    .map(|encoded| (providers, encoded))
+                    .map_err(anyhow::Error::from)
+            }) {
+                Ok((providers, encoded)) => {
+                    response.success = true;
+                    response.data.insert(DATA_KEY_PROVIDERS.into(), encoded);
+                    if let Some(active) = providers.iter().find(|provider| provider.active) {
+                        response
+                            .data
+                            .insert(DATA_KEY_PROVIDER.into(), active.name.clone());
+                    }
+                }
+                Err(e) => err = Some(e),
+            }
+        }
         ACTION_STATUS => {
             let status = handler.get_status();
             response.success = true;
@@ -452,6 +488,9 @@ fn process_command(handler: &dyn CommandHandler, cmd: &Command, received_at: Ins
             }
             if let Some(microphone) = handler.get_microphone_status() {
                 response.data.insert(DATA_KEY_MICROPHONE.into(), microphone);
+            }
+            if let Some(provider) = handler.get_active_provider() {
+                response.data.insert(DATA_KEY_PROVIDER.into(), provider);
             }
         }
         other => {

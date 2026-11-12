@@ -9,6 +9,7 @@
 //! - [`audio`]: recording and Whisper API transcription
 //! - [`typing`]: clipboard + paste simulation
 //! - [`notifier`]: D-Bus desktop notifications
+//! - [`provider`]: runtime choice of transcription provider
 //! - [`visual`]: OSD event stream
 //! - [`storage`]: sqlite transcript history
 //! - [`utils`]: configuration, paths and logging
@@ -18,6 +19,7 @@ pub mod daemon;
 pub mod glossary;
 pub mod ipc;
 pub mod notifier;
+pub mod provider;
 pub mod retry;
 pub mod storage;
 pub mod typing;

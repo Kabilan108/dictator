@@ -13,6 +13,7 @@ use crate::audio::{
 };
 use crate::ipc::{self, CommandHandler, DaemonState, Server, StatusData};
 use crate::notifier::Notifier;
+use crate::provider::{self, ProviderSelector, ProviderSummary};
 use crate::storage::Db;
 use crate::typing::Typer;
 use crate::utils::{Config, NotificationMode, get_path_to_recording};
@@ -95,6 +96,14 @@ struct Operation {
     cancel: CancellationToken,
 }
 
+/// What every saved attempt of one dictation records.
+struct Dictation<'a> {
+    duration: Duration,
+    audio_path: &'a str,
+    /// Chosen when transcription started; a later switch does not change it.
+    provider: &'a str,
+}
+
 struct PipelineTask {
     operation_id: u64,
     task: JoinHandle<()>,
@@ -122,6 +131,7 @@ pub struct Daemon {
     config: Config,
     recorder: Recorder,
     transcriber: WhisperClient,
+    providers: ProviderSelector,
     notifier: Notifier,
     visual_sink: RwLock<Sink>,
     typer: Typer,
@@ -153,6 +163,8 @@ impl Daemon {
 
         let transcriber = WhisperClient::new(&cfg.api)
             .map_err(|e| anyhow!("failed to create transcription client: {e}"))?;
+        let providers = ProviderSelector::load(&cfg.api, provider::runtime_path());
+        info!(provider = %providers.active(), "transcription provider");
 
         let notifier = if cfg.notifications == NotificationMode::Off {
             Notifier::Noop
@@ -178,6 +190,7 @@ impl Daemon {
             config: cfg,
             recorder,
             transcriber,
+            providers,
             notifier,
             visual_sink: RwLock::new(Sink::Noop),
             typer,
@@ -650,6 +663,7 @@ impl Daemon {
         cancel: CancellationToken,
         recording_duration: Duration,
         stopped_at: Instant,
+        provider: String,
     ) {
         if cancel.is_cancelled() {
             return;
@@ -708,8 +722,16 @@ impl Daemon {
             return;
         }
 
+        let dictation = Dictation {
+            duration: recording_duration,
+            audio_path: &audio_path,
+            provider: &provider,
+        };
         let request_started = Instant::now();
-        let text = match self.transcribe(&cancel, audio_data, &audio_path).await {
+        let text = match self
+            .transcribe(&cancel, audio_data, &audio_path, &provider)
+            .await
+        {
             Ok(text) => text,
             Err(err) => {
                 if cancel.is_cancelled() {
@@ -720,8 +742,7 @@ impl Daemon {
                     .persist_failed_transcription(
                         operation_id,
                         &cancel,
-                        recording_duration,
-                        &audio_path,
+                        &dictation,
                         &format!("{err:#}"),
                         request_started.elapsed(),
                     )
@@ -743,8 +764,7 @@ impl Daemon {
                 operation_id,
                 &cancel,
                 &text,
-                recording_duration,
-                &audio_path,
+                &dictation,
                 request_started.elapsed(),
             )
             .await
@@ -822,12 +842,8 @@ impl Daemon {
 
     fn persist_capture_failure(&self, duration: Duration, error_message: &str) {
         let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-        let model = self
-            .config
-            .api
-            .providers
-            .get(&self.config.api.active_provider)
-            .map(|provider| provider.model.as_str());
+        let provider = self.providers.active();
+        let model = self.providers.model(&provider);
         let saved = self
             .db
             .lock()
@@ -873,23 +889,17 @@ impl Daemon {
         self: &Arc<Self>,
         operation_id: u64,
         cancel: &CancellationToken,
-        duration: Duration,
-        audio_path: &str,
+        dictation: &Dictation<'_>,
         error_message: &str,
         latency: Duration,
     ) -> bool {
         let daemon = Arc::clone(self);
         let task_cancel = cancel.clone();
-        let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-        let audio_path = audio_path.to_owned();
+        let duration_ms = i64::try_from(dictation.duration.as_millis()).unwrap_or(i64::MAX);
+        let audio_path = dictation.audio_path.to_owned();
         let error_message = error_message.to_owned();
         let latency_ms = i64::try_from(latency.as_millis()).unwrap_or(i64::MAX);
-        let model = self
-            .config
-            .api
-            .providers
-            .get(&self.config.api.active_provider)
-            .map(|provider| provider.model.clone());
+        let model = self.providers.model(dictation.provider).map(str::to_owned);
         let saved = tokio::task::spawn_blocking(move || {
             let _command = daemon.command_lock.lock().unwrap();
             if task_cancel.is_cancelled() || !daemon.state_matches_operation(operation_id) {
@@ -932,20 +942,18 @@ impl Daemon {
         cancel: &CancellationToken,
         audio_data: Vec<u8>,
         audio_path: &str,
+        provider: &str,
     ) -> Result<String> {
-        let model = self
-            .config
-            .api
-            .providers
-            .get(&self.config.api.active_provider)
-            .map(|p| p.model.clone())
-            .unwrap_or_default();
-
         let req = TranscriptionRequest {
             audio_data: audio_data.into(),
             filename: audio_path.to_string(),
-            model,
+            model: self
+                .providers
+                .model(provider)
+                .unwrap_or_default()
+                .to_owned(),
             language: String::new(),
+            provider: provider.to_owned(),
         };
 
         match self.transcriber.transcribe(cancel, &req).await {
@@ -965,8 +973,7 @@ impl Daemon {
         operation_id: u64,
         cancel: &CancellationToken,
         text: &str,
-        duration: Duration,
-        audio_path: &str,
+        dictation: &Dictation<'_>,
         latency: Duration,
     ) -> Result<()> {
         if cancel.is_cancelled() {
@@ -1011,17 +1018,15 @@ impl Daemon {
         }
 
         let model = self
-            .config
-            .api
             .providers
-            .get(&self.config.api.active_provider)
-            .map(|p| p.model.clone())
-            .unwrap_or_default();
-        let duration_ms = duration.as_millis() as i64;
+            .model(dictation.provider)
+            .unwrap_or_default()
+            .to_owned();
+        let duration_ms = dictation.duration.as_millis() as i64;
 
         let daemon = Arc::clone(self);
         let text = text.to_owned();
-        let audio_path = audio_path.to_owned();
+        let audio_path = dictation.audio_path.to_owned();
         let saved = tokio::task::spawn_blocking(move || match daemon.db.lock().unwrap().as_ref() {
             Some(db) => db.save_transcript_attempt(
                 duration_ms,
@@ -1162,11 +1167,13 @@ impl Daemon {
         self.notify_state(DaemonState::Transcribing, revision);
         let daemon = Arc::clone(self);
         let persistence_fence = Arc::clone(&self.retry_persistence_fence);
+        let provider = self.providers.active();
         let task = self.runtime.spawn(async move {
             let result = crate::retry::run_recording_with_cancel_and_fence(
                 recording_id,
                 retry_cancel,
                 persistence_fence,
+                provider,
             )
             .await;
             let persisted = match &result {
@@ -1251,9 +1258,16 @@ impl Daemon {
         self.notify_state(DaemonState::Transcribing, revision);
 
         let daemon = Arc::clone(self);
+        let provider = self.providers.active();
         let task = self.runtime.spawn(async move {
             daemon
-                .transcribe_and_type(operation_id, cancel, recording_duration, stopped_at)
+                .transcribe_and_type(
+                    operation_id,
+                    cancel,
+                    recording_duration,
+                    stopped_at,
+                    provider,
+                )
                 .await;
         });
         let mut pipeline = self.pipeline.lock().unwrap();
@@ -1450,6 +1464,18 @@ impl CommandHandler for Arc<Daemon> {
         Some(self.recorder.microphone_status().to_string())
     }
 
+    fn list_providers(&self) -> Result<Vec<ProviderSummary>> {
+        Ok(self.providers.list())
+    }
+
+    fn use_provider(&self, name: &str) -> Result<Vec<ProviderSummary>> {
+        self.providers.select(name)
+    }
+
+    fn get_active_provider(&self) -> Option<String> {
+        Some(self.providers.active())
+    }
+
     fn handle_cancel(&self) -> Result<()> {
         let _command = self.command_lock.lock().unwrap();
         self.cancel_operation_locked()
@@ -1597,9 +1623,19 @@ mod tests {
         let mut config = default_config();
         config.enable_osd = false;
         config.notifications = NotificationMode::All;
+        config.api.providers.insert(
+            "local".into(),
+            crate::utils::Provider {
+                endpoint: "http://127.0.0.1:1".into(),
+                key: "local-key".into(),
+                model: "local-model".into(),
+                send_vocabulary: false,
+            },
+        );
         let recorder = Recorder::for_test(config.audio.clone());
         let transcriber = WhisperClient::new(&config.api).unwrap();
         let dir = tempfile::tempdir().unwrap();
+        let providers = ProviderSelector::load(&config.api, dir.path().join("runtime.json"));
         let db = Db::open(&dir.path().join("app.db")).unwrap();
         let (notification_tx, _) = watch::channel(NotificationUpdate {
             state: DaemonState::Idle,
@@ -1609,6 +1645,7 @@ mod tests {
             config,
             recorder,
             transcriber,
+            providers,
             notifier: Notifier::Noop,
             visual_sink: RwLock::new(Sink::Noop),
             typer: Typer::with_backend(Backend::Wayland),
@@ -1652,6 +1689,37 @@ mod tests {
             next_operation_id: operation_id,
             revision: 3,
         }
+    }
+
+    #[tokio::test]
+    async fn selected_provider_names_the_model_of_later_attempts() {
+        let (daemon, dir) = daemon_fixture();
+        let handler: &dyn CommandHandler = &daemon;
+        assert_eq!(handler.get_active_provider().as_deref(), Some("openai"));
+        let error = handler.use_provider("openai").unwrap_err().to_string();
+        assert!(error.contains("no API key is configured"), "{error}");
+
+        let listed = handler.use_provider("local").unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|entry| entry.name == "local" && entry.active)
+        );
+        assert_eq!(handler.get_active_provider().as_deref(), Some("local"));
+        assert!(dir.path().join("runtime.json").exists());
+
+        daemon.persist_capture_failure(Duration::from_secs(1), "no input");
+        let recording_id = daemon.get_last_recording().unwrap().0;
+        let detail = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_recording(recording_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.attempts[0].model.as_deref(), Some("local-model"));
     }
 
     #[test]
@@ -2019,7 +2087,13 @@ mod tests {
             task_started.notify_one();
             task_resume.notified().await;
             task_daemon
-                .transcribe_and_type(1, operation_a, Duration::from_secs(4), Instant::now())
+                .transcribe_and_type(
+                    1,
+                    operation_a,
+                    Duration::from_secs(4),
+                    Instant::now(),
+                    "openai".into(),
+                )
                 .await;
         });
 
@@ -2065,8 +2139,11 @@ mod tests {
                 .persist_failed_transcription(
                     4,
                     &operation,
-                    Duration::from_millis(4_321),
-                    "/tmp/current-failure.wav",
+                    &Dictation {
+                        duration: Duration::from_millis(4_321),
+                        audio_path: "/tmp/current-failure.wav",
+                        provider: "openai",
+                    },
                     "provider timeout",
                     Duration::from_millis(812),
                 )
@@ -2090,8 +2167,11 @@ mod tests {
                 .persist_failed_transcription(
                     4,
                     &operation,
-                    Duration::from_secs(5),
-                    "/tmp/canceled-failure.wav",
+                    &Dictation {
+                        duration: Duration::from_secs(5),
+                        audio_path: "/tmp/canceled-failure.wav",
+                        provider: "openai",
+                    },
                     "canceled",
                     Duration::from_millis(1),
                 )
@@ -2102,8 +2182,11 @@ mod tests {
                 .persist_failed_transcription(
                     3,
                     &daemon.shutdown_cancel.child_token(),
-                    Duration::from_secs(6),
-                    "/tmp/stale-failure.wav",
+                    &Dictation {
+                        duration: Duration::from_secs(6),
+                        audio_path: "/tmp/stale-failure.wav",
+                        provider: "openai",
+                    },
                     "stale",
                     Duration::from_millis(1),
                 )

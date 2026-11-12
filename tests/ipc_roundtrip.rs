@@ -7,10 +7,12 @@ use anyhow::{Result, bail};
 use dictator::ipc::client::MAX_RESPONSE_BYTES;
 use dictator::ipc::server::MAX_COMMAND_BYTES;
 use dictator::ipc::{
-    ACTION_CANCEL, ACTION_MIC, ACTION_START, ACTION_STATUS, ACTION_STOP, ACTION_TOGGLE, Client,
-    CommandHandler, DATA_KEY_LAST_ERROR, DATA_KEY_MICROPHONE, DATA_KEY_RECORDING_DURATION,
+    ACTION_CANCEL, ACTION_MIC, ACTION_PROVIDERS, ACTION_START, ACTION_STATUS, ACTION_STOP,
+    ACTION_TOGGLE, ACTION_USE_PROVIDER, Client, CommandHandler, DATA_KEY_LAST_ERROR,
+    DATA_KEY_MICROPHONE, DATA_KEY_PROVIDER, DATA_KEY_PROVIDERS, DATA_KEY_RECORDING_DURATION,
     DATA_KEY_STATE, DATA_KEY_UPTIME, DaemonState, ERR_INVALID_COMMAND, LEGACY_SOCKET_PATH,
-    MIC_RELEASE, MIC_RESUME, Server, StatusData, default_socket_path,
+    MIC_RELEASE, MIC_RESUME, ProviderSummary, Server, StatusData, decode_providers,
+    default_socket_path,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -505,5 +507,103 @@ async fn commands_carry_their_arrival_time_and_mic_control_round_trips() {
 
     let resp = client.status().await.unwrap();
     assert_eq!(resp.data[DATA_KEY_MICROPHONE], "warm (Desk microphone)");
+    server.stop().await.unwrap();
+}
+
+struct ProviderHandler {
+    providers: dictator::provider::ProviderSelector,
+}
+
+impl CommandHandler for ProviderHandler {
+    fn handle_start(&self, _received_at: Instant) -> Result<()> {
+        Ok(())
+    }
+    fn handle_stop(&self, _received_at: Instant) -> Result<()> {
+        Ok(())
+    }
+    fn handle_toggle(&self, _received_at: Instant) -> Result<()> {
+        Ok(())
+    }
+    fn handle_cancel(&self) -> Result<()> {
+        Ok(())
+    }
+    fn get_status(&self) -> StatusData {
+        StatusData {
+            state: DaemonState::Idle,
+            recording_duration: None,
+            last_error: None,
+            uptime: Duration::ZERO,
+        }
+    }
+    fn list_providers(&self) -> Result<Vec<ProviderSummary>> {
+        Ok(self.providers.list())
+    }
+    fn use_provider(&self, name: &str) -> Result<Vec<ProviderSummary>> {
+        self.providers.select(name)
+    }
+    fn get_active_provider(&self) -> Option<String> {
+        Some(self.providers.active())
+    }
+}
+
+#[tokio::test]
+async fn providers_list_and_switch_over_ipc() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket_path = dir.path().join("dictator.sock");
+    let runtime_path = dir.path().join("runtime.json");
+    let mut api = dictator::utils::default_config().api;
+    api.providers.get_mut("openai").unwrap().key = "sk-test-secret".into();
+    api.providers.insert(
+        "siren".into(),
+        dictator::utils::Provider {
+            endpoint: "http://siren:8000".into(),
+            key: "siren-secret".into(),
+            model: "large-v3".into(),
+            send_vocabulary: true,
+        },
+    );
+    api.active_provider = "siren".into();
+    let handler = Arc::new(ProviderHandler {
+        providers: dictator::provider::ProviderSelector::load(&api, runtime_path.clone()),
+    });
+    let server = Server::with_path(handler, socket_path.clone());
+    server.start().await.unwrap();
+    let client = Client::with_path(socket_path);
+
+    let raw = client.send_command(ACTION_PROVIDERS, &[]).await.unwrap();
+    assert!(raw.success);
+    assert_eq!(raw.data[DATA_KEY_PROVIDER], "siren");
+    assert!(!raw.data[DATA_KEY_PROVIDERS].contains("secret"));
+    let listed = decode_providers(&raw).unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|p| (p.name.as_str(), p.active, p.is_default))
+            .collect::<Vec<_>>(),
+        [("openai", false, false), ("siren", true, true)]
+    );
+
+    let switched = client.use_provider("openai").await.unwrap();
+    assert!(switched.iter().any(|p| p.name == "openai" && p.active));
+    assert!(runtime_path.exists());
+    let status = client.status().await.unwrap();
+    assert_eq!(status.data[DATA_KEY_PROVIDER], "openai");
+
+    let unknown = client.use_provider("nope").await.unwrap_err().to_string();
+    assert_eq!(
+        unknown,
+        "unknown provider 'nope'; configured providers: openai, siren"
+    );
+    for (action, args) in [
+        (ACTION_USE_PROVIDER, vec![]),
+        (ACTION_USE_PROVIDER, vec!["a".to_string(), "b".to_string()]),
+        (ACTION_PROVIDERS, vec!["extra".to_string()]),
+    ] {
+        let response = client.send_command(action, &args).await.unwrap();
+        assert!(!response.success, "{action} {args:?}");
+    }
+
+    client.use_provider("siren").await.unwrap();
+    assert!(!runtime_path.exists());
     server.stop().await.unwrap();
 }

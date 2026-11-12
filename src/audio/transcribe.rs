@@ -19,6 +19,8 @@ pub struct TranscriptionRequest {
     pub model: String,
     /// optional
     pub language: String,
+    /// configured provider to send to; empty uses the config default
+    pub provider: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -65,18 +67,17 @@ impl WhisperClient {
         }
         debug!(filename = %req.filename, "starting transcription request");
 
-        let Some(provider) = self.config.providers.get(&self.config.active_provider) else {
-            bail!(
-                "active provider '{}' not found",
-                self.config.active_provider
-            );
+        let provider_name = if req.provider.is_empty() {
+            self.config.active_provider.as_str()
+        } else {
+            req.provider.as_str()
+        };
+        let Some(provider) = self.config.providers.get(provider_name) else {
+            bail!("provider '{provider_name}' not found");
         };
 
-        if provider.key.is_empty() {
-            bail!(
-                "API key is required but not configured for provider '{}'",
-                self.config.active_provider
-            );
+        if let Some(problem) = crate::provider::provider_problem(provider) {
+            bail!("provider '{provider_name}' cannot be used: {problem}");
         }
 
         let mut model = req.model.as_str();
@@ -105,7 +106,7 @@ impl WhisperClient {
         let resp = loop {
             attempts += 1;
             let form = build_form(req, model, vocabulary.as_deref())?;
-            debug!(url = %url, model = %model, attempt = attempts, "sending request");
+            debug!(url = %url, provider = provider_name, model = %model, attempt = attempts, "sending request");
 
             let send = self
                 .http
@@ -298,6 +299,58 @@ mod tests {
             filename: "sample.wav".into(),
             model: "test-model".into(),
             language: "en".into(),
+            provider: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_provider_overrides_the_config_default() {
+        let body = br#"{"text":"routed"}"#;
+        let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let (mut client, _, server) =
+            mock_provider([response.as_bytes(), body].concat(), false).await;
+        client.config.providers.insert(
+            "unreachable".into(),
+            crate::utils::Provider {
+                endpoint: "http://127.0.0.1:1".into(),
+                key: "k".into(),
+                ..Default::default()
+            },
+        );
+        client.config.providers.insert(
+            "keyless".into(),
+            crate::utils::Provider {
+                endpoint: "http://127.0.0.1:1".into(),
+                key: "${env:DICTATOR_TEST_UNSET_KEY}".into(),
+                ..Default::default()
+            },
+        );
+        client.config.active_provider = "unreachable".into();
+
+        let mut routed = request();
+        routed.provider = "openai".into();
+        let result = client
+            .transcribe(&CancellationToken::new(), &routed)
+            .await
+            .unwrap();
+        assert_eq!(result.text, "routed");
+        server.await.unwrap();
+
+        for (provider, expected) in [
+            (
+                "keyless",
+                "provider 'keyless' cannot be used: DICTATOR_TEST_UNSET_KEY is not set in the daemon's environment",
+            ),
+            ("gone", "provider 'gone' not found"),
+        ] {
+            let mut rejected = request();
+            rejected.provider = provider.into();
+            let error = client
+                .transcribe(&CancellationToken::new(), &rejected)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert_eq!(error, expected);
         }
     }
 

@@ -80,6 +80,16 @@ enum Commands {
         /// WAV recording to transcribe (defaults to the newest failed recording)
         audio_file: Option<PathBuf>,
     },
+    /// list or switch transcription providers
+    ///
+    /// providers are defined in config.json, whose active_provider is the
+    /// default. 'use' switches the daemon to another configured provider for
+    /// the next transcription; the choice is saved in runtime.json and kept
+    /// across restarts. using the default again removes the override.
+    Provider {
+        #[command(subcommand)]
+        action: Option<ProviderAction>,
+    },
     /// print the version number
     ///
     /// prints the version number of the dictator daemon
@@ -128,6 +138,16 @@ enum GlossaryAction {
     Add { term: String },
     /// remove a term, ignoring case
     Remove { term: String },
+    /// replace a term in place, keeping its position
+    Rename { from: String, to: String },
+}
+
+#[derive(Subcommand)]
+enum ProviderAction {
+    /// print the configured providers (the default action)
+    List,
+    /// switch the daemon to a configured provider
+    Use { name: String },
 }
 
 #[derive(Subcommand)]
@@ -178,9 +198,73 @@ async fn run_status() {
         if let Some(microphone) = response.data.get(ipc::DATA_KEY_MICROPHONE) {
             println!("  microphone: {microphone}");
         }
+        if let Some(provider) = response.data.get(ipc::DATA_KEY_PROVIDER) {
+            println!("  provider: {provider}");
+        }
     } else {
         eprintln!("status command failed: {}", response.error);
         std::process::exit(1);
+    }
+}
+
+/// One line per provider: `*` marks the active one, and the default and any
+/// reason a provider cannot be used follow the endpoint.
+fn format_providers(providers: &[ipc::ProviderSummary]) -> String {
+    let name_width = providers.iter().map(|p| p.name.len()).max().unwrap_or(0);
+    let model_width = providers.iter().map(|p| p.model.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for provider in providers {
+        let marker = if provider.active { '*' } else { ' ' };
+        let mut line = format!(
+            "{marker} {:<name_width$}  {:<model_width$}  {}",
+            provider.name, provider.model, provider.endpoint
+        );
+        if provider.is_default {
+            line.push_str("  [default]");
+        }
+        if !provider.usable {
+            line.push_str(&format!("  [unusable: {}]", provider.problem));
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+async fn run_provider(action: Option<ProviderAction>) {
+    let (args, verb) = match action.unwrap_or(ProviderAction::List) {
+        ProviderAction::List => (None, "provider list"),
+        ProviderAction::Use { name } => (Some(name), "provider use"),
+    };
+    let action = if args.is_some() {
+        ipc::ACTION_USE_PROVIDER
+    } else {
+        ipc::ACTION_PROVIDERS
+    };
+    let response = exit_if_error(
+        Client::new()
+            .send_command(action, &args.iter().cloned().collect::<Vec<_>>())
+            .await
+            .map_err(daemon::not_running),
+        1,
+    );
+    let providers = match ipc::decode_providers(&response) {
+        Ok(providers) => providers,
+        Err(err) => {
+            eprintln!("{verb} failed: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    if args.is_none() {
+        print!("{}", format_providers(&providers));
+        return;
+    }
+    match providers.iter().find(|provider| provider.active) {
+        Some(active) if active.is_default => {
+            println!("using {} (the config default)", active.name)
+        }
+        Some(active) => println!("using {} for the next transcription", active.name),
+        None => println!("provider updated"),
     }
 }
 
@@ -326,6 +410,8 @@ fn run_glossary(action: GlossaryAction) {
         }
         GlossaryAction::Add { term } => glossary::add(&path, &term)
             .map(|terms| format!("added; {} of {} terms", terms.len(), glossary::MAX_TERMS)),
+        GlossaryAction::Rename { from, to } => glossary::rename(&path, &from, &to)
+            .map(|terms| format!("renamed; {} of {} terms", terms.len(), glossary::MAX_TERMS)),
         GlossaryAction::Remove { term } => glossary::remove(&path, &term).map(|terms| {
             if terms.is_empty() {
                 "removed; the glossary is now empty, so boosting is off".to_string()
@@ -384,6 +470,7 @@ fn run_async(command: Commands, daemon_runtime: bool) {
             Commands::Toggle => run_command(ipc::ACTION_TOGGLE, "toggled daemon").await,
             Commands::Cancel => run_command(ipc::ACTION_CANCEL, "operation canceled").await,
             Commands::Status => run_status().await,
+            Commands::Provider { action } => run_provider(action).await,
             Commands::Mic { action } => {
                 let (arg, message) = match action {
                     MicAction::Release => (ipc::MIC_RELEASE, "microphone released"),
@@ -425,6 +512,38 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    #[test]
+    fn provider_list_marks_active_default_and_unusable_entries() {
+        let entry =
+            |name: &str, model: &str, active, is_default, problem: &str| ipc::ProviderSummary {
+                name: name.into(),
+                model: model.into(),
+                endpoint: format!("https://{name}.test/v1"),
+                usable: problem.is_empty(),
+                problem: problem.into(),
+                active,
+                is_default,
+                send_vocabulary: false,
+            };
+        let text = format_providers(&[
+            entry(
+                "groq",
+                "whisper-large-v3",
+                false,
+                false,
+                "GROQ_API_KEY is not set in the daemon's environment",
+            ),
+            entry("openai", "gpt-4o-transcribe", true, false, ""),
+            entry("siren", "large-v3", false, true, ""),
+        ]);
+        let expected = [
+            "  groq    whisper-large-v3   https://groq.test/v1  [unusable: GROQ_API_KEY is not set in the daemon's environment]",
+            "* openai  gpt-4o-transcribe  https://openai.test/v1",
+            "  siren   large-v3           https://siren.test/v1  [default]",
+        ];
+        assert_eq!(text.lines().collect::<Vec<_>>(), expected);
+    }
 
     #[test]
     fn failed_write_never_publishes_partial_config() {

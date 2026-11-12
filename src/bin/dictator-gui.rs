@@ -1,16 +1,10 @@
 use anyhow::Result;
-use clap::Parser;
 use dictator::gui::{GuiOptions, run};
 
-#[derive(Debug, Parser)]
-#[command(about = "Dictator desktop history and recording controls")]
-struct Args {
-    /// Use isolated synthetic recordings, statistics and microphones.
-    #[arg(long)]
-    demo: bool,
-}
-
+/// `dictator-gui [--demo]`. `--demo` uses isolated synthetic recordings,
+/// statistics and microphones. Rune reads its own flags (`--snap`, `--scene`,
+/// `--theme`, ...) from the same command line and hands back the rest.
 fn main() -> Result<()> {
-    let args = Args::parse();
-    run(GuiOptions { demo: args.demo })
+    let demo = rune::extra_args().iter().any(|arg| arg == "--demo");
+    run(GuiOptions { demo })
 }

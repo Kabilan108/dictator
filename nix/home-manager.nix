@@ -112,6 +112,9 @@ in
         Configuration for Dictator written to config.json. Provider entries pass
         through as written, including `send_vocabulary`, which sends the glossary
         in $XDG_DATA_HOME/dictator/glossary.json to providers that accept it.
+        `api.active_provider` is the default provider; `dictator provider use`
+        switches the running daemon to another configured provider and saves
+        the choice in $XDG_CONFIG_HOME/dictator/runtime.json, without a rebuild.
       '';
       example = {
         enable_osd = true;

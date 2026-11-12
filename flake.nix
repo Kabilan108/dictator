@@ -21,7 +21,13 @@
             pname = "dictator";
             version = "2.4.0";
             src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
+            cargoLock = {
+              lockFile = ./Cargo.lock;
+              # One entry covers every crate from the Rune repository. Bump it
+              # with the `rev` in Cargo.toml: set it to lib.fakeHash, build,
+              # and take the hash the error prints.
+              outputHashes."rune-0.0.1" = "sha256-7XrJm3glNR9hrp4VfBL1w93lOuCk9sT5wlCIJ5wIQm0=";
+            };
 
             DICTATOR_VERSION = version;
 
@@ -73,14 +79,6 @@
                 vulkan-loader
                 openssl
               ]);
-            nativeBuildInputs =
-              old.nativeBuildInputs
-              ++ (with pkgs; [
-                cmake
-                ninja
-                clang
-              ]);
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
             postInstall = ''
               rm -f $out/bin/dictator
               install -Dm644 assets/dictator.svg $out/share/icons/hicolor/scalable/apps/dictator.svg
@@ -112,7 +110,7 @@
                 }
             '';
             meta = old.meta // {
-              description = "Dictator GPUI desktop application";
+              description = "Dictator desktop application";
               mainProgram = "dictator-gui";
             };
           });
@@ -140,10 +138,6 @@
             libGL
             vulkan-loader
             openssl
-            cmake
-            ninja
-            clang
-            llvmPackages.libclang
           ];
           guiLibraries = with pkgs; [
             libxkbcommon
@@ -160,7 +154,6 @@
           ];
           guiEnvironment = {
             LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath guiLibraries;
-            LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
           };
           x11Packages = with pkgs; [
             xclip

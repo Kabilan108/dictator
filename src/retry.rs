@@ -34,35 +34,60 @@ struct LoadedAudio {
 /// Callers should print the text even when saving history failed, and send
 /// diagnostics to stderr so transcripts remain safe to pipe elsewhere.
 pub async fn run(audio_file: Option<PathBuf>) -> Result<RetryOutput> {
-    run_inner(audio_file, None, None, Arc::new(Mutex::new(()))).await
+    run_inner(audio_file, None, None, Arc::new(Mutex::new(())), None).await
 }
 
 /// Retries one canonical recording by ID. This is used by daemon IPC so a GUI
 /// never needs provider credentials and cannot accidentally retry a newer row.
 pub async fn run_recording(recording_id: i64) -> Result<RetryOutput> {
-    run_inner(None, Some(recording_id), None, Arc::new(Mutex::new(()))).await
+    run_inner(
+        None,
+        Some(recording_id),
+        None,
+        Arc::new(Mutex::new(())),
+        None,
+    )
+    .await
 }
 
 pub async fn run_recording_with_cancel(
     recording_id: i64,
     cancel: CancellationToken,
 ) -> Result<RetryOutput> {
-    run_recording_with_cancel_and_fence(recording_id, cancel, Arc::new(Mutex::new(()))).await
+    run_inner(
+        None,
+        Some(recording_id),
+        Some(cancel),
+        Arc::new(Mutex::new(())),
+        None,
+    )
+    .await
 }
 
+/// `provider` is the daemon's provider when the retry started.
 pub(crate) async fn run_recording_with_cancel_and_fence(
     recording_id: i64,
     cancel: CancellationToken,
     persistence_fence: Arc<Mutex<()>>,
+    provider: String,
 ) -> Result<RetryOutput> {
-    run_inner(None, Some(recording_id), Some(cancel), persistence_fence).await
+    run_inner(
+        None,
+        Some(recording_id),
+        Some(cancel),
+        persistence_fence,
+        Some(provider),
+    )
+    .await
 }
 
+/// A `None` provider reads the saved override, as the `retry` command does.
 async fn run_inner(
     audio_file: Option<PathBuf>,
     requested_recording_id: Option<i64>,
     external_cancel: Option<CancellationToken>,
     persistence_fence: Arc<Mutex<()>>,
+    provider: Option<String>,
 ) -> Result<RetryOutput> {
     // A process-held advisory lock prevents two terminals from submitting the
     // same pending recording. The OS releases it even if the process crashes.
@@ -126,16 +151,13 @@ async fn run_inner(
     let config = tokio::task::spawn_blocking(utils::get_config)
         .await
         .context("failed to join configuration reader task")??;
+    let provider_name =
+        provider.unwrap_or_else(|| crate::provider::effective_provider(&config.api));
     let provider = config
         .api
         .providers
-        .get(&config.api.active_provider)
-        .ok_or_else(|| {
-            anyhow!(
-                "active provider '{}' is not configured",
-                config.api.active_provider
-            )
-        })?;
+        .get(&provider_name)
+        .ok_or_else(|| anyhow!("provider '{provider_name}' is not configured"))?;
     let model = if provider.model.is_empty() {
         "distil-large-v3".to_owned()
     } else {
@@ -147,6 +169,7 @@ async fn run_inner(
         filename: audio_path.clone(),
         model: model.clone(),
         language: String::new(),
+        provider: provider_name,
     };
 
     let cancel = external_cancel.unwrap_or_default();
