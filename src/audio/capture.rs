@@ -482,8 +482,10 @@ fn decode_float32le(bytes: &[u8], remainder: &mut Vec<u8>) -> Vec<f32> {
     combined.extend_from_slice(bytes);
     let complete = combined.len() / 4 * 4;
     let samples = combined[..complete]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     remainder.extend_from_slice(&combined[complete..]);
     samples

@@ -57,7 +57,9 @@
               mainProgram = "dictator";
             };
 
-            buildInputs = [ ];
+            # nixpkgs links -sys crates against system libraries rather than
+            # their bundled copies; rusqlite's libsqlite3-sys needs this one.
+            buildInputs = [ pkgs.sqlite ];
             nativeBuildInputs = with pkgs; [
               pkg-config
               makeWrapper

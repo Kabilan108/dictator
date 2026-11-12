@@ -302,8 +302,10 @@ fn waveform_from_file(path: &Path, buckets: usize) -> Result<Vec<f32>> {
         file.seek(SeekFrom::Start(offset))?;
         file.read_exact(&mut buffer[..read_len])?;
         let peak = buffer[..read_len]
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]).unsigned_abs() as f32)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair).unsigned_abs() as f32)
             .fold(0.0_f32, f32::max);
         peaks.push((peak / i16::MAX as f32).clamp(0.04, 1.0));
     }
