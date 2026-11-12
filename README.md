@@ -574,13 +574,19 @@ When `enable_osd` is true, the daemon emits visual OSD events on `$XDG_RUNTIME_D
 The OSD socket emits newline-delimited JSON. A new client receives a current state snapshot immediately after connecting.
 
 ```json
-{"type":"state","value":"recording","recording_duration_ms":0}
+{"type":"state","value":"recording","recording_duration_ms":0,"provider":"openai"}
 {"type":"meter","rms":0.03,"peak":0.2}
 {"type":"state","value":"transcribing","recording_duration_ms":4820}
-{"type":"state","value":"typing"}
+{"type":"state","value":"typing","text":"Ship the overlay behind a feature flag first."}
 {"type":"state","value":"error","message":"transcription failed"}
 {"type":"state","value":"idle"}
 ```
+
+`provider` names the provider the recording will be transcribed with, chosen
+when it started. `text` is the text being pasted. Both are omitted when empty,
+as are the other optional fields, and a client should ignore fields it does
+not know. The socket is readable only by your user, which is why it may carry
+transcript text.
 
 A recording that the daemon discards as too short or silent goes from `transcribing` straight to `idle`.
 
