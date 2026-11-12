@@ -57,11 +57,13 @@ impl State {
         Some((operation, self.revision))
     }
 
-    fn transition_operation(&mut self, operation_id: u64, state: DaemonState) -> Option<u64> {
-        if !self.matches_operation(operation_id) {
-            return None;
-        }
-        self.state = state;
+    fn start_typing(&mut self, operation_id: u64, text: &str) -> Option<u64> {
+        let operation = self
+            .operation
+            .as_mut()
+            .filter(|operation| operation.id == operation_id)?;
+        operation.text = text.to_owned();
+        self.state = DaemonState::Typing;
         self.revision = self.revision.wrapping_add(1);
         Some(self.revision)
     }
@@ -94,13 +96,28 @@ impl State {
 struct Operation {
     id: u64,
     cancel: CancellationToken,
+    /// Chosen when the recording or retry started; a later switch applies to
+    /// the next one.
+    provider: String,
+    /// What the operation pastes, once it is typing.
+    text: String,
+}
+
+impl Operation {
+    fn new(id: u64, cancel: CancellationToken, provider: String) -> Self {
+        Self {
+            id,
+            cancel,
+            provider,
+            text: String::new(),
+        }
+    }
 }
 
 /// What every saved attempt of one dictation records.
 struct Dictation<'a> {
     duration: Duration,
     audio_path: &'a str,
-    /// Chosen when transcription started; a later switch does not change it.
     provider: &'a str,
 }
 
@@ -445,32 +462,28 @@ impl Daemon {
             .send_replace(NotificationUpdate { state, revision });
     }
 
+    /// The current state for a newly connected OSD client, with a recording's
+    /// live duration.
     fn osd_snapshot(&self) -> StateEvent {
-        let (state, mut recording_duration, error_message) = {
-            let st = self.state.read().unwrap();
-            (
-                st.state,
-                st.recording_duration,
-                st.last_error.clone().unwrap_or_default(),
-            )
+        let live = self.recorder.get_recording_duration();
+        let st = self.state.read().unwrap();
+        let recording_duration = if st.state == DaemonState::Recording {
+            live
+        } else {
+            st.recording_duration
         };
-
-        if state == DaemonState::Recording {
-            recording_duration = self.recorder.get_recording_duration();
-        }
-
-        osd_state_event(state, recording_duration, &error_message)
+        osd_state_event(&st, recording_duration)
     }
 
-    fn publish_osd_state(
-        &self,
-        state: DaemonState,
-        recording_duration: Option<Duration>,
-        error_message: &str,
-    ) {
-        let duration = recording_duration.unwrap_or_default();
+    /// Publishes the state as it is now. Callers hold the command lock, so it
+    /// is the state they just set.
+    fn publish_osd_state(&self) {
+        let event = {
+            let st = self.state.read().unwrap();
+            osd_state_event(&st, st.recording_duration)
+        };
         let sink = self.visual_sink.read().unwrap().clone();
-        sink.publish(osd_state_event(state, duration, error_message));
+        sink.publish(event);
     }
 
     fn start_osd(self: &Arc<Self>) {
@@ -481,7 +494,7 @@ impl Daemon {
         let snapshot_daemon = Arc::downgrade(self);
         let snapshot: visual::SnapshotFn = Arc::new(move || {
             snapshot_daemon.upgrade().map_or_else(
-                || osd_state_event(DaemonState::Idle, Duration::ZERO, ""),
+                || visual::new_state_event(StateValue::Idle, None, ""),
                 |daemon| daemon.osd_snapshot(),
             )
         });
@@ -608,7 +621,7 @@ impl Daemon {
 
         self.cancel_recording_timeout(operation_id);
         self.cancel_error_timeout(None);
-        self.publish_osd_state(DaemonState::Error, None, &error_msg);
+        self.publish_osd_state();
         self.notify_state(DaemonState::Error, revision);
 
         let daemon = Arc::downgrade(self);
@@ -633,7 +646,7 @@ impl Daemon {
                     let mut state = transition_daemon.state.write().unwrap();
                     state.reset_error(revision)?
                 };
-                transition_daemon.publish_osd_state(DaemonState::Idle, None, "");
+                transition_daemon.publish_osd_state();
                 Some(idle_revision)
             })
             .await;
@@ -781,7 +794,7 @@ impl Daemon {
                 .write()
                 .unwrap()
                 .finish_operation(operation_id)?;
-            finish_daemon.publish_osd_state(DaemonState::Idle, None, "");
+            finish_daemon.publish_osd_state();
             Some(revision)
         })
         .await;
@@ -831,7 +844,7 @@ impl Daemon {
                 .write()
                 .unwrap()
                 .finish_operation(operation_id)?;
-            daemon.publish_osd_state(DaemonState::Idle, None, "");
+            daemon.publish_osd_state();
             Some(revision)
         })
         .await;
@@ -840,10 +853,21 @@ impl Daemon {
         }
     }
 
-    fn persist_capture_failure(&self, duration: Duration, error_message: &str) {
+    /// The current operation's provider, or the active one between operations.
+    fn operation_provider(&self) -> String {
+        let provider = self
+            .state
+            .read()
+            .unwrap()
+            .operation
+            .as_ref()
+            .map(|operation| operation.provider.clone());
+        provider.unwrap_or_else(|| self.providers.active())
+    }
+
+    fn persist_capture_failure(&self, provider: &str, duration: Duration, error_message: &str) {
         let duration_ms = i64::try_from(duration.as_millis()).unwrap_or(i64::MAX);
-        let provider = self.providers.active();
-        let model = self.providers.model(&provider);
+        let model = self.providers.model(provider);
         let saved = self
             .db
             .lock()
@@ -872,7 +896,7 @@ impl Daemon {
             if task_cancel.is_cancelled() || !daemon.state_matches_operation(operation_id) {
                 return false;
             }
-            daemon.persist_capture_failure(duration, &error_message);
+            daemon.persist_capture_failure(&daemon.operation_provider(), duration, &error_message);
             true
         })
         .await;
@@ -980,14 +1004,15 @@ impl Daemon {
             return Ok(());
         }
         let transition_daemon = Arc::clone(self);
+        let typed = text.to_owned();
         let revision = tokio::task::spawn_blocking(move || {
             let _command = transition_daemon.command_lock.lock().unwrap();
             let revision = transition_daemon
                 .state
                 .write()
                 .unwrap()
-                .transition_operation(operation_id, DaemonState::Typing)?;
-            transition_daemon.publish_osd_state(DaemonState::Typing, None, "");
+                .start_typing(operation_id, &typed)?;
+            transition_daemon.publish_osd_state();
             Some(revision)
         })
         .await
@@ -1080,9 +1105,10 @@ impl Daemon {
 
         debug!("starting recording");
         self.reset_audio_level();
+        let provider = self.providers.active();
         if let Err(err) = self.recorder.start(received_at) {
             error!(err = %err, "failed to start recording");
-            self.persist_capture_failure(Duration::ZERO, &format!("{err:#}"));
+            self.persist_capture_failure(&provider, Duration::ZERO, &format!("{err:#}"));
             self.handle_error_locked(None, format!("{}: {err:#}", ipc::ERR_RECORDING_FAILED));
             bail!("{}: {err:#}", ipc::ERR_RECORDING_FAILED);
         }
@@ -1093,10 +1119,7 @@ impl Daemon {
             let mut state = self.state.write().unwrap();
             state.next_operation_id = state.next_operation_id.wrapping_add(1).max(1);
             let operation_id = state.next_operation_id;
-            state.operation = Some(Operation {
-                id: operation_id,
-                cancel: cancel.clone(),
-            });
+            state.operation = Some(Operation::new(operation_id, cancel.clone(), provider));
             state.state = DaemonState::Recording;
             state.last_error = None;
             state.recording_duration = Duration::ZERO;
@@ -1104,7 +1127,7 @@ impl Daemon {
             (operation_id, state.revision)
         };
 
-        self.publish_osd_state(DaemonState::Recording, Some(Duration::ZERO), "");
+        self.publish_osd_state();
         self.notify_state(DaemonState::Recording, revision);
         self.start_recording_timeout(operation_id);
         info!(operation_id, "recording started");
@@ -1149,25 +1172,22 @@ impl Daemon {
         self.recovered_retry_text.lock().unwrap().take();
         let cancel = self.shutdown_cancel.child_token();
         let retry_cancel = cancel.clone();
+        let provider = self.providers.active();
         let (operation_id, revision) = {
             let mut state = self.state.write().unwrap();
             state.next_operation_id = state.next_operation_id.wrapping_add(1).max(1);
             let operation_id = state.next_operation_id;
-            state.operation = Some(Operation {
-                id: operation_id,
-                cancel,
-            });
+            state.operation = Some(Operation::new(operation_id, cancel, provider.clone()));
             state.state = DaemonState::Transcribing;
             state.last_error = None;
             state.recording_duration = Duration::ZERO;
             state.revision = state.revision.wrapping_add(1);
             (operation_id, state.revision)
         };
-        self.publish_osd_state(DaemonState::Transcribing, None, "");
+        self.publish_osd_state();
         self.notify_state(DaemonState::Transcribing, revision);
         let daemon = Arc::clone(self);
         let persistence_fence = Arc::clone(&self.retry_persistence_fence);
-        let provider = self.providers.active();
         let task = self.runtime.spawn(async move {
             let result = crate::retry::run_recording_with_cancel_and_fence(
                 recording_id,
@@ -1199,6 +1219,7 @@ impl Daemon {
                             .write()
                             .unwrap()
                             .finish_operation(operation_id)?;
+                        finish_daemon.publish_osd_state();
                         Some(revision)
                     })
                     .await;
@@ -1243,22 +1264,26 @@ impl Daemon {
         }
 
         let recording_duration = self.recorder.duration_until(stopped_at);
-        let (operation_id, cancel, revision) = {
+        let (operation, revision) = {
             let mut state = self.state.write().unwrap();
-            let Some((operation, revision)) =
-                state.claim_recording(expected_operation_id, recording_duration)
+            let Some(claimed) = state.claim_recording(expected_operation_id, recording_duration)
             else {
                 bail!("{}", ipc::ERR_NOT_RECORDING);
             };
-            (operation.id, operation.cancel, revision)
+            claimed
         };
+        let Operation {
+            id: operation_id,
+            cancel,
+            provider,
+            ..
+        } = operation;
 
         self.cancel_recording_timeout(Some(operation_id));
-        self.publish_osd_state(DaemonState::Transcribing, Some(recording_duration), "");
+        self.publish_osd_state();
         self.notify_state(DaemonState::Transcribing, revision);
 
         let daemon = Arc::clone(self);
-        let provider = self.providers.active();
         let task = self.runtime.spawn(async move {
             daemon
                 .transcribe_and_type(
@@ -1319,7 +1344,7 @@ impl Daemon {
             error!(err = %err, "failed to stop recording during cancel");
         }
 
-        self.publish_osd_state(DaemonState::Idle, None, "");
+        self.publish_osd_state();
         self.notify_state(DaemonState::Idle, revision);
         info!(operation_id, "operation canceled");
         Ok(())
@@ -1376,6 +1401,7 @@ impl Daemon {
                                 return;
                             }
                             daemon.persist_capture_failure(
+                                &daemon.operation_provider(),
                                 daemon.recorder.get_recording_duration(),
                                 &recorder_error,
                             );
@@ -1539,23 +1565,22 @@ pub fn public_osd_error_message(error_message: &str) -> &'static str {
     }
 }
 
-fn osd_state_event(
-    state: DaemonState,
-    recording_duration: Duration,
-    error_message: &str,
-) -> StateEvent {
-    match state {
+fn osd_state_event(st: &State, recording_duration: Duration) -> StateEvent {
+    let operation = st.operation.as_ref();
+    match st.state {
         DaemonState::Recording => {
             visual::new_state_event(StateValue::Recording, Some(recording_duration), "")
+                .with_provider(operation.map_or("", |operation| &operation.provider))
         }
         DaemonState::Transcribing => {
             visual::new_state_event(StateValue::Transcribing, Some(recording_duration), "")
         }
-        DaemonState::Typing => visual::new_state_event(StateValue::Typing, None, ""),
+        DaemonState::Typing => visual::new_state_event(StateValue::Typing, None, "")
+            .with_text(operation.map_or("", |operation| &operation.text)),
         DaemonState::Error => visual::new_state_event(
             StateValue::Error,
             None,
-            public_osd_error_message(error_message),
+            public_osd_error_message(st.last_error.as_deref().unwrap_or_default()),
         ),
         DaemonState::Idle => visual::new_state_event(StateValue::Idle, None, ""),
     }
@@ -1687,10 +1712,11 @@ mod tests {
             state,
             last_error: None,
             recording_duration: Duration::from_secs(9),
-            operation: Some(Operation {
-                id: operation_id,
-                cancel: CancellationToken::new(),
-            }),
+            operation: Some(Operation::new(
+                operation_id,
+                CancellationToken::new(),
+                String::new(),
+            )),
             next_operation_id: operation_id,
             revision: 3,
         }
@@ -1713,7 +1739,11 @@ mod tests {
         assert_eq!(handler.get_active_provider().as_deref(), Some("local"));
         assert!(dir.path().join("runtime.json").exists());
 
-        daemon.persist_capture_failure(Duration::from_secs(1), "no input");
+        daemon.persist_capture_failure(
+            &daemon.providers.active(),
+            Duration::from_secs(1),
+            "no input",
+        );
         let recording_id = daemon.get_last_recording().unwrap().0;
         let detail = daemon
             .db
@@ -1759,7 +1789,7 @@ mod tests {
     fn stale_pipeline_cannot_mutate_new_operation() {
         let mut state = state_with_operation(2, DaemonState::Recording);
 
-        assert_eq!(state.transition_operation(1, DaemonState::Typing), None);
+        assert_eq!(state.start_typing(1, "stale"), None);
         assert_eq!(state.finish_operation(1), None);
         assert!(!state.matches_operation(1));
 
@@ -1936,10 +1966,7 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Transcribing;
-            state.operation = Some(Operation {
-                id: 41,
-                cancel: cancel.clone(),
-            });
+            state.operation = Some(Operation::new(41, cancel.clone(), String::new()));
             state.next_operation_id = 41;
         }
         cancel.cancel();
@@ -1986,10 +2013,7 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Transcribing;
-            state.operation = Some(Operation {
-                id: 42,
-                cancel: cancel.clone(),
-            });
+            state.operation = Some(Operation::new(42, cancel.clone(), String::new()));
             state.next_operation_id = 42;
         }
         let persist_daemon = Arc::clone(&daemon);
@@ -2068,6 +2092,141 @@ mod tests {
         daemon.shutdown().await.unwrap();
     }
 
+    #[test]
+    fn osd_events_carry_the_operation_provider_and_typed_text() {
+        let mut state = state_with_operation(5, DaemonState::Recording);
+        state.operation.as_mut().unwrap().provider = "local".into();
+        let recording = osd_state_event(&state, Duration::from_millis(1200));
+        assert_eq!(recording.provider, "local");
+        assert_eq!(recording.recording_duration_ms, Some(1200));
+
+        state
+            .claim_recording(Some(5), Duration::from_secs(2))
+            .unwrap();
+        let transcribing = osd_state_event(&state, state.recording_duration);
+        assert_eq!(
+            (transcribing.provider.as_str(), transcribing.text.as_str()),
+            ("", "")
+        );
+
+        state.start_typing(5, "Ship it.").unwrap();
+        let typing = osd_state_event(&state, state.recording_duration);
+        assert_eq!(typing.value, StateValue::Typing);
+        assert_eq!(
+            (typing.provider.as_str(), typing.text.as_str()),
+            ("", "Ship it.")
+        );
+
+        state.finish_operation(5).unwrap();
+        let idle = osd_state_event(&state, state.recording_duration);
+        assert_eq!(idle, visual::new_state_event(StateValue::Idle, None, ""));
+    }
+
+    #[tokio::test]
+    async fn osd_snapshot_and_published_states_carry_provider_and_text() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::AsyncBufReadExt;
+
+        let (daemon, dir) = daemon_fixture();
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Recording;
+            state.operation = Some(Operation::new(
+                5,
+                daemon.shutdown_cancel.child_token(),
+                "local".into(),
+            ));
+        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let snapshot_daemon = Arc::downgrade(&daemon);
+        let snapshot: visual::SnapshotFn =
+            Arc::new(move || snapshot_daemon.upgrade().unwrap().osd_snapshot());
+        let sink =
+            SocketSink::with_path(Some(snapshot), dir.path().join("private/osd.sock")).unwrap();
+        let stream = tokio::net::UnixStream::connect(sink.socket_path())
+            .await
+            .unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut next_state = async || {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(1), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            match serde_json::from_str(&line).unwrap() {
+                visual::Event::State(state) => state,
+                other => panic!("expected a state, got {other:?}"),
+            }
+        };
+
+        let snapshot = next_state().await;
+        assert_eq!(snapshot.value, StateValue::Recording);
+        assert_eq!(snapshot.provider, "local");
+
+        *daemon.visual_sink.write().unwrap() = Sink::Socket(sink);
+        daemon
+            .state
+            .write()
+            .unwrap()
+            .start_typing(5, "Ship it.")
+            .unwrap();
+        daemon.publish_osd_state();
+        let typing = next_state().await;
+        assert_eq!(
+            (typing.value, typing.text.as_str()),
+            (StateValue::Typing, "Ship it.")
+        );
+
+        daemon.state.write().unwrap().finish_operation(5).unwrap();
+        daemon.publish_osd_state();
+        assert_eq!(next_state().await.text, "");
+        daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_recording_is_transcribed_with_the_provider_it_started_with() {
+        let (daemon, _dir) = daemon_fixture();
+        assert_eq!(daemon.providers.active(), "openai");
+        {
+            let mut state = daemon.state.write().unwrap();
+            state.state = DaemonState::Recording;
+            state.operation = Some(Operation::new(
+                3,
+                daemon.shutdown_cancel.child_token(),
+                "local".into(),
+            ));
+            state.next_operation_id = 3;
+        }
+
+        let stop_daemon = Arc::clone(&daemon);
+        tokio::task::spawn_blocking(move || {
+            let _command = stop_daemon.command_lock.lock().unwrap();
+            stop_daemon.stop_recording_locked(Some(3), Instant::now())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let pipeline = daemon.pipeline.lock().unwrap().take().unwrap();
+        pipeline.task.await.unwrap();
+
+        let recording_id = daemon.get_last_recording().unwrap().0;
+        let detail = daemon
+            .db
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get_recording(recording_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            detail.attempts[0].model.as_deref(),
+            Some("local-model"),
+            "the recording's failure is recorded against the provider it started with"
+        );
+        daemon.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn canceled_pipeline_cannot_mutate_replacement_operation() {
         let (daemon, _dir) = daemon_fixture();
@@ -2075,10 +2234,7 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Transcribing;
-            state.operation = Some(Operation {
-                id: 1,
-                cancel: operation_a.clone(),
-            });
+            state.operation = Some(Operation::new(1, operation_a.clone(), String::new()));
             state.next_operation_id = 1;
             state.revision = 1;
         }
@@ -2107,10 +2263,11 @@ mod tests {
             let mut state = daemon.state.write().unwrap();
             state.operation.as_ref().unwrap().cancel.cancel();
             state.state = DaemonState::Recording;
-            state.operation = Some(Operation {
-                id: 2,
-                cancel: daemon.shutdown_cancel.child_token(),
-            });
+            state.operation = Some(Operation::new(
+                2,
+                daemon.shutdown_cancel.child_token(),
+                String::new(),
+            ));
             state.next_operation_id = 2;
             state.recording_duration = Duration::from_secs(17);
             state.revision = 2;
@@ -2131,10 +2288,7 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Transcribing;
-            state.operation = Some(Operation {
-                id: 4,
-                cancel: operation.clone(),
-            });
+            state.operation = Some(Operation::new(4, operation.clone(), String::new()));
             state.next_operation_id = 4;
             state.revision = 1;
         }
@@ -2217,10 +2371,11 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Recording;
-            state.operation = Some(Operation {
-                id: 7,
-                cancel: daemon.shutdown_cancel.child_token(),
-            });
+            state.operation = Some(Operation::new(
+                7,
+                daemon.shutdown_cancel.child_token(),
+                String::new(),
+            ));
             state.next_operation_id = 7;
             state.revision = 1;
         }
@@ -2276,10 +2431,7 @@ mod tests {
         {
             let mut state = daemon.state.write().unwrap();
             state.state = DaemonState::Transcribing;
-            state.operation = Some(Operation {
-                id: 1,
-                cancel: operation.clone(),
-            });
+            state.operation = Some(Operation::new(1, operation.clone(), String::new()));
         }
 
         daemon.shutdown_cancel.cancel();

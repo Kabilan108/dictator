@@ -40,7 +40,7 @@ async fn socket_sink_sends_snapshot_and_events() {
 
     let duration = Duration::from_millis(1234);
     let sink = SocketSink::new(Some(Arc::new(move || {
-        new_state_event(StateValue::Recording, Some(duration), "")
+        new_state_event(StateValue::Recording, Some(duration), "").with_provider("openai")
     })))
     .unwrap();
 
@@ -55,6 +55,7 @@ async fn socket_sink_sends_snapshot_and_events() {
         Event::State(state) => {
             assert_eq!(state.value, StateValue::Recording);
             assert_eq!(state.recording_duration_ms, Some(1234));
+            assert_eq!(state.provider, "openai");
         }
         other => panic!("expected state snapshot, got {other:?}"),
     }
@@ -72,6 +73,19 @@ async fn socket_sink_sends_snapshot_and_events() {
         }
         other => panic!("expected meter event, got {other:?}"),
     }
+
+    sink.publish(
+        new_state_event(StateValue::Typing, None, "")
+            .with_text("Ship it.")
+            .into(),
+    );
+    let line = read_line(&mut reader, Duration::from_secs(1))
+        .await
+        .expect("typing line");
+    assert_eq!(
+        line.trim_end(),
+        r#"{"type":"state","value":"typing","text":"Ship it."}"#
+    );
 
     sink.close().await.unwrap();
     assert!(!default_socket_path().exists());
