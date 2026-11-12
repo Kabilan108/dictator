@@ -37,6 +37,8 @@ const BLOOM_ROOM: f32 = 6.0;
 /// The widest a transcript or error line runs before it wraps.
 const LINE_MAX: f32 = 340.0;
 const LINE_H: f32 = 18.0;
+/// The transcript and error lines the tall states show before an ellipsis.
+const MAX_LINES: usize = 2;
 const TALL_PAD_Y: f32 = 12.0;
 
 fn time_style(p: Paint) -> TextStyle {
@@ -100,6 +102,7 @@ pub(super) fn fit(content: &Content, p: Paint, elapsed_ms: i64) -> Fit {
         }
         | Content::Failed { message: line } => {
             let (width, height) = measure(line, line_style(p), Some(LINE_MAX));
+            let height = height.min(LINE_H * MAX_LINES as f32);
             Fit {
                 size: (
                     (PAD * 2.0 + BADGE + GAP + width).ceil(),
@@ -374,7 +377,7 @@ fn tall(p: Paint, key: &str, badge: El, line: &str) -> El {
             text(line)
                 .font(line_style(p))
                 .color(p.strong())
-                .max_lines(2)
+                .max_lines(MAX_LINES)
                 .w(width),
         )
 }
@@ -518,6 +521,35 @@ mod tests {
             [(0, "0:00"), (7_900, "0:07"), (61_000, "1:01"), (-5, "0:00")]
         {
             assert_eq!(clock(milliseconds), expected);
+        }
+    }
+
+    #[test]
+    fn a_long_transcript_fits_the_surface_at_two_lines() {
+        let p = Paint::new(true, 1.0);
+        let paragraph =
+            "Okay, so the plan for tomorrow is to finish the provider switcher. ".repeat(12);
+        let short = fit(
+            &Content::Failed {
+                message: "Transcription failed".into(),
+            },
+            p,
+            0,
+        )
+        .size
+        .1;
+        for content in [
+            Content::Pasted {
+                transcript: Some(paragraph.clone()),
+            },
+            Content::Failed {
+                message: paragraph.clone(),
+            },
+        ] {
+            let (_, height) = fit(&content, p, 0).size;
+            assert!(height > short, "two lines should be taller than one");
+            assert!(height <= (LINE_H * MAX_LINES as f32 + TALL_PAD_Y * 2.0).ceil());
+            assert!(height <= SURFACE.1);
         }
     }
 }
