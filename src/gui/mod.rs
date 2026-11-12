@@ -627,6 +627,9 @@ impl Ui {
             if state != DaemonState::Recording {
                 self.level_history.clear();
             }
+            if state == DaemonState::Error {
+                self.check_connection();
+            }
             changed = true;
         }
         if update.state_changed {
@@ -759,6 +762,8 @@ impl Ui {
                         if status.state != DaemonState::Recording {
                             self.level_history.clear();
                         }
+                        // The feed may have reported the error first and
+                        // started the check already.
                         let failed_now = status.state == DaemonState::Error
                             && self.state() != Some(DaemonState::Error);
                         if failed_now {
