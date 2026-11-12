@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub use crate::provider::ProviderSummary;
+pub use crate::provider::{CheckOutcome, ProviderCheck, ProviderSummary};
 
 /// Request from cli to daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,7 +14,7 @@ pub struct Command {
     /// unique identifier for request correlation
     pub id: String,
     /// command action: start, stop, toggle, cancel, status, retry, mic,
-    /// providers, use_provider
+    /// providers, use_provider, check_provider
     pub action: String,
     /// optional command arguments
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -89,6 +89,10 @@ pub const ACTION_PROVIDERS: &str = "providers";
 /// Takes one argument, a provider name, and makes it the provider for the
 /// next transcription. Replies like [`ACTION_PROVIDERS`].
 pub const ACTION_USE_PROVIDER: &str = "use_provider";
+/// Takes an optional provider name (the active one by default) and sends it
+/// an authenticated request with no audio. Replies with
+/// [`DATA_KEY_PROVIDER_CHECK`].
+pub const ACTION_CHECK_PROVIDER: &str = "check_provider";
 
 pub const MIC_RELEASE: &str = "release";
 pub const MIC_RESUME: &str = "resume";
@@ -137,6 +141,8 @@ pub const DATA_KEY_MICROPHONE: &str = "microphone";
 pub const DATA_KEY_PROVIDER: &str = "provider";
 /// A JSON array of [`ProviderSummary`] values.
 pub const DATA_KEY_PROVIDERS: &str = "providers";
+/// A JSON [`ProviderCheck`].
+pub const DATA_KEY_PROVIDER_CHECK: &str = "provider_check";
 
 // Error messages
 pub const ERR_INVALID_COMMAND: &str = "invalid command";
@@ -157,4 +163,16 @@ pub fn decode_providers(response: &Response) -> Result<Vec<ProviderSummary>> {
         .get(DATA_KEY_PROVIDERS)
         .ok_or_else(|| anyhow!("daemon reply has no provider list"))?;
     serde_json::from_str(encoded).context("daemon sent an invalid provider list")
+}
+
+/// Reads the result from a [`ACTION_CHECK_PROVIDER`] reply.
+pub fn decode_provider_check(response: &Response) -> Result<ProviderCheck> {
+    if !response.success {
+        bail!("{}", response.error);
+    }
+    let encoded = response
+        .data
+        .get(DATA_KEY_PROVIDER_CHECK)
+        .ok_or_else(|| anyhow!("daemon reply has no provider check"))?;
+    serde_json::from_str(encoded).context("daemon sent an invalid provider check")
 }

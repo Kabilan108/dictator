@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::glossary::{self, Vocabulary};
+use crate::provider::{CheckOutcome, ProviderCheck, classify_check};
 use crate::utils::ApiConfig;
 
 pub const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -163,6 +164,84 @@ impl WhisperClient {
         );
         Ok(parsed)
     }
+
+    /// Sends `provider_name` an authenticated request with no audio, so a
+    /// refused key or a dead endpoint shows before a recording is lost to it.
+    pub async fn check(&self, provider_name: &str) -> ProviderCheck {
+        let mut check = ProviderCheck {
+            provider: provider_name.to_string(),
+            host: String::new(),
+            outcome: CheckOutcome::Unusable,
+            status: None,
+            latency_ms: 0,
+            message: String::new(),
+        };
+        let Some(provider) = self.config.providers.get(provider_name) else {
+            check.message = format!("provider '{provider_name}' is not configured");
+            return check;
+        };
+        let url = normalize_endpoint(&provider.endpoint);
+        check.host = reqwest::Url::parse(&url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        if let Some(problem) = crate::provider::provider_problem(provider) {
+            check.message = problem;
+            return check;
+        }
+        let model = if provider.model.is_empty() {
+            "distil-large-v3"
+        } else {
+            provider.model.as_str()
+        };
+        let started = std::time::Instant::now();
+        let sent = self
+            .http
+            .post(&url)
+            .bearer_auth(&provider.key)
+            .multipart(Form::new().text("model", model.to_string()))
+            .timeout(CHECK_TIMEOUT)
+            .send()
+            .await;
+        let response = match sent {
+            Ok(response) => response,
+            Err(err) => {
+                check.latency_ms = started.elapsed().as_millis() as u64;
+                check.outcome = CheckOutcome::Unreachable;
+                check.message = describe_request_error(&err);
+                return check;
+            }
+        };
+        let status = response.status().as_u16();
+        let body = read_response(&CancellationToken::new(), response, MAX_ERROR_BYTES)
+            .await
+            .unwrap_or_default();
+        check.latency_ms = started.elapsed().as_millis() as u64;
+        check.status = Some(status);
+        (check.outcome, check.message) = classify_check(status, &body);
+        debug!(provider = provider_name, status, outcome = ?check.outcome, "provider check");
+        check
+    }
+}
+
+const CHECK_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// A short reason a request got no answer: what failed and the root cause.
+pub fn describe_request_error(error: &reqwest::Error) -> String {
+    let kind = if error.is_timeout() {
+        "timed out"
+    } else if error.is_connect() {
+        "connection failed"
+    } else if error.is_builder() {
+        "invalid endpoint"
+    } else {
+        "request failed"
+    };
+    let mut source: &dyn std::error::Error = error;
+    while let Some(next) = source.source() {
+        source = next;
+    }
+    format!("{kind}: {source}")
 }
 
 /// Only a request that never reached the provider is safe to send again. After
@@ -351,6 +430,51 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert_eq!(error, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn check_sends_no_audio_and_reports_a_refused_key() {
+        let body = br#"{"detail":"Invalid token."}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut client, _, server) =
+            mock_provider([response.as_bytes(), body].concat(), false).await;
+        let check = client.check("openai").await;
+        assert_eq!(check.outcome, CheckOutcome::KeyRejected);
+        assert_eq!(check.status, Some(401));
+        assert_eq!(check.message, "Invalid token.");
+        assert_eq!(check.host, "127.0.0.1");
+        let multipart = String::from_utf8(server.await.unwrap()).unwrap();
+        assert!(multipart.contains("name=\"model\""));
+        assert!(!multipart.contains("filename="));
+
+        client.config.providers.insert(
+            "keyless".into(),
+            crate::utils::Provider {
+                endpoint: "http://127.0.0.1:1".into(),
+                key: "${env:DICTATOR_TEST_UNSET_KEY}".into(),
+                ..Default::default()
+            },
+        );
+        client.config.providers.insert(
+            "down".into(),
+            crate::utils::Provider {
+                endpoint: "http://127.0.0.1:1".into(),
+                key: "k".into(),
+                ..Default::default()
+            },
+        );
+        for (provider, outcome) in [
+            ("keyless", CheckOutcome::Unusable),
+            ("gone", CheckOutcome::Unusable),
+            ("down", CheckOutcome::Unreachable),
+        ] {
+            let check = client.check(provider).await;
+            assert_eq!(check.outcome, outcome, "{provider}");
+            assert!(!check.message.is_empty(), "{provider}");
         }
     }
 

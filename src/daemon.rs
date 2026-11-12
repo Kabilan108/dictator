@@ -13,7 +13,7 @@ use crate::audio::{
 };
 use crate::ipc::{self, CommandHandler, DaemonState, Server, StatusData};
 use crate::notifier::Notifier;
-use crate::provider::{self, ProviderSelector, ProviderSummary};
+use crate::provider::{self, ProviderCheck, ProviderSelector, ProviderSummary};
 use crate::storage::Db;
 use crate::typing::Typer;
 use crate::utils::{Config, NotificationMode, get_path_to_recording};
@@ -1474,6 +1474,11 @@ impl CommandHandler for Arc<Daemon> {
 
     fn get_active_provider(&self) -> Option<String> {
         Some(self.providers.active())
+    }
+
+    fn check_provider(&self, name: Option<&str>) -> Result<ProviderCheck> {
+        let name = name.map_or_else(|| self.providers.active(), str::to_string);
+        Ok(self.runtime.block_on(self.transcriber.check(&name)))
     }
 
     fn handle_cancel(&self) -> Result<()> {

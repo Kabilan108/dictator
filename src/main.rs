@@ -148,6 +148,9 @@ enum ProviderAction {
     List,
     /// switch the daemon to a configured provider
     Use { name: String },
+    /// send a provider (the active one by default) a request with its key
+    /// and no audio, to see whether the key and endpoint work
+    Check { name: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +238,7 @@ async fn run_provider(action: Option<ProviderAction>) {
     let (args, verb) = match action.unwrap_or(ProviderAction::List) {
         ProviderAction::List => (None, "provider list"),
         ProviderAction::Use { name } => (Some(name), "provider use"),
+        ProviderAction::Check { name } => return run_provider_check(name.as_deref()).await,
     };
     let action = if args.is_some() {
         ipc::ACTION_USE_PROVIDER
@@ -266,6 +270,39 @@ async fn run_provider(action: Option<ProviderAction>) {
         Some(active) => println!("using {} for the next transcription", active.name),
         None => println!("provider updated"),
     }
+}
+
+async fn run_provider_check(name: Option<&str>) {
+    let check = match Client::new().check_provider(name).await {
+        Ok(check) => check,
+        Err(err) => {
+            eprintln!("provider check failed: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    println!("{}", format_provider_check(&check));
+    if check.outcome != ipc::CheckOutcome::Ready {
+        std::process::exit(1);
+    }
+}
+
+fn format_provider_check(check: &ipc::ProviderCheck) -> String {
+    let verdict = match check.outcome {
+        ipc::CheckOutcome::Ready => "ready",
+        ipc::CheckOutcome::KeyRejected => "key rejected",
+        ipc::CheckOutcome::Unreachable => "unreachable",
+        ipc::CheckOutcome::Failed => "error",
+        ipc::CheckOutcome::Unusable => "not usable",
+        ipc::CheckOutcome::Reachable => "reachable",
+    };
+    let mut line = format!("{}: {verdict}", check.provider);
+    if let Some(status) = check.status {
+        line.push_str(&format!(" (HTTP {status}, {} ms)", check.latency_ms));
+    }
+    if !check.message.is_empty() {
+        line.push_str(&format!(": {}", check.message));
+    }
+    line
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -59,6 +59,109 @@ pub struct ProviderSummary {
     pub send_vocabulary: bool,
 }
 
+/// What a provider check found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckOutcome {
+    /// The provider accepted an authenticated request.
+    Ready,
+    /// The provider refused the key (HTTP 401 or 403).
+    KeyRejected,
+    /// Nothing answered at the endpoint.
+    Unreachable,
+    /// The provider answered with an error other than a refused key.
+    Failed,
+    /// The provider is not configured well enough to try.
+    Unusable,
+    /// The endpoint answered a request sent without the key, so only
+    /// reachability is known. The desktop app reports this when the daemon
+    /// is down or predates provider checks.
+    Reachable,
+}
+
+/// The result of sending a provider an authenticated request with no audio,
+/// which a working provider rejects as incomplete without transcribing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderCheck {
+    pub provider: String,
+    pub host: String,
+    pub outcome: CheckOutcome,
+    /// The HTTP status, when the provider answered.
+    #[serde(default)]
+    pub status: Option<u16>,
+    pub latency_ms: u64,
+    /// The provider's own explanation, or why no answer came. Never the key.
+    #[serde(default)]
+    pub message: String,
+}
+
+/// Sorts a provider's answer to a check request. A request with no audio is
+/// expected to fail validation (400 or 422) once the key is accepted.
+pub fn classify_check(status: u16, body: &[u8]) -> (CheckOutcome, String) {
+    let message = provider_message(body);
+    match status {
+        200..=299 | 400 | 415 | 422 => (CheckOutcome::Ready, String::new()),
+        401 | 403 => (CheckOutcome::KeyRejected, message),
+        404 | 405 => (
+            CheckOutcome::Failed,
+            if message.is_empty() {
+                "the endpoint does not accept transcription requests".to_string()
+            } else {
+                message
+            },
+        ),
+        _ => (CheckOutcome::Failed, message),
+    }
+}
+
+/// The readable part of a provider's error body: OpenAI's `error.message`,
+/// FastAPI's `detail`, or the trimmed text. Masked key runs (`sk-****abcd`)
+/// are shortened so the message stays readable.
+pub fn provider_message(body: &[u8]) -> String {
+    const LIMIT: usize = 400;
+    let text = String::from_utf8_lossy(body);
+    let parsed = serde_json::from_str::<Value>(text.trim()).ok();
+    let found = parsed.as_ref().and_then(|value| {
+        let error = value.get("error");
+        error
+            .and_then(|error| error.get("message"))
+            .or(error.filter(|error| error.is_string()))
+            .or_else(|| value.get("detail").filter(|detail| detail.is_string()))
+            .or_else(|| value.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    });
+    let message = found.unwrap_or_else(|| text.into_owned());
+    let message = collapse_masks(&message.split_whitespace().collect::<Vec<_>>().join(" "));
+    match message.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}…", &message[..cut]),
+        None => message,
+    }
+}
+
+/// Replaces each run of four or more `*` with an ellipsis, as a provider
+/// masks a key it quotes back.
+pub fn collapse_masks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut stars = 0;
+    for ch in text.chars().chain(std::iter::once('\0')) {
+        if ch == '*' {
+            stars += 1;
+            continue;
+        }
+        match stars {
+            0 => {}
+            1..=3 => out.extend(std::iter::repeat_n('*', stars)),
+            _ => out.push('…'),
+        }
+        stars = 0;
+        if ch != '\0' {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Why `provider` cannot transcribe, or `None` when it can.
 pub fn provider_problem(provider: &Provider) -> Option<String> {
     if provider.endpoint.trim().is_empty() {
@@ -339,6 +442,71 @@ mod tests {
             timeout: 60,
             providers,
         }
+    }
+
+    #[test]
+    fn check_answers_are_sorted_by_status() {
+        let openai = br#"{"error":{"message":"Incorrect API key provided: sk-proj-********************abcd. You can find your API key at https://platform.openai.com/account/api-keys.","type":"invalid_request_error","code":"invalid_api_key","param":null},"status":401}"#;
+        let cases: [(u16, &[u8], CheckOutcome, &str); 7] = [
+            (
+                400,
+                br#"{"error":{"message":"you must provide a file"}}"#,
+                CheckOutcome::Ready,
+                "",
+            ),
+            (
+                422,
+                br#"{"detail":[{"msg":"field required"}]}"#,
+                CheckOutcome::Ready,
+                "",
+            ),
+            (
+                401,
+                openai,
+                CheckOutcome::KeyRejected,
+                "Incorrect API key provided: sk-proj-…abcd. You can find your API key at https://platform.openai.com/account/api-keys.",
+            ),
+            (
+                401,
+                br#"{"detail":"Invalid token."}"#,
+                CheckOutcome::KeyRejected,
+                "Invalid token.",
+            ),
+            (
+                404,
+                b"",
+                CheckOutcome::Failed,
+                "the endpoint does not accept transcription requests",
+            ),
+            (
+                429,
+                br#"{"error":{"message":"You exceeded your current quota"}}"#,
+                CheckOutcome::Failed,
+                "You exceeded your current quota",
+            ),
+            (
+                502,
+                b"<html>\n  Bad   gateway </html>",
+                CheckOutcome::Failed,
+                "<html> Bad gateway </html>",
+            ),
+        ];
+        for (status, body, outcome, message) in cases {
+            assert_eq!(
+                classify_check(status, body),
+                (outcome, message.to_string()),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_message_keeps_short_star_runs_and_caps_length() {
+        assert_eq!(provider_message(b"a ** b *** c"), "a ** b *** c");
+        let long = "x".repeat(500);
+        let message = provider_message(long.as_bytes());
+        assert_eq!(message.chars().count(), 401);
+        assert!(message.ends_with('…'));
     }
 
     #[test]

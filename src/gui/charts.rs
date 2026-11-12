@@ -13,7 +13,7 @@ use super::{LEVEL_HISTORY, Ui, logic};
 
 const METER_PITCH: f32 = 6.0;
 const METER_BAR: f32 = 3.0;
-pub(super) const METER_HEIGHT: f32 = 92.0;
+pub(super) const METER_HEIGHT: f32 = 80.0;
 pub(super) const METER_WIDTH: f32 = LEVEL_HISTORY as f32 * METER_PITCH;
 
 /// A plausible speech envelope for `--demo`, where no daemon feeds levels.
@@ -35,27 +35,8 @@ pub(super) fn demo_waveform(seed: i64, buckets: usize) -> Vec<f32> {
         .collect()
 }
 
-/// The app's mark: three bars in a rounded tile that takes the state's tone.
-pub(super) fn brand_mark(p: Paint, state: Option<DaemonState>) -> El {
-    let (tile, ink) = match state {
-        Some(DaemonState::Recording) => (p.k.c.danger.fg, p.k.c.white),
-        _ => (p.k.c.bg_contrast, p.k.c.text_contrast),
-    };
-    let mut shape = Shape::new();
-    for (index, half) in [3.0_f32, 6.0, 4.0].into_iter().enumerate() {
-        let x = 6.5 + index as f32 * 4.5;
-        shape = shape.line([x, 11.0 - half], [x, 11.0 + half], 2.0, LineCap::Round, ink);
-    }
-    canvas(shape)
-        .key("mark")
-        .size(22.0, 22.0)
-        .radius(6.0)
-        .fill(tile)
-        .a11y_hidden()
-}
-
-/// The live input level as a mirrored strip of bars, newest on the right.
-/// Idle, it rests as a row of dots.
+/// The live input level as a mirrored strip of bars, newest on the right,
+/// stretched across its container. Idle, it rests as a row of dots.
 pub(super) fn level_meter(
     p: Paint,
     state: Option<DaemonState>,
@@ -98,9 +79,10 @@ pub(super) fn level_meter(
             color,
         );
     }
-    canvas(shape)
+    canvas(shape.view_box(METER_WIDTH, METER_HEIGHT))
         .key("meter")
-        .size(METER_WIDTH, METER_HEIGHT)
+        .w_full()
+        .h(METER_HEIGHT)
         .a11y_hidden()
 }
 

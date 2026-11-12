@@ -83,8 +83,10 @@
               ]);
             postInstall = ''
               rm -f $out/bin/dictator
-              install -Dm644 assets/dictator.svg $out/share/icons/hicolor/scalable/apps/dictator.svg
-              install -Dm644 assets/dictator.desktop $out/share/applications/dictator.desktop
+              # Named for the app id the window reports, so launchers and
+              # taskbars match the running window to this entry and its icon.
+              install -Dm644 assets/dictator.svg $out/share/icons/hicolor/scalable/apps/org.dictator.Dictator.svg
+              install -Dm644 assets/org.dictator.Dictator.desktop $out/share/applications/org.dictator.Dictator.desktop
               wrapProgram $out/bin/dictator-gui \
                 --prefix PATH : ${
                   lib.makeBinPath [

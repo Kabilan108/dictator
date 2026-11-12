@@ -400,6 +400,7 @@ nohup dictator daemon > /dev/null 2>&1 &
 | `glossary rename <FROM> <TO>` | Replace a term in place, keeping its position |
 | `provider [list]` | List the configured providers, marking the active one and the default |
 | `provider use <NAME>` | Switch the daemon to another configured provider |
+| `provider check [NAME]` | Test a provider's key and endpoint (the active one by default) without sending audio |
 
 ### Microphone capture
 
@@ -502,6 +503,15 @@ dictator provider            # list providers; * marks the active one
 dictator provider use openai # use openai from the next transcription on
 dictator provider use siren  # back to the default
 ```
+
+To find out whether a provider's key works before you record, check it. The daemon sends the provider a request with the key and no audio, so nothing is transcribed:
+
+```bash
+dictator provider check        # the active provider
+dictator provider check openai # openai: key rejected (HTTP 401, 231 ms): Incorrect API key provided: ...
+```
+
+The desktop app runs the same check when it starts, when you switch providers and when you press Check in Settings.
 
 The desktop app's settings offer the same choice. A provider can be selected when it has an endpoint and a key, and every `${env:VAR}` in its key is set in the daemon's environment; the list shows the reason for any provider that cannot be selected. The switch applies to the next transcription and to retries. A recording already being transcribed finishes with the provider it started with.
 

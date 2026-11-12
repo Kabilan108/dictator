@@ -13,7 +13,7 @@ use rune_kit::{
 use super::backend::{Attempt, Detail, Filter, Recording, Request};
 use super::controls::{self, GUTTER, Paint, Tone};
 use super::logic::{self, DiffSegment};
-use super::{Ui, charts, icons};
+use super::{Ui, charts, dictation, icons};
 
 const LIST_WIDTH: f32 = 296.0;
 const PAGE_SIZE: usize = 50;
@@ -118,11 +118,11 @@ fn list_column(ui: &Ui, p: Paint) -> El {
 
 fn list_row(p: Paint, recording: &Recording, selected: bool) -> El {
     let id = recording.id;
-    let snippet = logic::single_line(if recording.failed {
-        &recording.error
+    let snippet = if recording.failed {
+        logic::describe_error(&recording.error).line()
     } else {
-        &recording.text
-    });
+        logic::single_line(&recording.text)
+    };
     let (snippet, color) = if recording.failed {
         (snippet, p.danger())
     } else if snippet.is_empty() {
@@ -532,23 +532,39 @@ fn fact(p: Paint, label: &str, value: &str) -> El {
 fn failed_body(p: Paint, detail: &Detail) -> El {
     let recording = &detail.recording;
     let retained = !recording.audio_path.as_os_str().is_empty();
+    let summary = logic::describe_error(&recording.error);
     let attempts = detail
         .attempts
         .iter()
         .rev()
         .map(|attempt| attempt_row(p, attempt));
+    let reply = summary.raw.clone().map(|raw| {
+        col()
+            .key("provider-reply")
+            .gap(8.0)
+            .child(controls::section_label(p, "Provider reply"))
+            .child(
+                text(raw)
+                    .key("raw")
+                    .font(p.k.ty.mono)
+                    .color(p.muted())
+                    .wrap_anywhere()
+                    .selectable(true)
+                    .selection_color(p.k.selection())
+                    .px(12.0)
+                    .py(10.0)
+                    .radius(p.k.radius.md)
+                    .fill(p.k.c.layer_02)
+                    .border(p.hair, p.k.c.border_muted),
+            )
+    });
+    let actions = dictation::fix_actions(p, &summary);
     col()
         .key("failed")
         .px(controls::ROW_PX)
         .py(14.0)
         .gap(16.0)
-        .child(controls::banner(
-            p,
-            "error",
-            &recording.error,
-            Tone::Bad,
-            None,
-        ))
+        .child(controls::error_callout(p, "error", &summary, actions))
         .child(controls::note(
             p,
             "retained",
@@ -559,6 +575,7 @@ fn failed_body(p: Paint, detail: &Detail) -> El {
             },
             Tone::Neutral,
         ))
+        .children(reply)
         .child(
             col()
                 .key("attempts")
@@ -588,10 +605,10 @@ fn attempt_row(p: Paint, attempt: &Attempt) -> El {
             .color(p.muted()),
         )
         .children((!attempt.error.is_empty()).then(|| {
-            text(attempt.error.clone())
+            text(logic::describe_error(&attempt.error).line())
                 .font(p.k.ty.small.lh(16.0))
                 .color(p.danger())
-                .wrap()
+                .truncate()
         }))
 }
 
@@ -607,7 +624,7 @@ fn detail_footer(ui: &Ui, p: Paint, detail: &Detail) -> El {
                 "Retry",
                 ButtonVariant::Contrast,
                 move |ui: &mut Ui, _: &mut Tx| {
-                    ui.backend.send(Request::Retry(id));
+                    ui.act(Request::Retry(id));
                     ui.notice = "Retry requested".to_string();
                 },
             ));

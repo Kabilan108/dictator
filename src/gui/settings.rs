@@ -1,6 +1,11 @@
 //! The Settings pane. What can change while the daemon runs is editable
 //! here: the transcription provider, the microphone order and the glossary.
 //! The rest comes from `config.json` and is shown read-only.
+//!
+//! Lists grow with the page instead of scrolling inside their card. Rune
+//! sends the wheel to the innermost scroll area under the pointer and never
+//! passes it on, so a nested list that slid under a resting pointer stopped
+//! the page from scrolling.
 
 use rune::{El, Key, KeyEvent, Tx, col, el, icon, row, text};
 use rune_kit::{ButtonVariant, ControlSize, TextInput};
@@ -9,12 +14,8 @@ use crate::glossary::MAX_TERMS;
 
 use super::backend::{Microphone, ProviderInfo, Request};
 use super::controls::{self, GUTTER, Paint, ROW_PX, SECTION_GAP, Tone};
-use super::{Ui, icons, logic};
+use super::{Ui, describe_check, icons, logic};
 
-/// Lists taller than this scroll inside their card instead of stretching
-/// the page.
-const MICROPHONES_MAX_H: f32 = 204.0;
-const GLOSSARY_MAX_H: f32 = 176.0;
 const CHIP_H: f32 = 28.0;
 
 pub(super) fn pane(ui: &Ui, p: Paint, _layer: &mut Vec<El>) -> (Vec<El>, El) {
@@ -155,35 +156,60 @@ fn radio_mark(p: Paint, checked: bool, enabled: bool) -> El {
         .children(checked.then(|| el().size(8.0, 8.0).radius(4.0).fill(p.strong())))
 }
 
+/// The last check of the active provider: whether its key works, and the
+/// provider's own explanation when it does not.
 fn connection_row(ui: &Ui, p: Paint) -> El {
-    let (line, tone) = match &ui.connection {
-        _ if ui.connection_pending => ("Checking…".to_string(), Tone::Neutral),
-        Some(report) => match &report.provider {
-            Ok(detail) => (
-                format!("{} answered · {detail}", report.endpoint_host),
-                Tone::Good,
-            ),
-            Err(error) => (format!("{} · {error}", report.endpoint_host), Tone::Bad),
-        },
-        None => ("Not checked yet".to_string(), Tone::Neutral),
+    let (tone, verdict, detail) = match &ui.connection {
+        _ if ui.connection_pending => (Tone::Neutral, "Checking…".to_string(), String::new()),
+        Some(report) => {
+            let (tone, verdict, message) = describe_check(&report.check);
+            let detail = if message.is_empty() {
+                report.check.host.clone()
+            } else {
+                message
+            };
+            (tone, verdict, detail)
+        }
+        None => (Tone::Neutral, "Not checked yet".to_string(), String::new()),
     };
-    controls::setting_row(
-        p,
-        "connection",
-        "Connection",
-        None,
-        row()
-            .gap(12.0)
-            .center_y()
-            .child(controls::tone_tag(p, &line, tone))
-            .child(controls::small_button(
-                p,
-                "check-connection",
-                "Check",
-                ButtonVariant::Neutral,
-                |ui: &mut Ui, _: &mut Tx| ui.check_connection(),
-            )),
-    )
+    let detail_color = match tone {
+        Tone::Bad => p.danger(),
+        Tone::Warn => p.warning(),
+        _ => p.muted(),
+    };
+    let copy = col()
+        .key("copy")
+        .grow(1.0)
+        .shrink()
+        .min_w(0.0)
+        .gap(2.0)
+        .child(text("Connection").font(p.k.ty.ui).color(p.text()))
+        .children((!detail.is_empty()).then(|| {
+            text(detail)
+                .key("detail")
+                .font(p.k.ty.small.lh(16.0))
+                .color(detail_color)
+                .wrap_anywhere()
+                .max_lines(3)
+                .selectable(true)
+                .selection_color(p.k.selection())
+        }));
+    row()
+        .key("connection")
+        .min_h(controls::ROW_H)
+        .px(ROW_PX)
+        .py(10.0)
+        .gap(16.0)
+        .center_y()
+        .child(copy)
+        .child(controls::tone_tag(p, &verdict, tone).key("verdict"))
+        .child(controls::small_button(
+            p,
+            "check-connection",
+            "Check",
+            ButtonVariant::Neutral,
+            |ui: &mut Ui, _: &mut Tx| ui.check_connection(),
+        ))
 }
 
 fn host(endpoint: &str) -> String {
@@ -216,12 +242,7 @@ fn microphones(ui: &Ui, p: Paint) -> El {
             "",
         ))
     } else {
-        col().child(controls::scroll_capped(
-            p,
-            "microphones-scroll",
-            MICROPHONES_MAX_H,
-            col().children(controls::separated(p, rows)),
-        ))
+        col().children(controls::separated(p, rows))
     };
     if !ui.microphone_error.is_empty() {
         body = body.child(
@@ -372,12 +393,7 @@ fn glossary(ui: &Ui, p: Paint) -> El {
             .flex_wrap()
             .gaps(6.0, 6.0)
             .children(terms.iter().map(|term| chip(ui, p, term)));
-        body = body.child(controls::scroll_capped(
-            p,
-            "terms-scroll",
-            GLOSSARY_MAX_H,
-            chips,
-        ));
+        body = body.child(chips);
     }
     for (index, message) in logic::glossary_notes(ui.glossary.as_ref(), send_vocabulary, provider)
         .iter()

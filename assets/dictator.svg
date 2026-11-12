@@ -1,4 +1,1 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
-  <path d="M12 21v22M22 13v38M32 21v22M45 8h10M50 8v48M45 56h10"
-        stroke="#cdd6f4" stroke-width="5" stroke-linecap="round"/>
-</svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="256" height="256"><defs><linearGradient id="dictator-tile" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3d3d3d"/><stop offset="1" stop-color="#1f1f1f"/></linearGradient></defs><rect x="1" y="1" width="22" height="22" rx="6" fill="url(#dictator-tile)"/><rect x="1.25" y="1.25" width="21.5" height="21.5" rx="5.75" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="0.5"/><path d="M7.5 9v6M12 6v12M16.5 8v8" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/></svg>

@@ -161,6 +161,11 @@ impl Client {
         )
     }
 
+    pub async fn check_provider(&self, name: Option<&str>) -> Result<ProviderCheck> {
+        let args: Vec<String> = name.into_iter().map(str::to_string).collect();
+        decode_provider_check(&self.send_command(ACTION_CHECK_PROVIDER, &args).await?)
+    }
+
     pub async fn is_connected(&self) -> bool {
         matches!(
             tokio::time::timeout(CONNECTION_TIMEOUT, self.connect()).await,
