@@ -57,3 +57,8 @@ gui = ["dep:rune", "dep:rune-kit", "dep:rune-theme-opencode"]
 name = "dictator-gui"
 path = "src/bin/dictator-gui.rs"
 required-features = ["gui"]
+
+[[bin]]
+name = "dictator-osd"
+path = "src/bin/dictator-osd.rs"
+required-features = ["gui"]

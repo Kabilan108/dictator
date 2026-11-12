@@ -9,6 +9,7 @@ mod history;
 mod icons;
 mod levels;
 mod logic;
+pub mod osd;
 mod playback;
 mod settings;
 mod stats;
