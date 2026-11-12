@@ -19,7 +19,7 @@
         rec {
           default = pkgs.rustPlatform.buildRustPackage rec {
             pname = "dictator";
-            version = "2.4.0";
+            version = "3.0.0";
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
