@@ -1,13 +1,13 @@
 //! What the island shows, decided from the OSD stream alone: a state machine
-//! over the daemon's events and the level history the waveform reads. Times
+//! over the daemon's events and the level history the dot scope reads. Times
 //! are seconds on the OSD's own clock.
 
 use std::collections::VecDeque;
 
 use crate::visual::StateValue;
 
-pub(super) const BARS: usize = 24;
-const HISTORY: usize = 48;
+/// Meter samples kept: a little over two seconds, more than the scope shows.
+const HISTORY: usize = 72;
 /// How long a paste stays on screen once it starts.
 const PASTED_HOLD: f64 = 1.2;
 /// The shortest an error stays, even when the daemon goes idle sooner.
@@ -21,12 +21,6 @@ const DISCARD_GRACE: f64 = 0.45;
 /// louder than -50 dBFS, and the recording is dropped without an upload.
 const GATE_MIN_MS: i64 = 300;
 const GATE_SILENCE_RMS: f32 = 0.003_162;
-/// Waveform bars read the level this long ago at the centre, so even the
-/// newest bar interpolates between two meter samples.
-const LEVEL_DELAY: f64 = 0.04;
-/// How much older the level the outermost bars show is: speech ripples out
-/// from the centre.
-const RIPPLE_LAG: f64 = 0.3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Input {
@@ -284,7 +278,7 @@ fn follow(previous: f32, target: f32) -> f32 {
     }
 }
 
-/// How tall a bar draws for a level, 0 to 1: quiet room noise stays flat.
+/// How much of a column a level lights, 0 to 1: quiet room noise stays flat.
 pub(super) fn bar_shape(level: f32) -> f32 {
     ((level - 0.2) / 0.8).clamp(0.0, 1.0).powf(1.35)
 }
@@ -294,8 +288,6 @@ pub(super) struct Levels {
     /// Smoothed levels with the time each arrived.
     samples: VecDeque<(f64, f32)>,
     smoothed: f32,
-    /// What each bar draws, eased frame by frame towards its level.
-    pub(super) bars: [f32; BARS],
 }
 
 impl Levels {
@@ -304,7 +296,7 @@ impl Levels {
         self.smoothed = 0.0;
     }
 
-    fn push(&mut self, level: f32, at: f64) {
+    pub(super) fn push(&mut self, level: f32, at: f64) {
         self.smoothed = follow(self.smoothed, level);
         if self.samples.len() == HISTORY {
             self.samples.pop_front();
@@ -330,30 +322,6 @@ impl Levels {
             later = (at, level);
         }
         later.1
-    }
-
-    /// Eases every bar towards its level at `now`; quiet when not `live`.
-    /// Returns whether any bar still moves.
-    pub(super) fn step(&mut self, now: f64, dt: f32, live: bool) -> bool {
-        let middle = (BARS - 1) as f32 / 2.0;
-        let targets: [f32; BARS] = std::array::from_fn(|index| {
-            let distance = (index as f32 - middle).abs() / middle;
-            if live {
-                let level = self.at(now - LEVEL_DELAY - RIPPLE_LAG * f64::from(distance));
-                bar_shape(level) * (1.0 - 0.4 * distance * distance)
-            } else {
-                0.0
-            }
-        });
-        let mut moving = false;
-        for (bar, target) in self.bars.iter_mut().zip(targets) {
-            let rate = if target > *bar { 30.0 } else { 9.0 };
-            *bar += (target - *bar) * (1.0 - (-rate * dt).exp());
-            if (target - *bar).abs() > 0.002 {
-                moving = true;
-            }
-        }
-        moving
     }
 }
 
@@ -539,29 +507,5 @@ mod tests {
         assert!((levels.at(0.25) - 0.25).abs() < 1e-6);
         assert_eq!(levels.at(2.0), 1.0);
         assert_eq!(levels.at(-1.0), 0.0);
-    }
-
-    #[test]
-    fn bars_rise_while_live_and_settle_flat_after() {
-        let mut model = Model::default();
-        model.apply(state(StateValue::Recording, Some(0)), 0.0);
-        speak(&mut model, 0.0, 1.0);
-        let mut t = 0.5;
-        while t < 1.0 {
-            model.levels.step(t, 1.0 / 60.0, true);
-            t += 1.0 / 60.0;
-        }
-        let middle = model.levels.bars[BARS / 2];
-        assert!(middle > 0.4, "{middle}");
-        assert!(
-            model.levels.bars[0] < middle,
-            "edges sit lower than the centre"
-        );
-        let mut moving = true;
-        for _ in 0..240 {
-            moving = model.levels.step(t, 1.0 / 60.0, false);
-        }
-        assert!(!moving);
-        assert!(model.levels.bars.iter().all(|bar| *bar < 0.01));
     }
 }

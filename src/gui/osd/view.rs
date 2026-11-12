@@ -1,16 +1,20 @@
-//! Drawing the island: one surface hung from the top edge, square where it
-//! meets the edge and round below, with concave fillets that blend it into
-//! the edge. Each content layer is laid out at its own state's size and
-//! centred in the surface, which clips it while the shape morphs.
+//! Drawing the island: one surface on its edge, square where it meets the
+//! edge and round elsewhere, with concave fillets that blend it into the
+//! edge; or, floating, a capsule round all over. Each content layer is laid
+//! out at its own state's size and centred in the surface, which clips it
+//! while the shape morphs. The dot scope is drawn once, over the layers,
+//! wherever the motion has slid it.
 
-use rune::{Color, Cx, El, LineCap, Path, Shape, TextStyle, canvas, el, row, spacer, text};
+use rune::{Color, Cx, El, LineCap, Path, ScreenEdge, Shape, TextStyle, canvas, el, row, text};
 
 use super::super::controls::Paint;
 use super::Island;
-use super::model::{BARS, Model};
-use super::motion::{Content, Layer};
+use super::model::Model;
+use super::motion::{Content, Fit, Layer};
+use super::scope::{COLUMNS, Dot, ROWS};
 
-/// The overlay surface: room for the largest state and its shadow.
+/// The overlay surface: room for the largest state, a floating island's gap
+/// and its shadow.
 pub(super) const SURFACE: (f32, f32) = (560.0, 132.0);
 const PILL_H: f32 = 40.0;
 const PAD: f32 = 16.0;
@@ -18,15 +22,18 @@ const GAP: f32 = 12.0;
 const RADIUS_MAX: f32 = 22.0;
 /// The concave fillets where the island leaves the edge.
 const FILLET: f32 = 10.0;
-const BAR_PITCH: f32 = 5.0;
-const BAR_W: f32 = 3.0;
-const WAVE_H: f32 = 22.0;
 const DOT: f32 = 8.0;
 const DOT_BOX: f32 = 18.0;
 const BADGE: f32 = 22.0;
-const SWEEP_DOTS: usize = 5;
-const SWEEP_PITCH: f32 = 6.0;
-const SWEEP_PERIOD: f64 = 0.95;
+/// The dot scope: dot spacing and size, and the bloom drawn under it.
+const PITCH: f32 = 6.0;
+const SCOPE_DOT: f32 = 3.2;
+const GLOW_DOT: f32 = 7.0;
+const GLOW_BLUR: f32 = 2.2;
+const SCOPE_W: f32 = COLUMNS as f32 * PITCH;
+const SCOPE_H: f32 = PILL_H;
+/// Room either side of the scope for the newest column's bloom.
+const BLOOM_ROOM: f32 = 6.0;
 /// The widest a transcript or error line runs before it wraps.
 const LINE_MAX: f32 = 340.0;
 const LINE_H: f32 = 18.0;
@@ -58,44 +65,48 @@ pub(super) fn clock(milliseconds: i64) -> String {
     format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
-fn wave_width() -> f32 {
-    BARS as f32 * BAR_PITCH
-}
-
-fn sweep_width() -> f32 {
-    SWEEP_DOTS as f32 * SWEEP_PITCH
-}
-
-/// The island's size for `content`; `elapsed_ms` is the recording's clock.
-pub(super) fn size(content: &Content, p: Paint, elapsed_ms: i64) -> (f32, f32) {
+/// How `content` lays out; `elapsed_ms` is the recording's clock.
+pub(super) fn fit(content: &Content, p: Paint, elapsed_ms: i64) -> Fit {
     match content {
         Content::Recording { provider } => {
             let time = measure(&clock(elapsed_ms), time_style(p), None).0;
-            let mut width = PAD * 2.0 + DOT_BOX + GAP + wave_width() + GAP + time;
-            if let Some(name) = provider {
-                width += measure(name, provider_style(p), None).0 + GAP + p.hair + GAP;
+            let lead = provider.as_ref().map_or(0.0, |name| {
+                measure(name, provider_style(p), None).0 + GAP + p.hair + GAP
+            });
+            let scope = PAD + lead + DOT_BOX + GAP;
+            Fit {
+                size: ((scope + SCOPE_W + GAP + time + PAD).ceil(), PILL_H),
+                scope: Some(scope),
             }
-            (width.ceil(), PILL_H)
         }
         Content::Transcribing { duration_ms } => {
             let label = measure("Transcribing", label_style(p), None).0;
             let time = measure(&clock(*duration_ms), time_style(p), None).0;
-            let width = PAD * 2.0 + sweep_width() + 8.0 + label + 10.0 + time;
-            (width.ceil(), PILL_H)
+            let width = PAD * 2.0 + SCOPE_W + GAP + label + GAP + time;
+            Fit {
+                size: (width.ceil(), PILL_H),
+                scope: Some(PAD),
+            }
         }
         Content::Pasted { transcript: None } => {
             let label = measure("Pasted", label_style(p), None).0;
-            ((PAD * 2.0 + BADGE + 10.0 + label).ceil(), PILL_H)
+            Fit {
+                size: ((PAD * 2.0 + BADGE + 10.0 + label).ceil(), PILL_H),
+                scope: None,
+            }
         }
         Content::Pasted {
             transcript: Some(line),
         }
         | Content::Failed { message: line } => {
             let (width, height) = measure(line, line_style(p), Some(LINE_MAX));
-            (
-                (PAD * 2.0 + BADGE + GAP + width).ceil(),
-                (height + TALL_PAD_Y * 2.0).max(PILL_H).ceil(),
-            )
+            Fit {
+                size: (
+                    (PAD * 2.0 + BADGE + GAP + width).ceil(),
+                    (height + TALL_PAD_Y * 2.0).max(PILL_H).ceil(),
+                ),
+                scope: None,
+            }
         }
     }
 }
@@ -108,8 +119,14 @@ fn surface(p: Paint, tint: f32) -> Color {
 
 pub(super) fn view(island: &Island, cx: &mut Cx<Island>) -> El {
     let p = Paint::new(island.dark, cx.env().scale);
+    let placement = island.placement;
     let motion = &island.motion;
-    let (width, height) = (motion.width.x.max(0.0), motion.height.x);
+    let height = motion.height.x;
+    let width = if placement.attached() {
+        motion.width.x.max(0.0)
+    } else {
+        motion.width.x.max(height)
+    };
     let root = el()
         .key("osd")
         .size(SURFACE.0, SURFACE.1)
@@ -119,21 +136,24 @@ pub(super) fn view(island: &Island, cx: &mut Cx<Island>) -> El {
     if island.first_frame.is_some() {
         return root.child(warm_up(island, p));
     }
-    if height < 0.25 {
+    if height < 0.25 || motion.fade.x < 0.005 {
         return root;
     }
     let left = ((SURFACE.0 - width) / 2.0).round();
-    let radius = (height / 2.0).min(RADIUS_MAX);
-    let corners = [0.0, 0.0, radius, radius];
+    let top = placement.top(height, SURFACE.1) + placement.away() * motion.rise.x;
+    let corners = placement.corners((height / 2.0).min(RADIUS_MAX));
     let fill = surface(p, motion.tint.x);
     let elapsed = island.model.elapsed_ms(island.now);
     let mut body = el()
         .key("island")
-        .pin(Some(left), Some(0.0), None, None)
+        .pin(Some(left), Some(top), None, None)
         .size(width, height)
         .corners(corners)
         .fill(fill)
         .clip_corners(corners);
+    if motion.fade.x < 1.0 {
+        body = body.opacity(motion.fade.x.clamp(0.0, 1.0));
+    }
     if motion.tint.x > 0.01 {
         body = body.border(p.hair, p.k.c.danger.border.alpha(motion.tint.x));
     } else if !p.k.dark {
@@ -146,8 +166,28 @@ pub(super) fn view(island: &Island, cx: &mut Cx<Island>) -> El {
         .layers
         .iter()
         .map(|layer| place(island, p, layer, (width, height), elapsed));
-    root.child(body.children(layers))
-        .child(fillets(left, width, height, fill))
+    let mut body = body.children(layers);
+    if motion.scope.x > 0.005 {
+        let (opacity, lift, blur) = arrival(motion.scope.x, motion.scope_leaving());
+        let mut scope = scope(island, p)
+            .pin(
+                Some((width / 2.0 + motion.scope_x.x - BLOOM_ROOM).round()),
+                Some((height - SCOPE_H) / 2.0 + lift * placement.away()),
+                None,
+                None,
+            )
+            .opacity(opacity);
+        if blur > 0.05 {
+            scope = scope.blur(blur);
+        }
+        body = body.child(scope);
+    }
+    let root = root.child(body);
+    if placement.attached() {
+        root.child(fillets(placement.edge(), left, width, height, fill))
+    } else {
+        root
+    }
 }
 
 fn status(model: &Model) -> &'static str {
@@ -160,37 +200,38 @@ fn status(model: &Model) -> &'static str {
     }
 }
 
-/// The concave corners either side of where the island meets the edge.
-fn fillets(left: f32, width: f32, height: f32, fill: Color) -> El {
+/// The concave corners either side of where the island meets its edge.
+fn fillets(edge: ScreenEdge, left: f32, width: f32, height: f32, fill: Color) -> El {
     let size = FILLET.min(height * 0.5);
     let k = 0.552_285 * size;
     let right = left + width;
-    let ear_left = Path::new()
-        .move_to([left, 0.0])
-        .line_to([left, size])
-        .cubic_to([left, size - k], [left - size + k, 0.0], [left - size, 0.0])
-        .close();
-    let ear_right = Path::new()
-        .move_to([right, 0.0])
-        .line_to([right, size])
-        .cubic_to(
-            [right, size - k],
-            [right + size - k, 0.0],
-            [right + size, 0.0],
-        )
-        .close();
+    let (top, y): (f32, fn(f32) -> f32) = match edge {
+        ScreenEdge::Top => (0.0, |y| y),
+        ScreenEdge::Bottom => (SURFACE.1 - FILLET, |y| FILLET - y),
+    };
+    let ear = |side: f32, x: f32| {
+        Path::new()
+            .move_to([x, y(0.0)])
+            .line_to([x, y(size)])
+            .cubic_to(
+                [x, y(size - k)],
+                [x + side * (size - k), y(0.0)],
+                [x + side * size, y(0.0)],
+            )
+            .close()
+    };
     let shape = Shape::new()
-        .fill_path(&ear_left, fill)
-        .fill_path(&ear_right, fill);
+        .fill_path(&ear(-1.0, left), fill)
+        .fill_path(&ear(1.0, right), fill);
     canvas(shape)
         .key("fillets")
-        .pin(Some(0.0), Some(0.0), None, None)
+        .pin(Some(0.0), Some(top), None, None)
         .size(SURFACE.0, FILLET)
         .a11y_hidden()
 }
 
 /// Every content, blurred and all but transparent, drawn in the frame the
-/// island waits on before it drops: the renderer builds its pipelines and
+/// island waits on before it shows: the renderer builds its pipelines and
 /// glyphs here instead of stalling the first time each state arrives.
 fn warm_up(island: &Island, p: Paint) -> El {
     let contents = [
@@ -208,37 +249,49 @@ fn warm_up(island: &Island, p: Paint) -> El {
     ];
     let layers = contents.into_iter().map(|content| {
         let layer = Layer::settled(content);
-        let (width, height) = size(&layer.content, p, 0);
+        let (width, height) = fit(&layer.content, p, 0).size;
         content_of(island, p, &layer)
             .size(width, height)
             .pin(Some(0.0), Some(0.0), None, None)
             .blur(2.0)
     });
+    let far_side = if island.placement.away() > 0.0 {
+        SURFACE.1 - PILL_H * 2.0
+    } else {
+        0.0
+    };
     el().key("warm-up")
         .size(SURFACE.0, PILL_H * 2.0)
-        .pin(Some(0.0), Some(SURFACE.1 - PILL_H * 2.0), None, None)
+        .pin(Some(0.0), Some(far_side), None, None)
         .fill(surface(p, 1.0))
         .opacity(0.01)
         .a11y_hidden()
         .children(layers)
+        .child(scope(island, p).blur(1.0))
 }
 
-/// A content layer at its own size, centred in the island, faded and slid
-/// by how far it has arrived or left.
-fn place(island: &Island, p: Paint, layer: &Layer, island_size: (f32, f32), elapsed: i64) -> El {
-    let (width, height) = size(&layer.content, p, elapsed);
-    let presence = layer.presence.x;
-    let (opacity, lift, blur) = if layer.leaving() {
+/// How far along arriving or leaving something is: its opacity, how far it
+/// has slid (towards the edge, in points) and its blur.
+fn arrival(presence: f32, leaving: bool) -> (f32, f32, f32) {
+    if leaving {
         let left = presence.clamp(0.0, 1.0);
         (left, -(1.0 - left) * 5.0, (1.0 - left) * 4.0)
     } else {
         (presence.clamp(0.0, 1.0), (1.0 - presence) * 10.0, 0.0)
-    };
+    }
+}
+
+/// A content layer at its own size, centred in the island, faded and slid
+/// by how far it has arrived or left: in from away from the edge, out
+/// towards it.
+fn place(island: &Island, p: Paint, layer: &Layer, island_size: (f32, f32), elapsed: i64) -> El {
+    let (width, height) = fit(&layer.content, p, elapsed).size;
+    let (opacity, lift, blur) = arrival(layer.presence.x, layer.leaving());
     let mut placed = content_of(island, p, layer)
         .size(width, height)
         .pin(
             Some(((island_size.0 - width) / 2.0).round()),
-            Some((island_size.1 - height) / 2.0 + lift),
+            Some((island_size.1 - height) / 2.0 + lift * island.placement.away()),
             None,
             None,
         )
@@ -247,6 +300,11 @@ fn place(island: &Island, p: Paint, layer: &Layer, island_size: (f32, f32), elap
         placed = placed.blur(blur);
     }
     placed
+}
+
+/// Where the dot scope sits in a layout; the scope itself is drawn on top.
+fn scope_slot() -> El {
+    el().w(SCOPE_W).h(SCOPE_H).a11y_hidden()
 }
 
 fn content_of(island: &Island, p: Paint, layer: &Layer) -> El {
@@ -269,12 +327,7 @@ fn content_of(island: &Island, p: Paint, layer: &Layer) -> El {
                 .center_y()
                 .children(provider)
                 .child(record_dot(p, now))
-                .child(waveform(
-                    p,
-                    &island.model.levels.bars,
-                    island.model.recording(),
-                ))
-                .child(spacer())
+                .child(scope_slot())
                 .child(
                     text(clock(island.model.elapsed_ms(now)))
                         .font(time_style(p))
@@ -284,12 +337,10 @@ fn content_of(island: &Island, p: Paint, layer: &Layer) -> El {
         Content::Transcribing { duration_ms } => row()
             .key("transcribing")
             .px(PAD)
-            .gap(8.0)
+            .gap(GAP)
             .center_y()
-            .child(sheen(p, since, size(&layer.content, p, 0)))
-            .child(sweep(p, since))
+            .child(scope_slot())
             .child(text("Transcribing").font(label_style(p)).color(p.text()))
-            .child(spacer())
             .child(
                 text(clock(*duration_ms))
                     .font(time_style(p))
@@ -304,7 +355,7 @@ fn content_of(island: &Island, p: Paint, layer: &Layer) -> El {
             .child(text("Pasted").font(label_style(p)).color(p.strong())),
         Content::Pasted {
             transcript: Some(line),
-        } => tall(p, "pasted", check_badge(p, since), line),
+        } => tall(p, "pasted-line", check_badge(p, since), line),
         Content::Failed { message } => tall(p, "failed", alert_badge(p), message),
     }
 }
@@ -350,77 +401,74 @@ fn record_dot(p: Paint, now: f64) -> El {
         )
 }
 
-/// Mirrored level bars, tallest at the centre. They lie flat as dots once
-/// the recording ends.
-fn waveform(p: Paint, bars: &[f32; BARS], live: bool) -> El {
-    let middle = WAVE_H / 2.0;
-    let ink = if live { p.strong() } else { p.muted() };
-    let mut shape = Shape::new();
-    for (index, level) in bars.iter().enumerate() {
-        let x = index as f32 * BAR_PITCH + BAR_PITCH / 2.0;
-        let half = level.clamp(0.0, 1.0) * (WAVE_H - BAR_W) / 2.0;
-        shape = shape.line(
-            [x, middle - half],
-            [x, middle + half],
-            BAR_W,
-            LineCap::Round,
-            ink.alpha(0.5 + 0.5 * level.clamp(0.0, 1.0)),
-        );
+struct Inks {
+    rest: Color,
+    ink: Color,
+    /// Bloom reads as light on a dark island and as a smudge on a light one.
+    bloom: f32,
+}
+
+impl Inks {
+    fn new(p: Paint) -> Self {
+        Self {
+            rest: p.faint().alpha(if p.k.dark { 0.3 } else { 0.36 }),
+            ink: p.strong(),
+            bloom: if p.k.dark { 0.6 } else { 0.3 },
+        }
     }
-    canvas(shape)
-        .key("wave")
-        .size(wave_width(), WAVE_H)
-        .a11y_hidden()
 }
 
-/// Where the transcribing crest is, from the first dot (0) to past the
-/// last (1).
-fn crest(since: f64) -> f32 {
-    (since / SWEEP_PERIOD).fract() as f32
+/// The centre of the dot at `column` and `row` within the scope's box.
+fn dot_centre(column: usize, row: usize) -> [f32; 2] {
+    [
+        BLOOM_ROOM + (column as f32 + 0.5) * PITCH,
+        SCOPE_H / 2.0 + (row as f32 - (ROWS / 2) as f32) * PITCH,
+    ]
 }
 
-/// A row of dots a bright crest runs along while the server works.
-fn sweep(p: Paint, since: f64) -> El {
-    let middle = WAVE_H / 2.0;
-    let crest = crest(since) * (SWEEP_DOTS as f32 + 2.0) - 1.0;
-    let mut shape = Shape::new();
-    for index in 0..SWEEP_DOTS {
-        let x = index as f32 * SWEEP_PITCH + SWEEP_PITCH / 2.0;
-        let distance = index as f32 - crest;
-        let lit = (-distance * distance / 1.6).exp();
-        let half = lit * 4.0;
-        shape = shape.line(
-            [x, middle - half],
-            [x, middle + half],
-            BAR_W,
-            LineCap::Round,
-            p.strong().alpha(0.28 + 0.72 * lit),
-        );
+fn dot_at(shape: Shape, at: [f32; 2], diameter: f32, color: Color) -> Shape {
+    let half = diameter * 0.01;
+    shape.line(
+        [at[0] - half, at[1]],
+        [at[0] + half, at[1]],
+        diameter,
+        LineCap::Round,
+        color,
+    )
+}
+
+/// The dot scope: every dot at rest, lit towards the ink by its level, over
+/// a blurred bloom for the brightest.
+fn scope(island: &Island, p: Paint) -> El {
+    let dots: [[Dot; ROWS]; COLUMNS] = island.scope.dots(island.now);
+    let inks = Inks::new(p);
+    let (mut matrix, mut bloom) = (Shape::new(), Shape::new());
+    for (column, cells) in dots.iter().enumerate() {
+        for (row, dot) in cells.iter().enumerate() {
+            let at = dot_centre(column, row);
+            matrix = dot_at(matrix, at, SCOPE_DOT, inks.rest.mix(inks.ink, dot.light));
+            if dot.glow > 0.02 {
+                bloom = dot_at(bloom, at, GLOW_DOT, inks.ink.alpha(dot.glow * inks.bloom));
+            }
+        }
     }
-    canvas(shape)
-        .key("sweep")
-        .size(sweep_width(), WAVE_H)
+    let size = (SCOPE_W + BLOOM_ROOM * 2.0, SCOPE_H);
+    el().key("scope")
+        .size(size.0, size.1)
         .a11y_hidden()
-}
-
-/// A soft band of light that follows the crest on across the label.
-fn sheen(p: Paint, since: f64, (width, height): (f32, f32)) -> El {
-    const BAND: f32 = 72.0;
-    let x = crest(since) * (width + BAND) - BAND;
-    let light = p.strong();
-    let strength = if p.k.dark { 0.07 } else { 0.035 };
-    el().key("sheen")
-        .size(BAND, height)
-        .pin(Some(x), Some(0.0), None, None)
-        .linear_gradient(
-            std::f32::consts::FRAC_PI_2,
-            [
-                (0.0, light.alpha(0.0)),
-                (0.5, light.alpha(strength)),
-                (1.0, light.alpha(0.0)),
-            ],
+        .child(
+            canvas(bloom)
+                .key("bloom")
+                .pin(Some(0.0), Some(0.0), None, None)
+                .size(size.0, size.1)
+                .blur(GLOW_BLUR),
         )
-        .a11y_hidden()
+        .child(
+            canvas(matrix)
+                .key("matrix")
+                .pin(Some(0.0), Some(0.0), None, None)
+                .size(size.0, size.1),
+        )
 }
 
 fn badge(key: &str, fill: Color, mark: Shape) -> El {

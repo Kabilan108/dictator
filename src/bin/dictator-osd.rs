@@ -1,17 +1,19 @@
 use std::path::PathBuf;
 
 use anyhow::{Result, bail};
-use dictator::gui::osd::{OsdOptions, run};
+use dictator::gui::osd::{OsdOptions, Placement, run};
 
-const USAGE: &str = "usage: dictator-osd [--socket PATH] [--theme dark|light]";
+const USAGE: &str =
+    "usage: dictator-osd [--socket PATH] [--theme dark|light] [--placement bottom|top|floating]";
 
-/// `dictator-osd [--socket PATH] [--theme dark|light]`: the dictation island,
-/// fed by the daemon's OSD socket. Rune reads its own flags (`--snap`,
-/// `--scene`, ...) from the same command line.
+/// `dictator-osd [--socket PATH] [--theme dark|light] [--placement ...]`: the
+/// dictation island, fed by the daemon's OSD socket. Rune reads its own
+/// flags (`--snap`, `--scene`, ...) from the same command line.
 fn main() -> Result<()> {
     let mut options = OsdOptions {
         socket: dictator::visual::default_socket_path(),
         dark: true,
+        placement: Placement::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -24,6 +26,10 @@ fn main() -> Result<()> {
                 Some("dark") => options.dark = true,
                 Some("light") => options.dark = false,
                 _ => bail!("--theme takes dark or light\n{USAGE}"),
+            },
+            "--placement" => match args.next().as_deref().and_then(Placement::parse) {
+                Some(placement) => options.placement = placement,
+                None => bail!("--placement takes bottom, top or floating\n{USAGE}"),
             },
             "-h" | "--help" => {
                 println!("{USAGE}");

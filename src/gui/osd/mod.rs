@@ -1,21 +1,22 @@
-//! `dictator-osd`: the dictation island. A shape hung from the top edge of
-//! the screen that grows out of it when a recording starts, morphs between
-//! states on springs and goes back into the edge when the dictation ends.
+//! `dictator-osd`: the dictation island. A shape on the bottom (or top) edge
+//! of the screen that grows out of it when a recording starts, morphs
+//! between states on springs and goes back into the edge when the dictation
+//! ends; or a capsule floating above the bottom edge that opens from a dot.
 //! A windowless Rune app with one click-through overlay, fed by the daemon's
 //! OSD socket.
 
 mod feed;
 mod model;
 mod motion;
+mod placement;
+mod scope;
 mod view;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use rune::{
-    Align, AppSpec, OverlayHandle, OverlayInput, OverlayOptions, OverlaySpec, ScreenEdge, Tx,
-};
+use rune::{Align, AppSpec, OverlayHandle, OverlayInput, OverlayOptions, OverlaySpec, Tx};
 
 use crate::visual::StateValue;
 
@@ -23,6 +24,8 @@ use super::controls::Paint;
 use feed::Feed;
 use model::{Input, Mode, Model};
 use motion::Motion;
+pub use placement::Placement;
+use scope::Scope;
 
 const APP_ID: &str = "org.dictator.Osd";
 /// A burst of dictations keeps the overlay's GPU surface; an OSD at rest
@@ -38,11 +41,14 @@ const FIRST_FRAME_WAIT: f64 = 0.5;
 pub struct OsdOptions {
     pub socket: PathBuf,
     pub dark: bool,
+    pub placement: Placement,
 }
 
 pub struct Island {
     model: Model,
     motion: Motion,
+    scope: Scope,
+    placement: Placement,
     dark: bool,
     feed: Feed,
     overlay: Option<OverlayHandle<Island>>,
@@ -60,10 +66,12 @@ pub struct Island {
 }
 
 impl Island {
-    fn new(dark: bool, feed: Feed) -> Self {
+    fn new(dark: bool, placement: Placement, feed: Feed) -> Self {
         Self {
             model: Model::default(),
-            motion: Motion::default(),
+            motion: Motion::new(placement),
+            scope: Scope::default(),
+            placement,
             dark,
             feed,
             overlay: None,
@@ -79,25 +87,31 @@ impl Island {
     fn step(&mut self, now: f64, dt: f32) -> bool {
         let p = Paint::new(self.dark, 1.0);
         let elapsed = self.model.elapsed_ms(now);
-        let live = self.model.recording();
-        let bars = self.model.levels.step(now, dt, live);
+        let phase = match self.model.mode {
+            Mode::Recording { .. } => scope::Phase::Live,
+            Mode::Transcribing { .. } => scope::Phase::Working,
+            _ => scope::Phase::Rest,
+        };
+        let scoping = self.scope.step(&self.model.levels, phase, now, dt);
         let moving = self.motion.step(&self.model, now, dt, |content| {
-            view::size(content, p, elapsed)
+            view::fit(content, p, elapsed)
         });
-        bars || moving
+        scoping || moving
     }
 }
 
 pub fn run(options: OsdOptions) -> Result<()> {
     rune::set_app_id(APP_ID);
-    let dark = options.dark;
-    let mut app = rune::App::new(spec()).init(move || demo(dark)).windowless();
-    let island = Island::new(options.dark, Feed::start(options.socket));
+    let (dark, placement) = (options.dark, options.placement);
+    let mut app = rune::App::new(spec())
+        .init(move || demo(dark, placement))
+        .windowless();
+    let island = Island::new(dark, placement, Feed::start(options.socket));
     let overlay = app.overlay(
         OverlaySpec {
             name: "dictator-osd",
             size: view::SURFACE,
-            edge: ScreenEdge::Top,
+            edge: placement.edge(),
             margin: 0.0,
             align: Align::Center,
             inset: 0.0,
@@ -124,7 +138,7 @@ fn spec() -> AppSpec<Island> {
         title: "Dictator OSD",
         size: view::SURFACE,
         min_size: None,
-        init: || demo(true),
+        init: || demo(true, Placement::default()),
         view: view::view,
         scenes: SCENES,
         fonts: rune_theme_opencode::FONTS,
@@ -163,6 +177,7 @@ fn poll(island: &mut Island, _clock: f64, tx: &mut Tx) -> bool {
     let present = island.model.present();
     if present && !island.shown {
         island.motion.reset();
+        island.scope.reset();
         if let Some(overlay) = &island.overlay {
             island.first_frame = Some((overlay.surface_stats().totals.presents, now));
             overlay.show();
@@ -201,8 +216,8 @@ fn poll(island: &mut Island, _clock: f64, tx: &mut Tx) -> bool {
 }
 
 /// A still island for headless snapshots, with no socket.
-fn demo(dark: bool) -> Island {
-    let mut island = Island::new(dark, Feed::default());
+fn demo(dark: bool, placement: Placement) -> Island {
+    let mut island = Island::new(dark, placement, Feed::default());
     island.frozen = true;
     island
 }
@@ -211,28 +226,28 @@ type Scene = (&'static str, fn(&mut Island));
 
 const SCENES: &[Scene] = &[
     ("tab", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         record(island, None, 0.0);
         settle(island, 0.06);
     }),
     ("recording", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         record(island, None, 4.2);
         settle(island, 4.2);
     }),
     ("recording-provider", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         record(island, Some("openai"), 12.6);
         settle(island, 12.6);
     }),
     ("transcribing", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         record(island, None, 7.5);
         state(island, StateValue::Transcribing, Some(7_500), "", 7.5);
         settle(island, 8.2);
     }),
     ("pasted", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         island.model.apply(
             Input::Transcript(
                 "Okay, so the plan for tomorrow: finish the provider switcher, then write \
@@ -245,7 +260,7 @@ const SCENES: &[Scene] = &[
         settle(island, 0.9);
     }),
     ("pasted-short", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         island.model.apply(
             Input::Transcript("Ship the overlay behind a feature flag first.".into()),
             0.0,
@@ -254,12 +269,12 @@ const SCENES: &[Scene] = &[
         settle(island, 0.9);
     }),
     ("pasted-plain", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         state(island, StateValue::Typing, None, "", 0.0);
         settle(island, 0.9);
     }),
     ("error", |island| {
-        island.dark = theme_dark();
+        prepare(island);
         state(
             island,
             StateValue::Error,
@@ -271,12 +286,20 @@ const SCENES: &[Scene] = &[
     }),
 ];
 
-/// Rune reads `--theme` for headless runs; scenes follow it too.
-fn theme_dark() -> bool {
+/// Scenes follow `--theme` (which Rune reads for headless runs too) and
+/// `--placement` from the command line.
+fn prepare(island: &mut Island) {
     let args: Vec<String> = std::env::args().collect();
-    !args
-        .windows(2)
-        .any(|pair| pair[0] == "--theme" && pair[1] == "light")
+    let flag = |name: &str| {
+        args.windows(2)
+            .find(|pair| pair[0] == name)
+            .map(|pair| pair[1].as_str())
+    };
+    island.dark = flag("--theme") != Some("light");
+    island.placement = flag("--placement")
+        .and_then(Placement::parse)
+        .unwrap_or_default();
+    island.motion = Motion::new(island.placement);
 }
 
 fn state(island: &mut Island, value: StateValue, duration_ms: Option<i64>, message: &str, at: f64) {
