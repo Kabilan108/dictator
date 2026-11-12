@@ -313,6 +313,10 @@ fn run_live_worker(requests: Receiver<Request>, replies: Sender<Reply>, fallback
     let mut db_error = String::new();
     retry_database(&mut db, &mut db_error, open_database);
     while let Ok(request) = requests.recv() {
+        if matches!(request, Request::CheckConnection) {
+            spawn_connection_check(replies.clone(), fallback.clone());
+            continue;
+        }
         let kind = live_request_kind(&request);
         reopen_database_for_request(&request, &mut db, &mut db_error, open_database);
         let reply = if let Some(db) = db.as_ref() {
@@ -593,6 +597,56 @@ fn daemon_error(error: anyhow::Error) -> String {
     }
 }
 
+/// Asks the daemon to check its provider with the key, or probes the
+/// endpoint without it when the daemon cannot.
+async fn check_connection(fallback: &Fallback) -> ConnectionReport {
+    let client = Client::new();
+    let daemon = client
+        .status()
+        .await
+        .and_then(parse_status)
+        .map(|_| ())
+        .map_err(|error| error.to_string());
+    let check = match &daemon {
+        Ok(()) => match client.check_provider(None).await {
+            Ok(check) => check,
+            Err(error) => {
+                tracing::debug!(%error, "daemon cannot check providers; probing without the key");
+                let active = active_provider(&client, fallback).await;
+                probe_provider(&active.provider, &active.endpoint).await
+            }
+        },
+        Err(_) => probe_provider(&fallback.provider, &fallback.endpoint).await,
+    };
+    ConnectionReport {
+        daemon,
+        check,
+        checked_at: Utc::now(),
+    }
+}
+
+/// Runs a connection check on its own thread: it waits on the network for
+/// up to the check's timeout, which would hold status replies and actions
+/// queued behind it on the worker.
+fn spawn_connection_check(replies: Sender<Reply>, fallback: Fallback) {
+    let spawned = thread::Builder::new()
+        .name("dictator-gui-check".to_string())
+        .spawn({
+            let replies = replies.clone();
+            move || {
+                let report = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|runtime| runtime.block_on(check_connection(&fallback)))
+                    .map_err(|error| error.to_string());
+                let _ = replies.send(Reply::Connection(report));
+            }
+        });
+    if let Err(error) = spawned {
+        let _ = replies.send(Reply::Connection(Err(error.to_string())));
+    }
+}
+
 /// The provider the daemon is using, or the config default when the daemon
 /// cannot say.
 async fn active_provider(client: &Client, fallback: &Fallback) -> Fallback {
@@ -679,31 +733,9 @@ fn handle_live_service(
                 .and_then(response_result)
                 .map_err(|error| error.to_string()),
         ),
-        Request::CheckConnection => Reply::Connection(Ok(runtime.block_on(async {
-            let client = Client::new();
-            let daemon = client
-                .status()
-                .await
-                .and_then(parse_status)
-                .map(|_| ())
-                .map_err(|error| error.to_string());
-            let check = match &daemon {
-                Ok(()) => match client.check_provider(None).await {
-                    Ok(check) => check,
-                    Err(error) => {
-                        tracing::debug!(%error, "daemon cannot check providers; probing without the key");
-                        let active = active_provider(&client, fallback).await;
-                        probe_provider(&active.provider, &active.endpoint).await
-                    }
-                },
-                Err(_) => probe_provider(&fallback.provider, &fallback.endpoint).await,
-            };
-            ConnectionReport {
-                daemon,
-                check,
-                checked_at: Utc::now(),
-            }
-        }))),
+        Request::CheckConnection => {
+            Reply::Connection(Ok(runtime.block_on(check_connection(fallback))))
+        }
         Request::Glossary => Reply::Glossary(
             crate::glossary::load(&crate::glossary::glossary_path())
                 .map(Glossary::from_stored)
