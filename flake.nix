@@ -15,6 +15,22 @@
         let
           pkgs = import nixpkgs { inherit system; };
           lib = pkgs.lib;
+          guiLibraryPath = lib.makeLibraryPath (
+            with pkgs;
+            [
+              libxkbcommon
+              wayland
+              libGL
+              vulkan-loader
+              fontconfig
+              freetype
+              libx11
+              libxcb
+              libxcursor
+              libxi
+              libxrandr
+            ]
+          );
         in
         rec {
           default = pkgs.rustPlatform.buildRustPackage rec {
@@ -94,24 +110,8 @@
                     pkgs.pulseaudio
                   ]
                 } \
-                --prefix LD_LIBRARY_PATH : ${
-                  lib.makeLibraryPath (
-                    with pkgs;
-                    [
-                      libxkbcommon
-                      wayland
-                      libGL
-                      vulkan-loader
-                      fontconfig
-                      freetype
-                      libx11
-                      libxcb
-                      libxcursor
-                      libxi
-                      libxrandr
-                    ]
-                  )
-                }
+                --prefix LD_LIBRARY_PATH : ${guiLibraryPath}
+              wrapProgram $out/bin/dictator-osd --prefix LD_LIBRARY_PATH : ${guiLibraryPath}
             '';
             meta = old.meta // {
               description = "Dictator desktop application";

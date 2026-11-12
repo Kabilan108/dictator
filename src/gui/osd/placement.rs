@@ -1,6 +1,6 @@
-//! Where the island sits, as data: the edge it hangs from, how far from it,
-//! its corner and fillet shape and which way it grows. Motion and view read
-//! these and are otherwise the same for every placement.
+//! Where the island sits, as data: the edge it is anchored to, how far from
+//! it, its corner and fillet shape and which way it grows. Motion and view
+//! read these and are otherwise the same for every placement.
 
 use rune::ScreenEdge;
 
@@ -17,21 +17,21 @@ const FLOAT_GAP: f32 = 28.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Placement {
+    /// A capsule above the bottom edge, clear of it.
+    #[default]
+    Floating,
+    /// Standing on the bottom edge.
+    Bottom,
     /// Hung from the top edge.
     Top,
-    /// Standing on the bottom edge.
-    #[default]
-    Bottom,
-    /// A capsule above the bottom edge, clear of it.
-    Floating,
 }
 
 impl Placement {
     pub fn parse(name: &str) -> Option<Self> {
         match name {
-            "top" => Some(Self::Top),
-            "bottom" => Some(Self::Bottom),
             "floating" => Some(Self::Floating),
+            "bottom" => Some(Self::Bottom),
+            "top" => Some(Self::Top),
             _ => None,
         }
     }
@@ -114,7 +114,7 @@ mod tests {
         assert_eq!(Placement::parse("bottom"), Some(Placement::Bottom));
         assert_eq!(Placement::parse("floating"), Some(Placement::Floating));
         assert_eq!(Placement::parse("left"), None);
-        assert_eq!(Placement::default(), Placement::Bottom);
+        assert_eq!(Placement::default(), Placement::Floating);
     }
 
     #[test]

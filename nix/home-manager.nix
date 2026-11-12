@@ -83,6 +83,37 @@ in
       };
     };
 
+    osd = {
+      enable = lib.mkEnableOption "the dictation overlay (dictator-osd) in the graphical session, alongside the daemon";
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = cfg.gui.package;
+        defaultText = "config.services.dictator.gui.package";
+        description = "Package providing dictator-osd.";
+      };
+      placement = lib.mkOption {
+        type = lib.types.enum [
+          "floating"
+          "bottom"
+          "top"
+        ];
+        default = "floating";
+        description = ''
+          Where the overlay shows: a capsule floating above the bottom edge, or
+          attached to the bottom or top edge.
+        '';
+      };
+      extraArgs = lib.mkOption {
+        type = lib.types.listOf lib.types.str;
+        default = [ ];
+        example = [
+          "--theme"
+          "dark"
+        ];
+        description = "Extra arguments passed to `dictator-osd`.";
+      };
+    };
+
     displayServer = lib.mkOption {
       type = lib.types.enum [
         "x11"
@@ -245,6 +276,33 @@ in
       };
       Install = {
         WantedBy = [ "default.target" ];
+      };
+    };
+
+    warnings = lib.optional (cfg.osd.enable && (cfg.settings.enable_osd or true) == false) ''
+      services.dictator.osd is enabled, but services.dictator.settings.enable_osd
+      is false, so the daemon publishes nothing for the overlay to show.
+    '';
+
+    # The overlay draws on the compositor's Wayland socket with the GPU and
+    # only reads the daemon's OSD socket, so it runs unsandboxed in the
+    # graphical session. It reconnects whenever the daemon restarts.
+    systemd.user.services.dictator-osd = lib.mkIf cfg.osd.enable {
+      Unit = {
+        Description = "Dictator dictation overlay";
+        Documentation = "https://github.com/kabilan108/dictator";
+        PartOf = [ "graphical-session.target" ];
+        After = [ "graphical-session.target" ];
+      };
+      Service = {
+        ExecStart =
+          "${lib.getExe' cfg.osd.package "dictator-osd"} --placement ${cfg.osd.placement}"
+          + lib.optionalString (cfg.osd.extraArgs != [ ]) " ${lib.escapeShellArgs cfg.osd.extraArgs}";
+        Restart = "on-failure";
+        RestartSec = 2;
+      };
+      Install = {
+        WantedBy = [ "graphical-session.target" ];
       };
     };
   };

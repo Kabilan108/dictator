@@ -1,9 +1,9 @@
-//! `dictator-osd`: the dictation island. A shape on the bottom (or top) edge
-//! of the screen that grows out of it when a recording starts, morphs
-//! between states on springs and goes back into the edge when the dictation
-//! ends; or a capsule floating above the bottom edge that opens from a dot.
-//! A windowless Rune app with one click-through overlay, fed by the daemon's
-//! OSD socket.
+//! `dictator-osd`: the dictation island. By default a capsule floating above
+//! the bottom edge that opens from a dot when a recording starts, morphs
+//! between states on springs and closes back into the dot when the dictation
+//! ends; `--placement bottom|top` attaches it to that edge instead, grown out
+//! of it. A windowless Rune app with one click-through overlay, fed by the
+//! daemon's OSD socket.
 
 mod feed;
 mod model;
@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow};
 use rune::{Align, AppSpec, OverlayHandle, OverlayInput, OverlayOptions, OverlaySpec, Tx};
 
-use crate::visual::StateValue;
+use crate::visual::{StateEvent, StateValue, new_state_event};
 
 use super::controls::Paint;
 use feed::Feed;
@@ -40,7 +40,8 @@ const FIRST_FRAME_WAIT: f64 = 0.5;
 #[derive(Clone, Debug)]
 pub struct OsdOptions {
     pub socket: PathBuf,
-    pub dark: bool,
+    /// Dark or light; `None` follows the system appearance.
+    pub dark: Option<bool>,
     pub placement: Placement,
 }
 
@@ -49,12 +50,12 @@ pub struct Island {
     motion: Motion,
     scope: Scope,
     placement: Placement,
-    dark: bool,
+    dark: Option<bool>,
     feed: Feed,
     overlay: Option<OverlayHandle<Island>>,
     shown: bool,
     /// Since a show, until the surface presents: the presents counted at the
-    /// show and when it was asked for. The tab drop waits for this, so a
+    /// show and when it was asked for. The opening waits for this, so a
     /// surface that takes a while to map still shows it from the start.
     first_frame: Option<(u64, f64)>,
     epoch: Instant,
@@ -66,7 +67,7 @@ pub struct Island {
 }
 
 impl Island {
-    fn new(dark: bool, placement: Placement, feed: Feed) -> Self {
+    fn new(dark: Option<bool>, placement: Placement, feed: Feed) -> Self {
         Self {
             model: Model::default(),
             motion: Motion::new(placement),
@@ -85,7 +86,8 @@ impl Island {
     }
 
     fn step(&mut self, now: f64, dt: f32) -> bool {
-        let p = Paint::new(self.dark, 1.0);
+        // Layout reads only the type scale, which both appearances share.
+        let p = Paint::new(true, 1.0);
         let elapsed = self.model.elapsed_ms(now);
         let phase = match self.model.mode {
             Mode::Recording { .. } => scope::Phase::Live,
@@ -138,7 +140,7 @@ fn spec() -> AppSpec<Island> {
         title: "Dictator OSD",
         size: view::SURFACE,
         min_size: None,
-        init: || demo(true, Placement::default()),
+        init: || demo(None, Placement::default()),
         view: view::view,
         scenes: SCENES,
         fonts: rune_theme_opencode::FONTS,
@@ -194,9 +196,7 @@ fn poll(island: &mut Island, _clock: f64, tx: &mut Tx) -> bool {
             dt = 0.0;
         }
     }
-    if island.first_frame.is_none() {
-        island.step(now, dt);
-    }
+    let moving = island.first_frame.is_some() || island.step(now, dt);
     if !present && island.motion.retracted() {
         if island.shown
             && let Some(overlay) = &island.overlay
@@ -212,11 +212,12 @@ fn poll(island: &mut Island, _clock: f64, tx: &mut Tx) -> bool {
     } else if let Some(due) = island.model.deadline() {
         tx.wake_after(Duration::from_secs_f64((due - now).max(0.0)));
     }
-    island.shown || changed
+    // A recording redraws every frame for its clock and record light.
+    changed || (island.shown && (moving || island.model.recording()))
 }
 
 /// A still island for headless snapshots, with no socket.
-fn demo(dark: bool, placement: Placement) -> Island {
+fn demo(dark: Option<bool>, placement: Placement) -> Island {
     let mut island = Island::new(dark, placement, Feed::default());
     island.frozen = true;
     island
@@ -225,10 +226,10 @@ fn demo(dark: bool, placement: Placement) -> Island {
 type Scene = (&'static str, fn(&mut Island));
 
 const SCENES: &[Scene] = &[
-    ("tab", |island| {
+    ("opening", |island| {
         prepare(island);
         record(island, None, 0.0);
-        settle(island, 0.06);
+        settle(island, island.placement.tab_hold() * 0.7);
     }),
     ("recording", |island| {
         prepare(island);
@@ -243,82 +244,70 @@ const SCENES: &[Scene] = &[
     ("transcribing", |island| {
         prepare(island);
         record(island, None, 7.5);
-        state(island, StateValue::Transcribing, Some(7_500), "", 7.5);
+        let duration = Duration::from_millis(7_500);
+        state(
+            island,
+            new_state_event(StateValue::Transcribing, Some(duration), ""),
+            7.5,
+        );
         settle(island, 8.2);
     }),
     ("pasted", |island| {
         prepare(island);
-        island.model.apply(
-            Input::Transcript(
-                "Okay, so the plan for tomorrow: finish the provider switcher, then write \
-                 the migration notes and send them to the team before lunch."
-                    .into(),
-            ),
-            0.0,
+        paste(
+            island,
+            "Okay, so the plan for tomorrow: finish the provider switcher, then write the \
+             migration notes and send them to the team before lunch.",
         );
-        state(island, StateValue::Typing, None, "", 0.0);
         settle(island, 0.9);
     }),
     ("pasted-short", |island| {
         prepare(island);
-        island.model.apply(
-            Input::Transcript("Ship the overlay behind a feature flag first.".into()),
-            0.0,
-        );
-        state(island, StateValue::Typing, None, "", 0.0);
+        paste(island, "Ship the overlay behind a feature flag first.");
         settle(island, 0.9);
     }),
     ("pasted-plain", |island| {
         prepare(island);
-        state(island, StateValue::Typing, None, "", 0.0);
+        paste(island, "");
         settle(island, 0.9);
     }),
     ("error", |island| {
         prepare(island);
-        state(
-            island,
-            StateValue::Error,
-            None,
-            "transcription failed: provider timed out",
-            0.0,
-        );
+        let failed = new_state_event(StateValue::Error, None, "transcription failed");
+        state(island, failed, 0.0);
         settle(island, 1.2);
     }),
 ];
 
-/// Scenes follow `--theme` (which Rune reads for headless runs too) and
-/// `--placement` from the command line.
+/// Scenes take `--placement` from the command line; Rune applies `--theme`
+/// to headless runs itself.
 fn prepare(island: &mut Island) {
     let args: Vec<String> = std::env::args().collect();
-    let flag = |name: &str| {
-        args.windows(2)
-            .find(|pair| pair[0] == name)
-            .map(|pair| pair[1].as_str())
-    };
-    island.dark = flag("--theme") != Some("light");
-    island.placement = flag("--placement")
-        .and_then(Placement::parse)
+    island.placement = args
+        .windows(2)
+        .find(|pair| pair[0] == "--placement")
+        .and_then(|pair| Placement::parse(&pair[1]))
         .unwrap_or_default();
     island.motion = Motion::new(island.placement);
 }
 
-fn state(island: &mut Island, value: StateValue, duration_ms: Option<i64>, message: &str, at: f64) {
-    island.model.apply(
-        Input::State {
-            value,
-            duration_ms,
-            message: message.to_string(),
-        },
-        at,
+fn state(island: &mut Island, event: StateEvent, at: f64) {
+    island.model.apply(Input::State(event), at);
+}
+
+fn paste(island: &mut Island, text: &str) {
+    state(
+        island,
+        new_state_event(StateValue::Typing, None, "").with_text(text),
+        0.0,
     );
 }
 
 /// A recording that has been going for `seconds` of speech.
 fn record(island: &mut Island, provider: Option<&str>, seconds: f64) {
-    if let Some(name) = provider {
-        island.model.apply(Input::Provider(name.into()), 0.0);
-    }
-    state(island, StateValue::Recording, Some(0), "", 0.0);
+    let started = new_state_event(StateValue::Recording, Some(Duration::ZERO), "")
+        .with_provider(provider.unwrap_or_default());
+    state(island, started, 0.0);
     let mut t = 0.0;
     while t < seconds {
         let (rms, peak) = super::charts::demo_level(t as f32 * 7.0);

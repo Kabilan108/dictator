@@ -1,15 +1,15 @@
-//! Drawing the island: one surface on its edge, square where it meets the
-//! edge and round elsewhere, with concave fillets that blend it into the
-//! edge; or, floating, a capsule round all over. Each content layer is laid
-//! out at its own state's size and centred in the surface, which clips it
-//! while the shape morphs. The dot scope is drawn once, over the layers,
+//! Drawing the island: floating, a capsule round all over; attached, one
+//! surface on its edge, square where it meets the edge and round elsewhere,
+//! with concave fillets that blend it into the edge. Each content layer is
+//! laid out at its own state's size and centred in the surface, which clips
+//! it while the shape morphs. The dot scope is drawn once, over the layers,
 //! wherever the motion has slid it.
 
 use rune::{Color, Cx, El, LineCap, Path, ScreenEdge, Shape, TextStyle, canvas, el, row, text};
 
 use super::super::controls::Paint;
 use super::Island;
-use super::model::Model;
+use super::model::{Mode, Model};
 use super::motion::{Content, Fit, Layer};
 use super::scope::{COLUMNS, Dot, ROWS};
 
@@ -118,7 +118,8 @@ fn surface(p: Paint, tint: f32) -> Color {
 }
 
 pub(super) fn view(island: &Island, cx: &mut Cx<Island>) -> El {
-    let p = Paint::new(island.dark, cx.env().scale);
+    let dark = island.dark.unwrap_or_else(|| cx.system_dark());
+    let p = Paint::new(dark, cx.env().scale);
     let placement = island.placement;
     let motion = &island.motion;
     let height = motion.height.x;
@@ -192,10 +193,10 @@ pub(super) fn view(island: &Island, cx: &mut Cx<Island>) -> El {
 
 fn status(model: &Model) -> &'static str {
     match model.mode {
-        super::model::Mode::Recording { .. } => "Recording",
-        super::model::Mode::Transcribing { .. } => "Transcribing",
-        super::model::Mode::Pasted { .. } => "Pasted",
-        super::model::Mode::Failed { .. } => "Dictation failed",
+        Mode::Recording { .. } => "Recording",
+        Mode::Transcribing { .. } => "Transcribing",
+        Mode::Pasted { .. } => "Pasted",
+        Mode::Failed { .. } => "Dictation failed",
         _ => "",
     }
 }
@@ -244,7 +245,7 @@ fn warm_up(island: &Island, p: Paint) -> El {
         },
         Content::Pasted { transcript: None },
         Content::Failed {
-            message: "transcription failed: provider timed out".into(),
+            message: "Transcription failed".into(),
         },
     ];
     let layers = contents.into_iter().map(|content| {

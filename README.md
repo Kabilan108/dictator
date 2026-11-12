@@ -38,6 +38,46 @@ priorities and terminal recording updates.
 For Home Manager, enable `services.dictator.gui.enable = true` alongside the
 existing daemon configuration to install `dictator-gui`.
 
+## Dictation overlay
+
+`dictator-osd`, in the same package as the desktop app, is a small overlay
+that shows each dictation as it happens: a capsule above the bottom of the
+screen with the provider, a live level scope and the elapsed time while you
+record; a sweeping scope while it transcribes; the pasted text; and errors.
+It never takes focus or clicks, hides when the daemon is idle, and reconnects
+on its own when the daemon restarts. It needs a Wayland compositor with
+layer-shell (niri, sway, Hyprland) and `enable_osd` in the daemon's config.
+
+```bash
+# From the GUI package
+nix build .#gui && ./result/bin/dictator-osd
+
+# A development build, attached to the bottom edge, always dark
+direnv exec "$PWD" cargo run --features gui --bin dictator-osd -- --placement bottom --theme dark
+
+# Headless render of a scene, with no socket (see SCENES in src/gui/osd/mod.rs)
+direnv exec "$PWD" cargo run --features gui --bin dictator-osd -- \
+  --snap /tmp/osd.png --scene recording-provider
+```
+
+| Flag | Default | |
+|------|---------|---|
+| `--placement floating\|bottom\|top` | `floating` | A capsule above the bottom edge, or attached to the bottom or top edge |
+| `--theme dark\|light` | the system's | Overrides the desktop's light or dark preference |
+| `--socket PATH` | `$XDG_RUNTIME_DIR/dictator/osd.sock` | The daemon's OSD socket |
+
+With Home Manager, `services.dictator.osd.enable = true` runs it as a user
+service in the graphical session (`dictator-osd.service`, part of
+`graphical-session.target`):
+
+```nix
+services.dictator.osd = {
+  enable = true;
+  placement = "floating"; # or "bottom" / "top"
+  extraArgs = [ "--theme" "dark" ];
+};
+```
+
 The window opens floating at its own size on tiling compositors (niri, sway,
 Hyprland), so it needs no window rule, and it follows the system's light or
 dark appearance.

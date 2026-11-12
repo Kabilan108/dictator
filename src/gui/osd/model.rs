@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 
-use crate::visual::StateValue;
+use crate::visual::{StateEvent, StateValue};
 
 /// Meter samples kept: a little over two seconds, more than the scope shows.
 const HISTORY: usize = 72;
@@ -24,20 +24,8 @@ const GATE_SILENCE_RMS: f32 = 0.003_162;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Input {
-    State {
-        value: StateValue,
-        duration_ms: Option<i64>,
-        message: String,
-    },
-    Meter {
-        rms: f32,
-        peak: f32,
-    },
-    /// `x-transcript`: the text about to be pasted (not sent by the daemon yet).
-    Transcript(String),
-    /// `x-provider`: the provider the next recording goes to (not sent by the
-    /// daemon yet).
-    Provider(String),
+    State(StateEvent),
+    Meter { rms: f32, peak: f32 },
     Disconnected,
 }
 
@@ -73,10 +61,6 @@ pub(super) enum Mode {
 pub(super) struct Model {
     pub(super) mode: Mode,
     daemon: StateValue,
-    /// The last `x-provider`, for the recording that starts next.
-    provider: Option<String>,
-    /// The last `x-transcript`, for the paste that starts next.
-    transcript: Option<String>,
     loudest: f32,
     pub(super) levels: Levels,
 }
@@ -86,8 +70,6 @@ impl Default for Model {
         Self {
             mode: Mode::Hidden,
             daemon: StateValue::Idle,
-            provider: None,
-            transcript: None,
             loudest: 0.0,
             levels: Levels::default(),
         }
@@ -125,8 +107,6 @@ impl Model {
 
     pub(super) fn apply(&mut self, input: Input, at: f64) {
         match input {
-            Input::Provider(name) => self.provider = Some(name),
-            Input::Transcript(text) => self.transcript = Some(text),
             Input::Meter { rms, peak } => {
                 if self.recording() {
                     self.loudest = self.loudest.max(rms);
@@ -135,20 +115,22 @@ impl Model {
             }
             Input::Disconnected => {
                 self.daemon = StateValue::Idle;
-                self.transcript = None;
                 if self.mode != Mode::Hidden {
                     self.mode = Mode::Leaving;
                 }
             }
-            Input::State {
-                value,
-                duration_ms,
-                message,
-            } => self.state(value, duration_ms, message, at),
+            Input::State(event) => self.state(event, at),
         }
     }
 
-    fn state(&mut self, value: StateValue, duration_ms: Option<i64>, message: String, at: f64) {
+    fn state(&mut self, event: StateEvent, at: f64) {
+        let StateEvent {
+            value,
+            recording_duration_ms: duration_ms,
+            message,
+            provider,
+            text,
+        } = event;
         self.daemon = value;
         match value {
             StateValue::Recording => {
@@ -156,7 +138,7 @@ impl Model {
                     self.mode = Mode::Recording {
                         since: at,
                         base_ms: duration_ms.unwrap_or(0).max(0),
-                        provider: self.provider.take(),
+                        provider: non_blank(provider),
                     };
                     self.loudest = 0.0;
                     self.levels.reset();
@@ -180,31 +162,25 @@ impl Model {
             StateValue::Typing => {
                 if !matches!(self.mode, Mode::Pasted { .. }) {
                     self.mode = Mode::Pasted {
-                        transcript: self.transcript.take(),
+                        transcript: non_blank(text),
                         until: at + PASTED_HOLD,
                     };
                 }
             }
             StateValue::Error => {
-                let message = if message.trim().is_empty() {
-                    "Dictation failed".to_string()
-                } else {
-                    message
-                };
+                let message =
+                    sentence_case(message.trim()).unwrap_or_else(|| "Dictation failed".to_string());
                 self.mode = Mode::Failed {
                     message,
                     since: at,
                     idle: false,
                 };
             }
-            StateValue::Idle => {
-                self.transcript = None;
-                match &mut self.mode {
-                    Mode::Hidden | Mode::Pasted { .. } => {}
-                    Mode::Failed { idle, .. } => *idle = true,
-                    _ => self.mode = Mode::Leaving,
-                }
-            }
+            StateValue::Idle => match &mut self.mode {
+                Mode::Hidden | Mode::Pasted { .. } => {}
+                Mode::Failed { idle, .. } => *idle = true,
+                _ => self.mode = Mode::Leaving,
+            },
         }
     }
 
@@ -251,6 +227,17 @@ impl Model {
             self.mode = Mode::Hidden;
         }
     }
+}
+
+/// The daemon's error messages are lower case (`transcription failed`).
+fn sentence_case(message: &str) -> Option<String> {
+    let mut chars = message.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
+
+fn non_blank(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
 }
 
 fn likely_discarded(duration_ms: i64, loudest_rms: f32) -> bool {
@@ -328,13 +315,15 @@ impl Levels {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use crate::visual::new_state_event;
 
     fn state(value: StateValue, duration_ms: Option<i64>) -> Input {
-        Input::State {
-            value,
-            duration_ms,
-            message: String::new(),
-        }
+        Input::State(StateEvent {
+            recording_duration_ms: duration_ms,
+            ..new_state_event(value, None, "")
+        })
     }
 
     fn speak(model: &mut Model, from: f64, seconds: f64) {
@@ -365,8 +354,13 @@ mod tests {
     #[test]
     fn a_dictation_runs_recording_transcribing_pasted_then_leaves() {
         let mut model = Model::default();
-        model.apply(Input::Provider("openai".into()), 0.0);
-        model.apply(state(StateValue::Recording, Some(0)), 0.1);
+        model.apply(
+            Input::State(
+                new_state_event(StateValue::Recording, Some(Duration::ZERO), "")
+                    .with_provider("openai"),
+            ),
+            0.1,
+        );
         assert!(matches!(
             &model.mode,
             Mode::Recording { provider: Some(name), .. } if name == "openai"
@@ -375,8 +369,10 @@ mod tests {
         assert_eq!(model.elapsed_ms(2.1), 2000);
         model.apply(state(StateValue::Transcribing, Some(3000)), 3.1);
         assert_eq!(model.mode, Mode::Transcribing { duration_ms: 3000 });
-        model.apply(Input::Transcript("Ship it.".into()), 4.0);
-        model.apply(state(StateValue::Typing, None), 4.0);
+        model.apply(
+            Input::State(new_state_event(StateValue::Typing, None, "").with_text("Ship it.")),
+            4.0,
+        );
         model.apply(state(StateValue::Idle, None), 4.6);
         assert!(model.present(), "a paste holds past the daemon's idle");
         model.tick(5.1);
@@ -385,18 +381,17 @@ mod tests {
         assert_eq!(model.mode, Mode::Leaving);
         model.retracted();
         assert_eq!(model.mode, Mode::Hidden);
-
-        model.apply(state(StateValue::Recording, Some(0)), 7.0);
-        assert!(
-            matches!(&model.mode, Mode::Recording { provider: None, .. }),
-            "a provider names one recording only"
-        );
     }
 
     #[test]
-    fn transcript_reaches_the_paste_it_precedes() {
+    fn a_daemon_without_provider_or_text_shows_neither() {
         let mut model = Model::default();
-        model.apply(state(StateValue::Typing, None), 0.0);
+        model.apply(state(StateValue::Recording, Some(0)), 0.0);
+        assert!(matches!(
+            &model.mode,
+            Mode::Recording { provider: None, .. }
+        ));
+        model.apply(state(StateValue::Typing, None), 1.0);
         assert!(matches!(
             model.mode,
             Mode::Pasted {
@@ -404,12 +399,19 @@ mod tests {
                 ..
             }
         ));
-        model.apply(state(StateValue::Idle, None), 0.5);
-        model.tick(2.0);
-        model.retracted();
-        model.apply(Input::Transcript("hello".into()), 3.0);
-        model.apply(state(StateValue::Typing, None), 3.0);
-        assert!(matches!(&model.mode, Mode::Pasted { transcript: Some(t), .. } if t == "hello"));
+
+        let mut blank = Model::default();
+        blank.apply(
+            Input::State(new_state_event(StateValue::Typing, None, "").with_text("  ")),
+            0.0,
+        );
+        assert!(matches!(
+            blank.mode,
+            Mode::Pasted {
+                transcript: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -454,17 +456,17 @@ mod tests {
         speak(&mut model, 0.0, 1.0);
         model.apply(state(StateValue::Transcribing, Some(1000)), 1.0);
         model.apply(
-            Input::State {
-                value: StateValue::Error,
-                duration_ms: None,
-                message: "provider timed out".into(),
-            },
+            Input::State(new_state_event(
+                StateValue::Error,
+                None,
+                "provider timed out",
+            )),
             2.0,
         );
         model.apply(state(StateValue::Idle, None), 2.5);
         model.tick(4.3);
         assert!(
-            matches!(&model.mode, Mode::Failed { message, .. } if message == "provider timed out")
+            matches!(&model.mode, Mode::Failed { message, .. } if message == "Provider timed out")
         );
         assert_eq!(model.deadline(), Some(2.0 + FAILED_HOLD));
         model.tick(2.0 + FAILED_HOLD);

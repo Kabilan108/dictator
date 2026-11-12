@@ -357,7 +357,7 @@ impl Motion {
 mod tests {
     use super::*;
     use crate::gui::osd::model::Input;
-    use crate::visual::StateValue;
+    use crate::visual::{StateValue, new_state_event};
 
     const FRAME: f32 = 1.0 / 120.0;
 
@@ -388,14 +388,8 @@ mod tests {
     }
 
     fn state(model: &mut Model, value: StateValue, at: f64) {
-        model.apply(
-            Input::State {
-                value,
-                duration_ms: Some(3000),
-                message: String::new(),
-            },
-            at,
-        );
+        let duration = std::time::Duration::from_secs(3);
+        model.apply(Input::State(new_state_event(value, Some(duration), "")), at);
     }
 
     #[test]
@@ -470,8 +464,10 @@ mod tests {
             t += f64::from(FRAME);
         }
         assert!((motion.scope_x.x - (TRANSCRIBING_SCOPE - 95.0)).abs() < 0.05);
-        model.apply(Input::Transcript("done".into()), 2.5);
-        state(&mut model, StateValue::Typing, 2.5);
+        model.apply(
+            Input::State(new_state_event(StateValue::Typing, None, "").with_text("done")),
+            2.5,
+        );
         run(&mut motion, &model, 2.5, 0.6);
         assert!(motion.scope.x < 0.02, "pasting lets it go");
     }

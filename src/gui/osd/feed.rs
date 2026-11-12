@@ -10,8 +10,6 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
-
 use crate::visual::Event;
 
 use super::model::Input;
@@ -93,60 +91,44 @@ fn push(shared: &Weak<Mutex<Shared>>, input: Input) -> bool {
     true
 }
 
-/// Events the daemon does not send yet, prototyped by the demo feed.
-#[derive(Deserialize)]
-#[serde(tag = "type")]
-enum Extra {
-    #[serde(rename = "x-transcript")]
-    Transcript { text: String },
-    #[serde(rename = "x-provider")]
-    Provider { name: String },
-}
-
 pub(super) fn parse(line: &str) -> Option<Input> {
-    if let Ok(event) = serde_json::from_str::<Event>(line) {
-        return Some(match event {
-            Event::State(state) => Input::State {
-                value: state.value,
-                duration_ms: state.recording_duration_ms,
-                message: state.message,
-            },
-            Event::Meter(meter) => Input::Meter {
-                rms: meter.rms as f32,
-                peak: meter.peak as f32,
-            },
-        });
-    }
-    match serde_json::from_str::<Extra>(line).ok()? {
-        Extra::Transcript { text } => Some(Input::Transcript(text)),
-        Extra::Provider { name } if !name.trim().is_empty() => Some(Input::Provider(name)),
-        Extra::Provider { .. } => None,
-    }
+    Some(match serde_json::from_str::<Event>(line).ok()? {
+        Event::State(state) => Input::State(state),
+        Event::Meter(meter) => Input::Meter {
+            rms: meter.rms as f32,
+            peak: meter.peak as f32,
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::visual::StateValue;
+    use crate::visual::{StateValue, new_state_event};
 
     #[test]
-    fn parses_daemon_events_and_the_prototype_extras() {
+    fn parses_daemon_events() {
         let cases = [
             (
-                r#"{"type":"state","value":"transcribing","recording_duration_ms":4200}"#,
-                Some(Input::State {
-                    value: StateValue::Transcribing,
-                    duration_ms: Some(4200),
-                    message: String::new(),
-                }),
+                r#"{"type":"state","value":"recording","recording_duration_ms":0,"provider":"openai"}"#,
+                Some(Input::State(
+                    new_state_event(StateValue::Recording, Some(Duration::ZERO), "")
+                        .with_provider("openai"),
+                )),
+            ),
+            (
+                r#"{"type":"state","value":"typing","text":"hello"}"#,
+                Some(Input::State(
+                    new_state_event(StateValue::Typing, None, "").with_text("hello"),
+                )),
             ),
             (
                 r#"{"type":"state","value":"error","message":"timed out"}"#,
-                Some(Input::State {
-                    value: StateValue::Error,
-                    duration_ms: None,
-                    message: "timed out".into(),
-                }),
+                Some(Input::State(new_state_event(
+                    StateValue::Error,
+                    None,
+                    "timed out",
+                ))),
             ),
             (
                 r#"{"type":"meter","rms":0.5,"peak":0.75}"#,
@@ -155,16 +137,7 @@ mod tests {
                     peak: 0.75,
                 }),
             ),
-            (
-                r#"{"type":"x-transcript","text":"hello"}"#,
-                Some(Input::Transcript("hello".into())),
-            ),
-            (
-                r#"{"type":"x-provider","name":"openai"}"#,
-                Some(Input::Provider("openai".into())),
-            ),
-            (r#"{"type":"x-provider","name":" "}"#, None),
-            (r#"{"type":"x-other"}"#, None),
+            (r#"{"type":"other"}"#, None),
             ("not json", None),
         ];
         for (line, expected) in cases {
@@ -172,11 +145,59 @@ mod tests {
         }
     }
 
+    /// The daemon's runtime directory, socket included, goes away while it is
+    /// stopped and comes back when it restarts.
+    #[test]
+    fn reconnects_when_the_daemon_comes_back_in_a_new_directory() {
+        use std::io::Write;
+        use std::os::unix::net::UnixListener;
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dictator");
+        let path = dir.join("osd.sock");
+        let serve = |line: &str| {
+            std::fs::create_dir(&dir).unwrap();
+            let listener = UnixListener::bind(&path).unwrap();
+            let line = format!("{line}\n");
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.write_all(line.as_bytes()).unwrap();
+            })
+        };
+        let wait_for = |feed: &Feed, count: usize| {
+            let mut inputs = Vec::new();
+            for _ in 0..100 {
+                inputs.extend(feed.drain().into_iter().map(|(_, input)| input));
+                if inputs.len() >= count {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(30));
+            }
+            inputs
+        };
+
+        let first = serve(r#"{"type":"state","value":"recording"}"#);
+        let feed = Feed::start(path.clone());
+        first.join().unwrap();
+        let inputs = wait_for(&feed, 2);
+        assert_eq!(inputs.last(), Some(&Input::Disconnected), "{inputs:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let second = serve(r#"{"type":"state","value":"idle"}"#);
+        second.join().unwrap();
+        let inputs = wait_for(&feed, 2);
+        assert_eq!(
+            inputs.first(),
+            Some(&Input::State(new_state_event(StateValue::Idle, None, "")))
+        );
+    }
+
     #[test]
     fn a_full_queue_drops_meter_samples_before_state() {
         let feed = Feed::default();
         let shared = Arc::downgrade(&feed.shared);
-        push(&shared, Input::Provider("first".into()));
+        let first = Input::State(new_state_event(StateValue::Recording, None, ""));
+        push(&shared, first.clone());
         for _ in 0..QUEUE_CAPACITY {
             push(
                 &shared,
@@ -188,6 +209,6 @@ mod tests {
         }
         let drained = feed.drain();
         assert_eq!(drained.len(), QUEUE_CAPACITY);
-        assert_eq!(drained[0].1, Input::Provider("first".into()));
+        assert_eq!(drained[0].1, first);
     }
 }
