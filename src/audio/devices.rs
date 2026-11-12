@@ -688,11 +688,9 @@ fn is_legacy_usb_id(id: &str) -> bool {
 ///
 /// A connected USB device with no saved entry adopts the entry saved under its
 /// own old bus path, or else the highest-ranked old USB entry with its name.
-/// Old USB entries sharing a name with each other or with a device adopted
-/// here are taken to be one device seen at several ports: they collapse into
-/// the highest-ranked of them. A port id cannot tell that case from two
-/// units of one model, so a second unit loses its old rank and is appended
-/// when it is next connected. Running it again changes nothing.
+/// Other old entries stay as they are, shown as disconnected: a port id cannot
+/// tell one device moved between ports from two units of one model, so the
+/// user removes the ones that are stale. Running it again changes nothing.
 fn migrate_usb_ids(saved: &mut SavedPreferences, discovery: &Discovery) -> bool {
     let current: HashSet<&str> = discovery
         .microphones
@@ -702,7 +700,7 @@ fn migrate_usb_ids(saved: &mut SavedPreferences, discovery: &Discovery) -> bool 
     let stale_legacy = |entry: &SavedMicrophone| {
         is_legacy_usb_id(&entry.id) && !current.contains(entry.id.as_str())
     };
-    let mut adopted: HashSet<String> = HashSet::new();
+    let mut changed = false;
     for device in &discovery.microphones {
         let Some(legacy_id) = device.legacy_id.as_deref() else {
             continue;
@@ -724,45 +722,10 @@ fn migrate_usb_ids(saved: &mut SavedPreferences, discovery: &Discovery) -> bool 
             let entry = &mut saved.microphones[index];
             entry.id.clone_from(&device.id);
             entry.name.clone_from(&device.name);
-            adopted.insert(device.id.clone());
+            changed = true;
         }
     }
-
-    struct Group {
-        slot: usize,
-        has_adopted: bool,
-    }
-    let before = saved.microphones.len();
-    let mut groups: HashMap<String, Group> = HashMap::new();
-    let mut kept: Vec<SavedMicrophone> = Vec::with_capacity(before);
-    for entry in saved.microphones.drain(..) {
-        let is_adopted = adopted.contains(&entry.id);
-        if !is_adopted && !stale_legacy(&entry) {
-            kept.push(entry);
-            continue;
-        }
-        match groups.get_mut(&entry.name) {
-            Some(group) if !(is_adopted && group.has_adopted) => {
-                if is_adopted {
-                    kept[group.slot].id = entry.id;
-                    group.has_adopted = true;
-                }
-            }
-            Some(_) => kept.push(entry),
-            None => {
-                groups.insert(
-                    entry.name.clone(),
-                    Group {
-                        slot: kept.len(),
-                        has_adopted: is_adopted,
-                    },
-                );
-                kept.push(entry);
-            }
-        }
-    }
-    saved.microphones = kept;
-    !adopted.is_empty() || saved.microphones.len() != before
+    changed
 }
 
 fn reconcile(saved: &mut SavedPreferences, discovery: &Discovery) -> bool {
@@ -1556,16 +1519,21 @@ mod tests {
         let expected = [
             (C270_ID, "Webcam C270 Mono"),
             ("bus:pci-0000:c3:00.4-usb-0:1.4:1.0", "BY-GM18CU Mono"),
+            ("bus:pci-0000:c3:00.4-usb-0:1.3.2:1.2", "Webcam C270 Mono"),
+            ("bus:pci-0000:c1:00.3-usb-0:2:1.0", "BY-GM18CU Mono"),
+            ("bus:pci-0000:c3:00.3-usb-0:1.4:1.0", "BY-GM18CU Mono"),
             (
                 "bus:pci-0000:c1:00.6",
                 "Ryzen HD Audio Controller Analog Stereo",
             ),
             ("bluetooth:88:C9:E8:16:C7:9C", "WH-1000XM4"),
+            ("bus:pci-0000:c3:00.3-usb-0:1.3.2:1.2", "Webcam C270 Mono"),
         ];
         assert_eq!(saved_entries(&saved), expected);
         assert!(!reconcile(&mut saved, &connected), "migration runs once");
 
-        // The microphone comes back on yet another port.
+        // A microphone on a port it was never saved under takes the
+        // highest-ranked old entry with its name; the others stay.
         let plugged = discovery_of(&[
             ryzen_source(),
             c270_source(
@@ -1576,12 +1544,12 @@ mod tests {
         ]);
         assert!(reconcile(&mut saved, &plugged));
         assert_eq!(saved.microphones[1].id, "usb:0d8c:0014");
-        assert_eq!(saved.microphones.len(), 4);
+        assert_eq!(saved.microphones.len(), 8);
         assert!(!reconcile(&mut saved, &plugged));
     }
 
     #[test]
-    fn adoption_prefers_the_old_bus_path_but_keeps_the_highest_rank() {
+    fn adoption_prefers_the_entry_saved_under_the_devices_own_port() {
         let mut saved: SavedPreferences = serde_json::from_str(LEGACY_PREFERENCES).unwrap();
         // Plugged into the port of the second-ranked C270 entry.
         let connected = discovery_of(&[c270_source(
@@ -1591,15 +1559,9 @@ mod tests {
 
         assert!(reconcile(&mut saved, &connected));
         let ids: Vec<_> = saved.microphones.iter().map(|m| m.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            [
-                C270_ID,
-                "bus:pci-0000:c3:00.4-usb-0:1.4:1.0",
-                "bus:pci-0000:c1:00.6",
-                "bluetooth:88:C9:E8:16:C7:9C",
-            ]
-        );
+        assert_eq!(ids.len(), 8);
+        assert_eq!(ids[0], "bus:pci-0000:c3:00.3-usb-0:1.3.1:1.2");
+        assert_eq!(ids[2], C270_ID);
     }
 
     #[test]
@@ -1621,7 +1583,7 @@ mod tests {
         assert_eq!(migrated.fingerprint, fingerprint_at(&path));
         assert_eq!(
             read_preferences(&path).unwrap().unwrap().microphones.len(),
-            4
+            8
         );
 
         let again = manager.resolve(&connected).unwrap();
@@ -1658,7 +1620,7 @@ mod tests {
             assert_eq!(ids, expected, "{name}");
         }
 
-        // Both adopt their own legacy entries and neither is collapsed.
+        // Both adopt their own legacy entries; the third old entry stays.
         let mut saved: SavedPreferences = serde_json::from_str(LEGACY_PREFERENCES).unwrap();
         let both = discovery_of(&[
             c270_source("pci-0000:c3:00.3-usb-0:1.3.1:1.2", serial),
@@ -1676,6 +1638,7 @@ mod tests {
             [
                 C270_ID.to_string(),
                 format!("{C270_ID}@pci-0000:c3:00.4-usb-0:1.3.2:1.2"),
+                "bus:pci-0000:c3:00.3-usb-0:1.3.2:1.2".to_string(),
             ]
         );
         assert!(!reconcile(&mut saved, &both));
@@ -1751,13 +1714,17 @@ mod tests {
             names,
             [
                 "Webcam C270 Mono",
+                "Webcam C270 Mono",
+                "BY-GM18CU Mono",
+                "BY-GM18CU Mono",
                 "Ryzen HD Audio Controller Analog Stereo",
                 "WH-1000XM4",
+                "Webcam C270 Mono",
             ]
         );
         assert_eq!(
             read_preferences(&path).unwrap().unwrap().microphones.len(),
-            3
+            7
         );
 
         let before = fs::read(&path).unwrap();
