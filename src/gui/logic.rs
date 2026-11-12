@@ -7,7 +7,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, Utc};
 
 use super::LEVEL_HISTORY;
-use super::backend::{Detail, Glossary, Microphone};
+use super::backend::{ConnectionReport, Detail, Glossary, Microphone, ProviderInfo};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum PendingMutation {
@@ -430,6 +430,13 @@ pub(super) fn format_uptime(seconds: u64) -> String {
     } else {
         format!("{}m", seconds / 60)
     }
+}
+
+/// Whether `report` checked a provider other than the one now active. A
+/// probe made while the daemon was down checks the config default, which
+/// the app cannot compare, so it is always kept.
+pub(super) fn stale_check(report: &ConnectionReport, active: Option<&ProviderInfo>) -> bool {
+    report.daemon.is_ok() && active.is_some_and(|active| active.name != report.check.provider)
 }
 
 /// What fixes a failure, which decides the action the view offers.
@@ -949,5 +956,51 @@ mod error_tests {
             describe_error("transcription cancelled").line(),
             "Cancelled"
         );
+    }
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+    use crate::provider::{CheckOutcome, ProviderCheck};
+
+    fn report(provider: &str, daemon: Result<(), String>) -> ConnectionReport {
+        ConnectionReport {
+            daemon,
+            check: ProviderCheck {
+                provider: provider.to_string(),
+                host: String::new(),
+                outcome: CheckOutcome::Ready,
+                status: Some(422),
+                latency_ms: 1,
+                message: String::new(),
+            },
+            checked_at: chrono::Utc::now(),
+        }
+    }
+
+    fn active(name: &str) -> ProviderInfo {
+        ProviderInfo {
+            name: name.to_string(),
+            model: String::new(),
+            endpoint: String::new(),
+            usable: true,
+            problem: String::new(),
+            active: true,
+            is_default: false,
+            send_vocabulary: false,
+        }
+    }
+
+    #[test]
+    fn a_check_of_the_provider_switched_away_from_is_stale() {
+        let openai = active("openai");
+        assert!(stale_check(&report("siren", Ok(())), Some(&openai)));
+        assert!(!stale_check(&report("openai", Ok(())), Some(&openai)));
+        assert!(!stale_check(&report("siren", Ok(())), None));
+        assert!(!stale_check(
+            &report("siren", Err("daemon down".to_string())),
+            Some(&openai)
+        ));
     }
 }

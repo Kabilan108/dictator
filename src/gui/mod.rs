@@ -817,6 +817,12 @@ impl Ui {
             Reply::Connection(result) => {
                 self.connection_pending = false;
                 match result {
+                    Ok(report) if logic::stale_check(&report, self.active_provider()) => {
+                        // Checks run beside other requests, so a switch can
+                        // land while one is out: check the new provider.
+                        self.backend.send(Request::Providers);
+                        self.check_connection();
+                    }
                     Ok(report) => self.connection = Some(report),
                     Err(error) => self.notice = error,
                 }
