@@ -46,8 +46,10 @@ tempfile = "3"
 
 [profile.release]
 strip = true
-lto = true
-codegen-units = 1
+# Thin LTO spreads the final optimisation across cores: on 4 cores the gui
+# build took 6:08 instead of 7:17 under fat LTO with one codegen unit, for
+# binaries about a quarter larger.
+lto = "thin"
 
 [features]
 default = []
