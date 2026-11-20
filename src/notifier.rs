@@ -104,32 +104,14 @@ pub struct DBusNotifier {
 }
 
 impl DBusNotifier {
-    /// Connects to the session bus and verifies the notification service is
-    /// available.
+    /// Connects to the session bus without requiring a notification service yet.
     pub async fn new() -> Result<Self> {
         let conn = tokio::time::timeout(DBUS_TIMEOUT, Connection::session())
             .await
             .context("timed out connecting to D-Bus session bus")?
             .context("failed to connect to D-Bus session bus")?;
 
-        let proxy = tokio::time::timeout(DBUS_TIMEOUT, zbus::fdo::DBusProxy::new(&conn))
-            .await
-            .context("timed out creating D-Bus proxy")?
-            .context("failed to create D-Bus proxy")?;
-        let names = tokio::time::timeout(DBUS_TIMEOUT, proxy.list_names())
-            .await
-            .context("timed out listing D-Bus names")?
-            .context("failed to list D-Bus names")?;
-        let service_available = names.iter().any(|name| name.as_str() == DBUS_SERVICE);
-        drop(proxy);
-
-        if !service_available {
-            warn!(
-                "notification service not available, D-Bus notification service may not be running"
-            );
-            bail!("notification service {DBUS_SERVICE} not available");
-        }
-
+        // Resolve the notification service on each send so it can start after us.
         debug!("dbus notifier initialized successfully");
         Ok(Self {
             state: Mutex::new(DBusState {
@@ -245,6 +227,115 @@ async fn update_notification(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct NotificationService {
+        notifications: Mutex<Vec<(u32, String, String)>>,
+        closed: Mutex<Vec<u32>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.Notifications")]
+    impl NotificationService {
+        #[allow(clippy::too_many_arguments)]
+        async fn notify(
+            &self,
+            _app_name: &str,
+            replaces_id: u32,
+            _app_icon: &str,
+            summary: &str,
+            body: &str,
+            _actions: Vec<String>,
+            _hints: HashMap<String, zbus::zvariant::OwnedValue>,
+            _expire_timeout: i32,
+        ) -> u32 {
+            self.notifications.lock().await.push((
+                replaces_id,
+                summary.to_owned(),
+                body.to_owned(),
+            ));
+            42
+        }
+
+        async fn close_notification(&self, id: u32) {
+            self.closed.lock().await.push(id);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess probe"]
+    async fn late_notification_service_probe_child() {
+        let notifier = Notifier::desktop().await;
+        assert!(matches!(notifier, Notifier::DBus(_)));
+        assert!(notifier.update("early", "no service yet").await.is_err());
+
+        let service = zbus::connection::Builder::session()
+            .unwrap()
+            .serve_at(DBUS_PATH, NotificationService::default())
+            .unwrap()
+            .name(DBUS_SERVICE)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+
+        notifier.update("late", "service is ready").await.unwrap();
+        notifier.update_state(DaemonState::Recording).await.unwrap();
+        notifier.close().await.unwrap();
+
+        let interface = service
+            .object_server()
+            .interface::<_, NotificationService>(DBUS_PATH)
+            .await
+            .unwrap();
+        let fixture = interface.get().await;
+        assert_eq!(
+            *fixture.notifications.lock().await,
+            vec![
+                (0, "late".to_owned(), "service is ready".to_owned()),
+                (42, "dictator".to_owned(), "Recording audio".to_owned()),
+            ]
+        );
+        assert_eq!(*fixture.closed.lock().await, vec![42]);
+    }
+
+    #[test]
+    fn notifications_recover_when_service_starts_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("bus.conf");
+        // No service directories: the early send must not activate an installed daemon.
+        std::fs::write(
+            &config,
+            r#"<busconfig>
+                <type>session</type>
+                <listen>unix:tmpdir=/tmp</listen>
+                <auth>EXTERNAL</auth>
+                <policy context="default">
+                    <allow own="*"/>
+                    <allow send_destination="*"/>
+                    <allow receive_sender="*"/>
+                </policy>
+            </busconfig>"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new("dbus-run-session")
+            .arg("--config-file")
+            .arg(&config)
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "notifier::tests::late_notification_service_probe_child",
+                "--ignored",
+            ])
+            .output()
+            .expect("dbus-run-session is required for the private notification bus test");
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[tokio::test]
     #[ignore = "subprocess probe"]
