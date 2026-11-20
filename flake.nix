@@ -129,6 +129,7 @@
             rustc
             rustfmt
             clippy
+            dbus # Private session bus for notification tests
             rust-analyzer
             ffmpeg
             pulseaudio
