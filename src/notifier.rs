@@ -300,7 +300,26 @@ mod tests {
 
     #[test]
     fn notifications_recover_when_service_starts_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("bus.conf");
+        // No service directories: the early send must not activate an installed daemon.
+        std::fs::write(
+            &config,
+            r#"<busconfig>
+                <type>session</type>
+                <listen>unix:tmpdir=/tmp</listen>
+                <auth>EXTERNAL</auth>
+                <policy context="default">
+                    <allow own="*"/>
+                    <allow send_destination="*"/>
+                    <allow receive_sender="*"/>
+                </policy>
+            </busconfig>"#,
+        )
+        .unwrap();
         let output = std::process::Command::new("dbus-run-session")
+            .arg("--config-file")
+            .arg(&config)
             .arg("--")
             .arg(std::env::current_exe().unwrap())
             .args([
